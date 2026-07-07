@@ -286,7 +286,7 @@
       if (!r || typeof r !== 'object') return r;
       var old = oldBySymbol[r.symbol];
       if (old) {
-        ['_price_snapshot_ms', '_price_bid', '_price_ask', '_depth_imbalance', '_bid_depth_top5_usd', '_ask_depth_top5_usd'].forEach(function (key) {
+        ['_price_snapshot_ms', '_price_bid', '_price_ask', '_depth_imbalance', '_bid_depth_top5_usd', '_ask_depth_top5_usd', '_depth_ladder'].forEach(function (key) {
           if (old[key] != null && r[key] == null) r[key] = old[key];
         });
       }
@@ -680,15 +680,25 @@
     var host = document.getElementById('signal-history');
     if (!host) return;
     var r = cur();
-    if (!r) { host.innerHTML = '<div class="empty">暂无信号历史</div>'; return; }
-    var items = loadSignalHistory().filter(function (x) { return x.symbol === r.symbol; }).slice(0, 8);
-    if (!items.length) { host.innerHTML = '<div class="empty">暂无信号历史</div>'; return; }
+    if (!r) { host.innerHTML = '<div class="history-empty">暂无信号历史</div>'; return; }
+    var items = loadSignalHistory().filter(function (x) { return x.symbol === r.symbol; }).slice(0, 30);
+    if (!items.length) { host.innerHTML = '<div class="history-empty">暂无信号历史</div>'; return; }
     host.innerHTML = items.map(function (x) {
+      var biasCls = x.bias === 'bull' ? 'bull' : x.bias === 'bear' ? 'bear' : 'wait';
+      var biasText = x.bias === 'bull' ? '偏多' : x.bias === 'bear' ? '偏空' : '观望';
       return '<div class="history-item">' +
-        '<div class="ht"><span>' + shortTime(x.ts) + '</span><span>' + x.reason + '</span></div>' +
-        '<div class="hb"><b>' + x.bias + '</b> · 开仓' + x.confidence + '/方向' + (x.directionScore || '-') + ' · ' + x.risk + '<br>' +
-        (x.entryLabel || '入场') + ' ' + fmtPrice(Number(x.entry || 0)) + (x.entryDistance ? ' · ' + x.entryDistance : '') + ' · 止损 ' + fmtPrice(Number(x.stop || 0)) + '<br>' +
-        x.position + ' · ' + x.advice + '</div>' +
+        '<div class="ht"><span>' + shortTime(x.ts) + ' · ' + x.reason + '</span><span>' + (x.advice || '') + '</span></div>' +
+        '<div class="hb">' +
+          '<span class="hl-bias ' + biasCls + '">' + biasText + '</span>' +
+          '<span>开仓<span class="hl-conf">' + x.confidence + '</span></span>' +
+          '<span>方向<span class="hl-conf">' + (x.directionScore != null ? x.directionScore : '-') + '</span></span>' +
+          '<span class="hl-risk">' + x.risk + '</span>' +
+          '<span class="sep">|</span>' +
+          '<span>' + (x.entryLabel || '入场') + ' <b>' + fmtPrice(Number(x.entry || 0)) + '</b>' + (x.entryDistance ? ' ' + x.entryDistance : '') + '</span>' +
+          '<span>止损 <b>' + fmtPrice(Number(x.stop || 0)) + '</b></span>' +
+          '<span class="sep">|</span>' +
+          '<span>' + x.position + '</span>' +
+        '</div>' +
       '</div>';
     }).join('');
   }
@@ -790,6 +800,7 @@
       if (item.depth_imbalance != null) r._depth_imbalance = item.depth_imbalance;
       if (item.bid_depth_top5_usd != null) r._bid_depth_top5_usd = item.bid_depth_top5_usd;
       if (item.ask_depth_top5_usd != null) r._ask_depth_top5_usd = item.ask_depth_top5_usd;
+      if (item.depth_ladder != null) r._depth_ladder = item.depth_ladder;
     });
     if (cur() && cur().symbol === item.symbol) {
       var el = document.querySelector('#kpi-main .price');
@@ -798,6 +809,7 @@
         el.title = '实时价格';
       }
       updateRealtimeSignal();
+      renderDepthDom();
       setGen();
       updateLiveBadge(true);
     }
@@ -1038,26 +1050,30 @@
     var topLine = signalTopline(risk, bestAdvice, snap, state);
     var title = r.symbol.replace('USDT', '') + ' ' + (bestAdvice ? bestAdvice.name : '当前') + '：' + biasPlain(signalBias);
     var reason = bestAdvice ? bestAdvice.action : (r.summary || '');
-    var actionsHtml = '<div class="sb-act">实时价<b class="js-signal-live-price" style="color:' + C.accent + '">' + realtimePriceText(r) + '</b><span class="minor js-signal-live-age" title="' + (r._price_snapshot_ms ? 'WebSocket 实时价格' : '等待 WebSocket 实时价格') + '">' + realtimePriceAge(r) + '</span></div>';
+    // 主行 5 核心:实时价 / 方向 / 开仓分 / 触发状态 / 建议仓位
+    var majorHtml = '<div class="sb-act major">实时价<b class="js-signal-live-price" style="color:' + C.accent + '">' + realtimePriceText(r) + '</b><span class="minor js-signal-live-age" title="' + (r._price_snapshot_ms ? 'WebSocket 实时价格' : '等待 WebSocket 实时价格') + '">' + realtimePriceAge(r) + '</span></div>';
     if (bestAdvice) {
       var entryColor = snap.side === 'short' ? C.bear : snap.side === 'long' ? C.bull : C.accent;
-      actionsHtml += '<div class="sb-act">方向分<b style="color:' + C.accent + '">' + Math.round(snap.directionScore || 0) + '</b></div>';
-      actionsHtml += '<div class="sb-act">开仓分<b style="color:' + (snap.executionScore >= 60 ? C.accent2 : C.warn) + '">' + Math.round(snap.executionScore || 0) + '</b></div>';
-      actionsHtml += '<div class="sb-act">K线<b style="color:' + (bestAdvice.candle_state === '收盘确认' ? C.accent2 : C.warn) + '">' + (bestAdvice.candle_state || '-') + '</b></div>';
-      actionsHtml += '<div class="sb-act">风控<b style="color:' + (bestAdvice.risk_gate === '正常' ? C.accent2 : C.warn) + '">' + gateText(bestAdvice.risk_gate) + '</b></div>';
-      actionsHtml += '<div class="sb-act">回测<b style="color:' + C.accent + '">' + backtestSummary(bestAdvice.backtest) + '</b></div>';
-      actionsHtml += '<div class="sb-act">触发<b style="color:' + (bestAdvice.trigger_check && bestAdvice.trigger_check.status === 'confirmed' ? C.accent2 : C.warn) + '">' + triggerLabel(bestAdvice.trigger_check) + '</b></div>';
+      majorHtml += '<div class="sb-act major">方向分<b style="color:' + C.accent + '">' + Math.round(snap.directionScore || 0) + '</b></div>';
+      majorHtml += '<div class="sb-act major">开仓分<b style="color:' + (snap.executionScore >= 60 ? C.accent2 : C.warn) + '">' + Math.round(snap.executionScore || 0) + '</b></div>';
+      majorHtml += '<div class="sb-act major">触发<b style="color:' + (bestAdvice.trigger_check && bestAdvice.trigger_check.status === 'confirmed' ? C.accent2 : C.warn) + '">' + triggerLabel(bestAdvice.trigger_check) + '</b></div>';
+      majorHtml += '<div class="sb-act major">建议仓位<b class="js-signal-position" title="' + (pos.note || '') + '" style="color:' + pos.color + '">' + pos.text + '</b></div>';
+      // 次行辅助:K线/风控/回测/盘口/入场/止损/周期
+      var minorHtml = '<div class="sb-act minor">K线<b style="color:' + (bestAdvice.candle_state === '收盘确认' ? C.accent2 : C.warn) + '">' + (bestAdvice.candle_state || '-') + '</b></div>';
+      minorHtml += '<div class="sb-act minor">风控<b style="color:' + (bestAdvice.risk_gate === '正常' ? C.accent2 : C.warn) + '">' + gateText(bestAdvice.risk_gate) + '</b></div>';
+      minorHtml += '<div class="sb-act minor">回测<b style="color:' + C.accent + '">' + backtestSummary(bestAdvice.backtest) + '</b></div>';
       var depthImbalance = r._depth_imbalance != null ? r._depth_imbalance : r.signal_quality && r.signal_quality.depth_imbalance;
       var bidDepth = r._bid_depth_top5_usd != null ? r._bid_depth_top5_usd : r.signal_quality && r.signal_quality.bid_depth_top5_usd;
       var askDepth = r._ask_depth_top5_usd != null ? r._ask_depth_top5_usd : r.signal_quality && r.signal_quality.ask_depth_top5_usd;
       if (depthImbalance != null && isFinite(Number(depthImbalance))) {
-        actionsHtml += '<div class="sb-act">盘口<b class="js-signal-depth" style="color:' + C.accent + '">' + Number(depthImbalance).toFixed(2) + '</b><span class="minor js-signal-depth-size">买' + fmtVol(Number(bidDepth || 0)) + '/卖' + fmtVol(Number(askDepth || 0)) + '</span></div>';
+        minorHtml += '<div class="sb-act minor">盘口<b class="js-signal-depth" style="color:' + C.accent + '">' + Number(depthImbalance).toFixed(2) + '</b><span class="minor js-signal-depth-size">买' + fmtVol(Number(bidDepth || 0)) + '/卖' + fmtVol(Number(askDepth || 0)) + '</span></div>';
       }
-      actionsHtml += '<div class="sb-act"><span class="js-signal-entry-label">' + snap.entryLabel + '</span><b class="js-signal-entry" style="color:' + entryColor + '">' + fmtPrice(snap.entry) + '</b><span class="minor js-signal-distance">' + snap.entryDistance + '</span></div>';
-      actionsHtml += '<div class="sb-act">风控止损<b class="js-signal-stop" style="color:' + C.warn + '">' + fmtPrice(snap.stop) + '</b></div>';
-      actionsHtml += '<div class="sb-act">信号周期<b>' + bestAdvice.name + '</b></div>';
+      minorHtml += '<div class="sb-act minor"><span class="js-signal-entry-label">' + snap.entryLabel + '</span><b class="js-signal-entry" style="color:' + entryColor + '">' + fmtPrice(snap.entry) + '</b><span class="minor js-signal-distance">' + snap.entryDistance + '</span></div>';
+      minorHtml += '<div class="sb-act minor">止损<b class="js-signal-stop" style="color:' + C.warn + '">' + fmtPrice(snap.stop) + '</b></div>';
+      minorHtml += '<div class="sb-act minor">周期<b>' + bestAdvice.name + '</b></div>';
+    } else {
+      var minorHtml = '';
     }
-    actionsHtml += '<div class="sb-act">建议仓位<b class="js-signal-position" title="' + (pos.note || '') + '" style="color:' + pos.color + '">' + pos.text + '</b></div>';
     var states = ['空仓', '多单', '空单'];
     var stateHtml = '<div class="pos-state" data-symbol="' + r.symbol + '"><span class="ps-label">当前状态</span>' +
       states.map(function (s) { return '<button class="pos-btn ' + (state === s ? 'active' : '') + '" data-state="' + s + '">' + s + '</button>'; }).join('') +
@@ -1070,7 +1086,8 @@
           '<div class="sb-topline js-signal-topline' + (topLine ? ' show ' + topLine.cls : '') + '">' + (topLine ? topLine.text : '') + '</div>' +
           '<div class="sb-title">' + title + '</div>' +
           '<div class="sb-reason">' + reason + '</div>' +
-          '<div class="sb-actions">' + actionsHtml + '</div>' +
+          '<div class="sb-actions">' + majorHtml + '</div>' +
+          (minorHtml ? '<div class="sb-actions-minor">' + minorHtml + '</div>' : '') +
           '<div class="sb-meta"><span class="risk-pill js-risk-level ' + risk.key + '" title="' + risk.text + '">' + risk.label + '</span>' + stateHtml + '</div>' +
           '<div class="sb-alert js-signal-alert' + (alert.text ? ' show ' + alert.cls : '') + '">' + alert.text + '</div>' +
         '</div>' +
@@ -1156,6 +1173,14 @@
         '<span class="chg-v" style="color:' + col + '">' + fmtPct(c.val) + '</span>' +
       '</div>';
     }).join('');
+    // 资金费率大显示 + 倒计时(Binance USD-M 每8h结算:00/08/16 UTC)
+    var fr = r.funding_rate * 100;
+    var frAbs = Math.abs(fr);
+    var frCls = frAbs >= 0.1 ? 'danger' : frAbs >= 0.05 ? 'warn' : '';
+    var frColor = frAbs >= 0.1 ? C.bear : frAbs >= 0.05 ? C.warn : C.accent2;
+    var frPlain = fr > 0.05 ? '多头拥挤，多头付钱给空头' : fr < -0.05 ? '空头拥挤，空头付钱给多头' : '多空均衡，费率正常';
+    var cdMs = fundingCountdownMs();
+    var cdText = formatHMS(cdMs);
     host.innerHTML =
       '<div class="kpi-top">' +
         '<div class="sym"><span class="base">' + key.toUpperCase() + '</span><span class="quote">USDT</span></div>' +
@@ -1170,7 +1195,17 @@
         mini('24H 高', fmtPrice(r.high_24h)) +
         mini('24H 低', fmtPrice(r.low_24h)) +
         mini('24H 额', fmtVol(r.quote_volume_24h)) +
-        mini('资金费率', (r.funding_rate * 100).toFixed(4) + '%') +
+      '</div>' +
+      '<div class="funding-box ' + frCls + '">' +
+        '<div class="funding-main">' +
+          '<div class="funding-label">资金费率</div>' +
+          '<div class="funding-val" style="color:' + frColor + '">' + fr.toFixed(4) + '%</div>' +
+          '<div class="funding-plain">' + frPlain + '</div>' +
+        '</div>' +
+        '<div class="funding-countdown">' +
+          '<div class="fc-next">下次结算</div>' +
+          '<div class="fc-time">' + cdText + '</div>' +
+        '</div>' +
       '</div>' +
       '<div class="conf-wrap">' +
         '<div id="gauge-main"></div>' +
@@ -1195,6 +1230,87 @@
           data: [{ value: executionScore }]
         }]
       });
+  }
+  function fundingCountdownMs() {
+    // Binance USD-M 每8h结算:00:00 / 08:00 / 16:00 UTC
+    var now = new Date();
+    var utcH = now.getUTCHours();
+    var nextH = utcH < 8 ? 8 : utcH < 16 ? 16 : 24;
+    var target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), nextH, 0, 0));
+    if (nextH === 24) target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
+    return Math.max(0, target.getTime() - now.getTime());
+  }
+  function formatHMS(ms) {
+    var s = Math.floor(ms / 1000);
+    var h = Math.floor(s / 3600);
+    var m = Math.floor((s % 3600) / 60);
+    var sec = s % 60;
+    function p(n) { return n < 10 ? '0' + n : '' + n; }
+    return h + ':' + p(m) + ':' + p(sec);
+  }
+  function depthLadderOf(r) {
+    // 优先用实时深度,回退到快照
+    if (r._depth_ladder && (r._depth_ladder.bids || []).length) return r._depth_ladder;
+    var sq = r.signal_quality || {};
+    if (sq.depth_ladder && (sq.depth_ladder.bids || []).length) return sq.depth_ladder;
+    return { bids: [], asks: [] };
+  }
+  function renderDepthDom() {
+    var host = document.getElementById('depth-dom');
+    if (!host) return;
+    var r = cur();
+    if (!r) { host.innerHTML = '<div class="dom-empty">暂无币种</div>'; return; }
+    var ladder = depthLadderOf(r);
+    var bids = ladder.bids || [];
+    var asks = ladder.asks || [];
+    if (!bids.length || !asks.length) {
+      host.innerHTML = '<div class="dom-empty">盘口深度加载中…</div>';
+      return;
+    }
+    // 归一化:用全档最大 usd 作为条形长度基准
+    var maxUsd = 0;
+    bids.forEach(function (b) { if (b[2] > maxUsd) maxUsd = b[2]; });
+    asks.forEach(function (a) { if (a[2] > maxUsd) maxUsd = a[2]; });
+    if (!maxUsd) maxUsd = 1;
+    // 大单墙阈值:usd > 平均值的 2.5 倍
+    var sumUsd = 0, n = 0;
+    bids.forEach(function (b) { sumUsd += b[2]; n++; });
+    asks.forEach(function (a) { sumUsd += a[2]; n++; });
+    var avgUsd = n ? sumUsd / n : 0;
+    var wallThreshold = avgUsd * 2.5;
+    function isWall(usd) { return usd >= wallThreshold && usd > 0; }
+    function barWidth(usd) { return Math.max(3, (usd / maxUsd) * 100); }
+    function rowHtml(item, side) {
+      var p = item[0], q = item[1], usd = item[2];
+      var wall = isWall(usd) ? ' wall' : '';
+      var w = barWidth(usd);
+      return '<div class="dom-row ' + side + wall + '">' +
+        '<div class="bar" style="width:' + w + '%"></div>' +
+        '<span class="price">' + fmtPrice(p) + '</span>' +
+        '<span class="qty">' + fmtVol(q) + '</span>' +
+        '<span class="usd">' + fmtVol(usd) + 'U</span>' +
+      '</div>';
+    }
+    // ask 倒序(最高价在上),bid 正序(最高价在上)
+    var askHtml = asks.slice().reverse().map(function (a) { return rowHtml(a, 'ask'); }).join('');
+    var bidHtml = bids.map(function (b) { return rowHtml(b, 'bid'); }).join('');
+    // 中间区
+    var mid = (bids[0][0] + asks[0][0]) / 2;
+    var spread = asks[0][0] - bids[0][0];
+    var spreadPct = mid ? (spread / mid * 100) : 0;
+    var imbalance = r._depth_imbalance != null ? r._depth_imbalance : (r.signal_quality && r.signal_quality.depth_imbalance);
+    var imbNum = Number(imbalance || 0);
+    var imbCls = imbNum >= 0.15 ? 'bull' : imbNum <= -0.15 ? 'bear' : 'neutral';
+    var imbPlain = imbNum >= 0.15 ? '多头垫厚' : imbNum <= -0.15 ? '空头垫厚' : '买卖均衡';
+    host.innerHTML =
+      '<div class="dom-side ask">' + askHtml + '</div>' +
+      '<div class="dom-side mid">' +
+        '<div class="dom-mid-spread">价差 ' + spreadPct.toFixed(3) + '%</div>' +
+        '<div class="dom-mid-price">' + fmtPrice(mid) + '</div>' +
+        '<div class="dom-mid-imbalance ' + imbCls + '">IMB ' + (imbNum >= 0 ? '+' : '') + imbNum.toFixed(2) + '</div>' +
+        '<div class="dom-mid-plain">' + imbPlain + '</div>' +
+      '</div>' +
+      '<div class="dom-side bid">' + bidHtml + '</div>';
   }
   function mini(l, v) {
     return '<div class="mini"><div class="l">' + l + '</div><div class="v">' + v + '</div></div>';
@@ -1535,7 +1651,7 @@
   /* ---------- render all panels (uses current DATA/GEN, single symbol view) ---------- */
   function renderEmptyState() {
     var msg = '<div class="empty">暂无币种，请在上方添加一个合约币种。</div>';
-    ['signal-banner', 'kpi-main', 'indicator-lights', 'advice-grid', 'risk-grid', 'signal-history', 'account-risk'].forEach(function (id) {
+    ['signal-banner', 'kpi-main', 'indicator-lights', 'advice-grid', 'risk-grid', 'signal-history', 'account-risk', 'depth-dom'].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) el.innerHTML = msg;
     });
@@ -1556,6 +1672,7 @@
     renderSignal();
     renderIndicatorLights();
     renderKpi();
+    renderDepthDom();
     chartHeatmap();
     groupedBar('chart-rsi', 'RSI', function (r, tf) { return r.indicators[tf].rsi14; }, { digits: 1, min: 0, max: 100, markLines: rsiLines() });
     groupedBar('chart-boll', 'BOLL位置', function (r, tf) { return Math.max(0, Math.min(110, r.indicators[tf].boll_position_pct)); }, {

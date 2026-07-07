@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Local dashboard server for Binance futures analysis.
@@ -249,6 +249,10 @@ class RealtimePriceHub:
                     "ask_depth_top5_usd": ask_top5,
                     "bid_depth_top20_usd": bid_top20,
                     "ask_depth_top20_usd": ask_top20,
+                    "depth_ladder": {
+                        "bids": [[p, q, p * q] for p, q in bids[:10]],
+                        "asks": [[p, q, p * q] for p, q in asks[:10]],
+                    },
                     "depth_source": "futures_depth20",
                 }
                 with self.lock:

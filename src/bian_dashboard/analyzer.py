@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Binance USD-M Futures market helper.
@@ -241,6 +241,11 @@ def fetch_book_ticker(symbol: str) -> Dict[str, float]:
         ask_top20 = sum(price * qty for price, qty in asks)
         total = bid_top20 + ask_top20
         imbalance = (bid_top20 - ask_top20) / total if total else 0.0
+        # top10 明细 ladder,供前端 DOM 小图渲染
+        depth_ladder = {
+            "bids": [[p, q, p * q] for p, q in bids[:10]],
+            "asks": [[p, q, p * q] for p, q in asks[:10]],
+        }
         fallback.update(
             {
                 "depth_ok": bool(bid_top5 and ask_top5),
@@ -249,6 +254,7 @@ def fetch_book_ticker(symbol: str) -> Dict[str, float]:
                 "ask_depth_top5_usd": ask_top5,
                 "bid_depth_top20_usd": bid_top20,
                 "ask_depth_top20_usd": ask_top20,
+                "depth_ladder": depth_ladder,
             }
         )
     except Exception:
@@ -1474,6 +1480,7 @@ def analyze_symbol(symbol: str) -> SymbolReport:
             "depth_imbalance": book.get("depth_imbalance", 0.0),
             "bid_depth_top5_usd": book.get("bid_depth_top5_usd", 0.0),
             "ask_depth_top5_usd": book.get("ask_depth_top5_usd", 0.0),
+            "depth_ladder": book.get("depth_ladder", {"bids": [], "asks": []}),
         },
         timeframe_advice=timeframe_advice,
     )
