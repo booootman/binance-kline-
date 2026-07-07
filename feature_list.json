@@ -82,6 +82,30 @@
         "Backtest samples are filtered by ATR/volume and should not be interpreted as all-market win rate.",
         "Signals are suitable for assisted monitoring, not autonomous high-confidence trade execution."
       ]
+    },
+    {
+      "id": "tradingview-kline-panel",
+      "name": "TradingView Binance futures K-line panel",
+      "status": "implemented",
+      "paths": [
+        "web/binance-futures-dashboard.html",
+        "web/assets/charts.js"
+      ],
+      "capabilities": [
+        "Embedded TradingView advanced chart panel in the dashboard",
+        "Uses Binance USDT perpetual TradingView symbols such as BINANCE:DOGEUSDT.P",
+        "Follows the active dashboard symbol on tab switch, add, remove, and refresh",
+        "Provides 1m, 5m, 15m, 1h, 4h, and 1D interval controls with local preference persistence",
+        "Provides direct external links to TradingView and Binance futures pages"
+      ],
+      "verification": [
+        "node --check web/assets/charts.js",
+        "powershell -ExecutionPolicy Bypass -File scripts/verify.ps1"
+      ],
+      "limitations": [
+        "The embedded chart depends on TradingView's external widget CDN being reachable from the browser.",
+        "The strategy calculations remain based on local Binance API data; the TradingView panel is a visual market-structure reference."
+      ]
     }
   ]
 }

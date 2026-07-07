@@ -16,6 +16,9 @@
   var SIGNAL_HISTORY_KEY = 'bian_dashboard_signal_history';
   var POSITION_STATE_KEY = 'bian_dashboard_position_state';
   var ACCOUNT_RISK_KEY = 'bian_dashboard_account_risk';
+  var TV_KLINE_INTERVAL_KEY = 'bian_dashboard_tv_kline_interval';
+  var tvKlineInterval = loadTvKlineInterval();
+  var tvKlineKey = '';
   var root = getComputedStyle(document.documentElement);
   var C = {
     ink: root.getPropertyValue('--ink').trim(),
@@ -104,6 +107,116 @@
     var c = echarts.init(el, null, { renderer: 'svg' });
     charts.push(c);
     return c;
+  }
+  function loadTvKlineInterval() {
+    var allowed = ['1', '5', '15', '60', '240', 'D'];
+    try {
+      var saved = localStorage.getItem(TV_KLINE_INTERVAL_KEY);
+      if (allowed.indexOf(saved) >= 0) return saved;
+    } catch (e) {}
+    return '15';
+  }
+  function saveTvKlineInterval(v) {
+    try { localStorage.setItem(TV_KLINE_INTERVAL_KEY, v); } catch (e) {}
+  }
+  function tvIntervalLabel(v) {
+    return v === '60' ? '1h' : v === '240' ? '4h' : v === 'D' ? '1D' : v + 'm';
+  }
+  function tradingViewSymbol(sym) {
+    var clean = String(sym || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!clean) return '';
+    return 'BINANCE:' + clean + (clean.endsWith('USDT') ? '.P' : '');
+  }
+  function tradingViewUrl(tvSymbol) {
+    return 'https://www.tradingview.com/chart/?symbol=' + encodeURIComponent(tvSymbol);
+  }
+  function binanceFuturesUrl(sym) {
+    var clean = String(sym || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    return clean ? 'https://www.binance.com/zh-CN/futures/' + encodeURIComponent(clean) : '#';
+  }
+  function renderTradingViewEmpty(text) {
+    var host = document.getElementById('tv-kline');
+    if (!host) return;
+    tvKlineKey = '';
+    host.innerHTML = '<div class="tv-empty">' + text + '</div>';
+  }
+  function bindTradingViewToolbar() {
+    var toolbar = document.getElementById('tv-kline-toolbar');
+    if (!toolbar) return;
+    var btns = toolbar.querySelectorAll('[data-tv-interval]');
+    for (var i = 0; i < btns.length; i++) {
+      var value = btns[i].getAttribute('data-tv-interval');
+      btns[i].classList.toggle('active', value === tvKlineInterval);
+      if (btns[i]._tvBound) continue;
+      btns[i]._tvBound = true;
+      btns[i].addEventListener('click', function () {
+        var next = this.getAttribute('data-tv-interval') || '15';
+        if (next === tvKlineInterval) return;
+        tvKlineInterval = next;
+        saveTvKlineInterval(next);
+        tvKlineKey = '';
+        renderTradingViewKline();
+      });
+    }
+  }
+  function renderTradingViewKline() {
+    var host = document.getElementById('tv-kline');
+    if (!host) return;
+    bindTradingViewToolbar();
+    var r = cur();
+    if (!r || !r.symbol) {
+      renderTradingViewEmpty('No active symbol for TradingView K-Line.');
+      return;
+    }
+    var tvSymbol = tradingViewSymbol(r.symbol);
+    if (!tvSymbol) {
+      renderTradingViewEmpty('TradingView symbol is unavailable.');
+      return;
+    }
+    var sub = document.getElementById('tv-kline-sub');
+    if (sub) sub.textContent = r.symbol + ' / ' + tvSymbol + ' / ' + tvIntervalLabel(tvKlineInterval);
+    var openTv = document.getElementById('tv-open-tv');
+    if (openTv) openTv.href = tradingViewUrl(tvSymbol);
+    var openBinance = document.getElementById('tv-open-binance');
+    if (openBinance) openBinance.href = binanceFuturesUrl(r.symbol);
+    var key = tvSymbol + '|' + tvKlineInterval;
+    if (key === tvKlineKey && host.querySelector('.tradingview-widget-container')) return;
+    tvKlineKey = key;
+    host.innerHTML = '<div class="tv-empty">Loading TradingView K-Line for ' + r.symbol + '...</div>';
+    var container = document.createElement('div');
+    container.className = 'tradingview-widget-container';
+    var widget = document.createElement('div');
+    widget.className = 'tradingview-widget-container__widget';
+    container.appendChild(widget);
+    var script = document.createElement('script');
+    script.type = 'text/javascript';
+    script.async = true;
+    script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+    script.innerHTML = JSON.stringify({
+      autosize: true,
+      symbol: tvSymbol,
+      interval: tvKlineInterval,
+      timezone: 'Asia/Shanghai',
+      theme: 'dark',
+      style: '1',
+      locale: 'zh_CN',
+      backgroundColor: '#050a14',
+      gridColor: 'rgba(26,44,74,0.6)',
+      withdateranges: true,
+      hide_side_toolbar: false,
+      allow_symbol_change: false,
+      save_image: false,
+      calendar: false,
+      support_host: 'https://www.tradingview.com',
+      studies: ['STD;Volume']
+    });
+    script.onerror = function () {
+      if (tvKlineKey === key) tvKlineKey = '';
+      host.innerHTML = '<div class="tv-empty">TradingView K-Line failed to load. Use the links above to open ' + r.symbol + ' directly.</div>';
+    };
+    host.innerHTML = '';
+    host.appendChild(container);
+    container.appendChild(script);
   }
 
   /* ---------- clock ---------- */
@@ -1659,6 +1772,7 @@
       var el = document.getElementById(id);
       if (el) el.innerHTML = '';
     });
+    renderTradingViewEmpty('No symbols loaded. Add a USDT futures symbol to show the TradingView K-Line.');
   }
 
   function render() {
@@ -1672,6 +1786,7 @@
     renderSignal();
     renderIndicatorLights();
     renderKpi();
+    renderTradingViewKline();
     renderDepthDom();
     chartHeatmap();
     groupedBar('chart-rsi', 'RSI', function (r, tf) { return r.indicators[tf].rsi14; }, { digits: 1, min: 0, max: 100, markLines: rsiLines() });
@@ -1725,6 +1840,9 @@
     }
     charts.forEach(function (c) { c.dispose(); });
     charts.length = 0;
+    tvKlineKey = '';
+    var tv = document.getElementById('tv-kline');
+    if (tv) tv.innerHTML = '';
     window.removeEventListener('resize', onResize);
   }
 

@@ -130,3 +130,16 @@
 - Restarted local server as PID `25728`.
 - `/api/market?symbols=DOGEUSDT,TLMUSDT` returned HTTP 200 with `risk_sizing` fields.
 - `/api/market?symbols=DOGEUSDT,NOTAREALUSDT` still returned HTTP 400 with `missing_symbols`.
+
+## 2026-07-07 TradingView K-line panel
+
+- Added a TradingView Advanced Chart panel below the main signal/KPI row.
+- The panel maps the active dashboard symbol to Binance USDT perpetual TradingView symbols such as `BINANCE:DOGEUSDT.P`.
+- Added 1m, 5m, 15m, 1h, 4h, and 1D interval controls, persisted in browser localStorage.
+- Added direct external links for opening the active symbol on TradingView and Binance futures.
+- Kept the panel as a visual K-line reference only; strategy math still comes from local Binance API analysis.
+
+## TradingView K-line Verification
+
+- Passed `node --check web/assets/charts.js`.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1`.

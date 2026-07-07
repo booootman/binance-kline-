@@ -93,7 +93,10 @@
   .row-kpi{grid-template-columns:repeat(2,1fr)}
   .row-3{grid-template-columns:1.15fr 1fr 1fr}
   .row-2{grid-template-columns:1fr 1fr}
-  .signal-kpi-row{grid-template-columns:2fr 1fr}
+  .signal-kpi-row{grid-template-columns:2fr 1fr;align-items:stretch;margin-bottom:16px}
+  .signal-kpi-row > .panel{height:100%}
+  .signal-kpi-row #signal-banner{display:flex;align-self:stretch}
+  .signal-kpi-row #signal-banner .sb{flex:1;min-height:100%;width:100%}
   @media(max-width:1100px){.row-kpi,.row-3,.row-2,.signal-kpi-row{grid-template-columns:1fr}}
 
   .panel{
@@ -154,6 +157,18 @@
   /* ===== chart containers ===== */
   .chart{width:100%;min-height:300px}
   .chart.tall{min-height:340px}
+  .tv-section{margin-bottom:16px;overflow:hidden}
+  .tv-head{align-items:flex-start}
+  .tv-tools{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+  .tv-intervals{display:flex;gap:8px;flex-wrap:wrap}
+  .tv-btn,.tv-link{font-family:var(--mono);font-size:var(--fs-meta);letter-spacing:.06em;padding:7px 11px;border-radius:8px;border:1px solid var(--rule);background:rgba(16,32,58,.38);color:var(--muted-strong);text-decoration:none;cursor:pointer}
+  .tv-btn:hover,.tv-link:hover{border-color:rgba(0,229,255,.55);color:var(--ink)}
+  .tv-btn.active{color:var(--bg);background:linear-gradient(135deg,var(--accent),var(--accent2));border-color:transparent;box-shadow:0 0 16px rgba(0,229,255,.25)}
+  .tv-links{display:flex;gap:8px;flex-wrap:wrap}
+  .tv-frame{position:relative;width:100%;height:560px;min-height:420px;border:1px solid var(--rule);border-radius:10px;overflow:hidden;background:#050a14}
+  #tv-kline .tradingview-widget-container,#tv-kline .tradingview-widget-container__widget{width:100%;height:100%}
+  .tv-empty{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:20px;color:var(--muted-strong);font-family:var(--mono);font-size:var(--fs-body);line-height:1.6;background:linear-gradient(180deg,rgba(12,22,38,.9),rgba(5,10,20,.96))}
+  @media(max-width:900px){.tv-frame{height:480px}.tv-tools{align-items:flex-start}}
 
   /* ===== grid zone ===== */
   .gridzone{display:grid;grid-template-columns:1fr 1fr;gap:16px}
@@ -413,9 +428,32 @@
   </section>
 
   <!-- 主信号区:banner + KPI 左右并排(2:1) -->
-  <section class="grid signal-kpi-row" style="margin-bottom:16px;grid-template-columns:2fr 1fr;align-items:start">
+  <section class="grid signal-kpi-row">
     <div class="panel" id="signal-banner" style="padding:0;overflow:hidden"></div>
     <div class="panel kpi" id="kpi-main"></div>
+  </section>
+
+  <!-- TradingView K-Line -->
+  <section class="panel tv-section">
+    <div class="ph tv-head">
+      <h2><span class="ic">K</span>TradingView K-Line</h2>
+      <span class="sub" id="tv-kline-sub">Binance USD-M Futures / follows active symbol</span>
+    </div>
+    <div class="tv-tools">
+      <div class="tv-intervals" id="tv-kline-toolbar">
+        <button class="tv-btn" data-tv-interval="1">1m</button>
+        <button class="tv-btn" data-tv-interval="5">5m</button>
+        <button class="tv-btn active" data-tv-interval="15">15m</button>
+        <button class="tv-btn" data-tv-interval="60">1h</button>
+        <button class="tv-btn" data-tv-interval="240">4h</button>
+        <button class="tv-btn" data-tv-interval="D">1D</button>
+      </div>
+      <div class="tv-links">
+        <a class="tv-link" id="tv-open-tv" href="#" target="_blank" rel="noopener">Open TradingView</a>
+        <a class="tv-link" id="tv-open-binance" href="#" target="_blank" rel="noopener">Open Binance</a>
+      </div>
+    </div>
+    <div id="tv-kline" class="tv-frame"></div>
   </section>
 
   <!-- 盘口深度 DOM(实时 top10 bid/ask) -->
