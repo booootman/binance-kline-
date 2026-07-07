@@ -1,0 +1,28 @@
+{
+  "project": "binance-futures-dashboard",
+  "updated_at": "2026-07-07",
+  "features": [
+    {
+      "id": "project-structure",
+      "name": "Organized project architecture",
+      "status": "implemented",
+      "paths": [
+        "src/bian_dashboard",
+        "web",
+        "runtime",
+        "scripts",
+        "docs",
+        "backups",
+        "archive"
+      ],
+      "verification": "scripts/verify.ps1",
+      "delivery_assets": [
+        "docs/architecture.md",
+        "docs/acceptance-checklist.md",
+        "docs/regression-cases.md",
+        "docs/risk-checklist.md"
+      ]
+    }
+  ]
+}
+

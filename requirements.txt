@@ -1,0 +1,7 @@
+# REST analysis uses Python standard library only.
+# Realtime futures prices prefer direct Binance websocket support.
+websockets>=12.0
+
+# Optional fallback websocket client used when available.
+python-binance>=1.0.19
+
