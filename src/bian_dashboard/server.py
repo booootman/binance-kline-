@@ -35,8 +35,10 @@ ROOT = os.path.dirname(os.path.dirname(PACKAGE_ROOT))
 WEB_ROOT = os.path.join(ROOT, "web")
 BIAN = os.path.join(PACKAGE_ROOT, "analyzer.py")
 CACHE_FILE = os.path.join(ROOT, "runtime", "market_cache.json")
+BACKTEST_CACHE_FILE = os.path.join(ROOT, "runtime", "backtest_cache.json")
 BJ_TZ = timezone(timedelta(hours=8))
 CACHE_TTL_SECONDS = 30
+BACKTEST_CACHE_TTL_SECONDS = 10 * 60
 RUN_TIMEOUT_SECONDS = 120
 DEFAULT_SYMBOLS = ["DOGEUSDT", "TLMUSDT"]
 MAX_SYMBOLS = 8
@@ -117,7 +119,11 @@ class RealtimePriceHub:
                 self.error = "python-binance is not installed"
                 return False
             try:
-                streams = [f"{symbol.lower()}@bookTicker" for symbol in symbols]
+                streams = []
+                for symbol in symbols:
+                    lower = symbol.lower()
+                    streams.append(f"{lower}@bookTicker")
+                    streams.append(f"{lower}@depth20@500ms")
                 self.twm = ThreadedWebsocketManager()
                 self.twm.start()
                 self.socket_key = self.twm.start_futures_multiplex_socket(
@@ -174,7 +180,12 @@ class RealtimePriceHub:
                 self.direct_connected = False
 
     async def direct_loop(self, symbols, stop_event):
-        streams = "/".join(f"{symbol.lower()}@bookTicker" for symbol in symbols)
+        parts = []
+        for symbol in symbols:
+            lower = symbol.lower()
+            parts.append(f"{lower}@bookTicker")
+            parts.append(f"{lower}@depth20@500ms")
+        streams = "/".join(parts)
         url = f"wss://fstream.binance.com/stream?streams={streams}"
         while not stop_event.is_set():
             try:
@@ -206,25 +217,70 @@ class RealtimePriceHub:
         try:
             data = msg.get("data", msg) if isinstance(msg, dict) else {}
             symbol = normalize_symbol(data.get("s"))
-            price = data.get("p") or data.get("c")
-            bid = data.get("b")
-            ask = data.get("a")
-            if price is None and bid is not None and ask is not None:
-                price = (float(bid) + float(ask)) / 2
-            if not symbol or price is None:
+            if not symbol:
                 return
             event_ms = int(data.get("T") or data.get("E") or int(time.time() * 1000))
+            received_ms = int(time.time() * 1000)
+            bids_raw = data.get("b")
+            asks_raw = data.get("a")
+            is_depth = isinstance(bids_raw, list) or data.get("e") == "depthUpdate"
+            if is_depth:
+                bids = [(float(price), float(qty)) for price, qty in (bids_raw or [])[:20]]
+                asks = [(float(price), float(qty)) for price, qty in (asks_raw or [])[:20]]
+                if not bids or not asks:
+                    return
+                bid = bids[0][0]
+                ask = asks[0][0]
+                mid = (bid + ask) / 2.0 if bid and ask else 0.0
+                bid_top5 = sum(price * qty for price, qty in bids[:5])
+                ask_top5 = sum(price * qty for price, qty in asks[:5])
+                bid_top20 = sum(price * qty for price, qty in bids)
+                ask_top20 = sum(price * qty for price, qty in asks)
+                total = bid_top20 + ask_top20
+                depth_update = {
+                    "symbol": symbol,
+                    "bid": bid,
+                    "ask": ask,
+                    "event_ms": event_ms,
+                    "received_ms": received_ms,
+                    "depth_ok": bool(bid_top5 and ask_top5),
+                    "depth_imbalance": (bid_top20 - ask_top20) / total if total else 0.0,
+                    "bid_depth_top5_usd": bid_top5,
+                    "ask_depth_top5_usd": ask_top5,
+                    "bid_depth_top20_usd": bid_top20,
+                    "ask_depth_top20_usd": ask_top20,
+                    "depth_source": "futures_depth20",
+                }
+                with self.lock:
+                    item = dict(self.latest.get(symbol, {}))
+                    item.update(depth_update)
+                    item.setdefault("price", mid)
+                    item["source"] = "futures_bookTicker+depth20" if item.get("price") else "futures_depth20"
+                    self.latest[symbol] = item
+                    self.error = None
+                return
+            price = data.get("p") or data.get("c")
+            bid = bids_raw
+            ask = asks_raw
+            if price is None and bid is not None and ask is not None:
+                price = (float(bid) + float(ask)) / 2
+            if price is None:
+                return
             item = {
                 "symbol": symbol,
                 "price": float(price),
                 "bid": float(bid) if bid is not None else None,
                 "ask": float(ask) if ask is not None else None,
                 "event_ms": event_ms,
-                "received_ms": int(time.time() * 1000),
+                "received_ms": received_ms,
                 "source": "futures_bookTicker",
             }
             with self.lock:
-                self.latest[symbol] = item
+                old = dict(self.latest.get(symbol, {}))
+                old.update(item)
+                if old.get("depth_ok"):
+                    old["source"] = "futures_bookTicker+depth20"
+                self.latest[symbol] = old
                 self.error = None
         except Exception as exc:
             with self.lock:
@@ -379,7 +435,18 @@ def run_bian_json(symbols):
     env["PYTHONUTF8"] = "1"
     with _run_semaphore:
         return subprocess.run(
-            [sys.executable, "-B", BIAN, "--symbols", ",".join(symbols), "--json"],
+            [
+                sys.executable,
+                "-B",
+                BIAN,
+                "--symbols",
+                ",".join(symbols),
+                "--json",
+                "--backtest-cache-file",
+                BACKTEST_CACHE_FILE,
+                "--backtest-cache-ttl",
+                str(BACKTEST_CACHE_TTL_SECONDS),
+            ],
             cwd=ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -389,6 +456,33 @@ def run_bian_json(symbols):
             env=env,
             timeout=RUN_TIMEOUT_SECONDS,
         )
+
+
+def classify_api_error(error, stderr=""):
+    text = f"{error}\n{stderr or ''}"
+    if "HTTP 400" in text or "Invalid symbol" in text or "illegal" in text.lower():
+        return "bad_request", 400, False, "请求参数或交易对无效"
+    if "HTTP 418" in text or "HTTP 429" in text or "rate limited" in text.lower():
+        return "rate_limited", 429, True, "Binance 限流，返回旧快照"
+    if "HTTP 5" in text:
+        return "upstream_5xx", 502, False, "Binance 上游异常"
+    if "timeout" in text.lower():
+        return "timeout", 504, True, "分析超时，返回旧快照"
+    if "Network error" in text or "urlopen" in text or "timed out" in text.lower():
+        return "network", 502, True, "网络异常，返回旧快照"
+    return "hard_error", 502, False, "分析失败"
+
+
+def symbols_from_market_data(data):
+    if not isinstance(data, list):
+        return set()
+    symbols = set()
+    for item in data:
+        if isinstance(item, dict):
+            symbol = normalize_symbol(item.get("symbol"))
+            if symbol:
+                symbols.add(symbol)
+    return symbols
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -444,6 +538,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.send_cached_or_error("bian.py returned empty stdout", stderr[-3000:], symbols)
                 return
             data = json.loads(stdout)
+            if not isinstance(data, list):
+                self.send_cached_or_error("bian.py returned malformed market data", stderr[-3000:], symbols)
+                return
+            returned_symbols = symbols_from_market_data(data)
+            missing_symbols = [symbol for symbol in symbols if symbol not in returned_symbols]
+            if missing_symbols:
+                self.send_cached_or_error(
+                    "bian.py returned partial market data; missing symbols: " + ",".join(missing_symbols),
+                    stderr[-3000:],
+                    symbols,
+                    {
+                        "missing_symbols": missing_symbols,
+                        "returned_symbols": sorted(returned_symbols),
+                    },
+                )
+                return
             payload = {
                 "generated_at": now_bj(),
                 "symbols": symbols,
@@ -492,18 +602,31 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         finally:
             hub.release()
 
-    def send_cached_or_error(self, error, stderr, symbols):
-        cached = load_cache(symbols)
+    def send_cached_or_error(self, error, stderr, symbols, extra=None):
+        extra = extra or {}
+        error_type, status, allow_stale, user_message = classify_api_error(error, stderr)
+        cached = load_cache(symbols) if allow_stale else None
         if cached and cached.get("data"):
             payload = dict(cached)
             payload["stale"] = True
             payload["cache_hit"] = True
-            payload["warning"] = error
+            payload["warning"] = user_message
+            payload["error_type"] = error_type
+            payload.update(extra)
             if stderr:
                 payload["stderr"] = stderr
             self.send_json(200, payload)
             return
-        self.send_json(502, {"error": error, "stderr": stderr, "symbols": symbols, "stale": False})
+        body = {
+            "error": user_message,
+            "detail": error,
+            "stderr": stderr,
+            "symbols": symbols,
+            "stale": False,
+            "error_type": error_type,
+        }
+        body.update(extra)
+        self.send_json(status, body)
 
     def send_json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")

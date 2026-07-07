@@ -215,8 +215,15 @@
 
   /* signal banner */
   #signal-banner .sb{display:flex;align-items:center;gap:0;min-height:88px}
+  #signal-banner .sb.risk-block{box-shadow:inset 0 0 0 1px rgba(255,59,92,.5),0 0 22px rgba(255,59,92,.08)}
+  #signal-banner .sb.risk-high{box-shadow:inset 0 0 0 1px rgba(255,176,32,.42),0 0 22px rgba(255,176,32,.06)}
+  #signal-banner .sb.realtime-prejudge{box-shadow:inset 0 0 0 1px rgba(255,176,32,.35)}
   #signal-banner .light{flex-shrink:0;width:14px;align-self:stretch}
   #signal-banner .sb-body{flex:1;padding:18px 24px;display:flex;flex-direction:column;justify-content:center;gap:6px}
+  #signal-banner .sb-topline{display:none;width:max-content;max-width:100%;padding:5px 9px;border-radius:8px;font-family:var(--mono);font-size:12px;font-weight:700;line-height:1.35;border:1px solid var(--rule)}
+  #signal-banner .sb-topline.show{display:block}
+  #signal-banner .sb-topline.warn{color:var(--warn);background:rgba(255,176,32,.10);border-color:rgba(255,176,32,.36)}
+  #signal-banner .sb-topline.danger{color:var(--bear);background:rgba(255,59,92,.11);border-color:rgba(255,59,92,.44)}
   #signal-banner .sb-title{font-family:var(--disp);font-weight:500;font-size:22px;letter-spacing:.03em;line-height:1.2}
   #signal-banner .sb-reason{font-size:13px;color:var(--muted);line-height:1.5}
   #signal-banner .sb-actions{display:flex;gap:14px;flex-wrap:wrap;margin-top:4px}
@@ -241,6 +248,22 @@
   #signal-banner .light.green{background:var(--bull);box-shadow:0 0 24px var(--bull)}
   #signal-banner .light.red{background:var(--bear);box-shadow:0 0 24px var(--bear)}
   #signal-banner .light.yellow{background:var(--warn);box-shadow:0 0 24px var(--warn)}
+
+  /* account risk fuse */
+  .account-risk{display:grid;grid-template-columns:1.1fr repeat(4,auto);align-items:end;gap:12px}
+  .ar-status{font-family:var(--mono);font-size:12px;line-height:1.45;padding:9px 12px;border-radius:9px;border:1px solid var(--rule);background:rgba(16,32,58,.35);color:var(--muted)}
+  .ar-status.ok{color:var(--bull);border-color:rgba(0,255,157,.28);background:rgba(0,255,157,.06)}
+  .ar-status.warn{color:var(--warn);border-color:rgba(255,176,32,.38);background:rgba(255,176,32,.08)}
+  .ar-status.danger{color:var(--bear);border-color:rgba(255,59,92,.42);background:rgba(255,59,92,.08)}
+  .ar-field{display:flex;flex-direction:column;gap:5px;min-width:120px}
+  .ar-field label{font-family:var(--mono);font-size:10.5px;color:var(--muted);letter-spacing:.08em}
+  .ar-field input{font-family:var(--mono);font-size:13px;padding:8px 10px;border-radius:8px;border:1px solid var(--rule);background:rgba(16,32,58,.4);color:var(--ink);outline:none;width:120px}
+  .ar-field input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,229,255,.15)}
+  .ar-actions{display:flex;gap:8px}
+  .ar-actions button{font-family:var(--ui);font-size:12px;padding:8px 12px;border-radius:8px;border:1px solid var(--rule);background:rgba(16,32,58,.35);color:var(--muted);cursor:pointer}
+  .ar-actions button.primary{border-color:var(--accent);color:var(--accent);background:rgba(0,229,255,.08)}
+  .ar-actions button:hover{color:var(--ink);border-color:var(--accent)}
+  @media(max-width:980px){.account-risk{grid-template-columns:1fr 1fr}.ar-status{grid-column:1/-1}.ar-actions{grid-column:1/-1}.ar-field input{width:100%}}
 
   /* indicator lights */
   .ind-lights{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
@@ -323,6 +346,12 @@
 
   <!-- Main signal banner (P0: 一句话结论) -->
   <section class="panel" id="signal-banner" style="margin-bottom:16px;padding:0;overflow:hidden"></section>
+
+  <!-- Account risk fuse -->
+  <section class="panel" style="margin-bottom:16px">
+    <div class="ph"><h2><span class="ic">⛔</span>账户风控熔断</h2><span class="sub">日亏 ≥3% · 连亏 3 次 · 单笔亏 ≥1.5%</span></div>
+    <div id="account-risk" class="account-risk"></div>
+  </section>
 
   <!-- Signal history -->
   <section class="panel" style="margin-bottom:16px">

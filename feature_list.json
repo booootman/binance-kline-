@@ -22,7 +22,66 @@
         "docs/regression-cases.md",
         "docs/risk-checklist.md"
       ]
+    },
+    {
+      "id": "strategy-trust-calibration",
+      "name": "Strategy trust calibration and extreme-risk gates",
+      "status": "implemented",
+      "paths": [
+        "src/bian_dashboard/analyzer.py",
+        "src/bian_dashboard/server.py",
+        "web/assets/charts.js",
+        "web/binance-futures-dashboard.html"
+      ],
+      "capabilities": [
+        "Historical 5m/15m/1h signal backtest metrics",
+        "Confidence calibrated by historical quality and risk penalties",
+        "Realtime-prejudge versus closed-candle confirmation labels",
+        "Extreme ATR/BOLL risk gates for small volatile coins",
+        "Entry trigger confirmation using 1m volume, structure, spread, and entry distance",
+        "Tick-size legal stop hints and grid stops",
+        "Separate direction quality score from executable opening score",
+        "Global no-open gate propagation across all timeframe cards",
+        "ATR-based near-entry trigger threshold plus 1m retest confirmation",
+        "Stop-first historical backtest path accounting with estimated fee/slippage cost",
+        "Backtest stop-out count, stop rate, average loss, net expectancy, and estimated cost fields",
+        "Funding-rate crowding risk gate downgrade",
+        "Order-book depth top5/top20 and depth imbalance in trigger confirmation",
+        "Unclosed 1m trigger candles forced to watch instead of confirmed",
+        "Strong frontend warnings for no-open gates, half-position bans, realtime-prejudge, and position conflicts",
+        "Shared online/backtest side threshold for signal selection",
+        "Backtest filtered-out sample count and ATR/volume filter note",
+        "Gross expectancy versus net expectancy after estimated fee/slippage",
+        "Price-path drawdown kept separate from execution cost",
+        "Reusable runtime backtest cache for analyzer/server calls",
+        "Realtime SSE depth20 stream with depth imbalance and top5/top20 depth",
+        "API error classification for invalid symbols, rate limits, timeouts, network errors, and upstream failures",
+        "Partial-symbol API responses are rejected with missing/returned symbol metadata instead of cached as successful snapshots",
+        "Backtest cache writes use lock-file protection and unique temp files for concurrent analyzer subprocesses",
+        "TLM extreme-rally downgrade is applied before side, backtest, and stop selection, with downgraded direction-score caps",
+        "Backend risk-budget sizing with suggested_size_pct, stop_distance_pct, max_loss_pct, and allowed/note metadata",
+        "Frontend account-risk fuse for daily loss, consecutive losses, and max single loss, blocking new-open suggestions until next local day",
+        "Frontend position display uses risk-budget percentage instead of score-to-star position labels",
+        "Same-side altcoin correlation exposure warning across loaded symbols",
+        "Frontend stale/warning/error_type handling for delayed cached snapshots",
+        "Realtime depth fields are preserved across bookTicker-only updates and strategy refreshes"
+      ],
+      "verification": [
+        "node --check web/assets/charts.js",
+        "python -B -m py_compile src/bian_dashboard/analyzer.py src/bian_dashboard/server.py bian.py server.py",
+        "powershell -ExecutionPolicy Bypass -File scripts/verify.ps1",
+        "python -B bian.py --symbols DOGEUSDT,TLMUSDT --json",
+        "GET /api/market?symbols=DOGEUSDT,TLMUSDT returns 200",
+        "GET /api/market?symbols=NOTAREALUSDT returns 400",
+        "GET /api/market?symbols=DOGEUSDT,NOTAREALUSDT returns 400 with missing_symbols metadata",
+        "GET /api/market?symbols=DOGEUSDT,TLMUSDT includes risk_sizing for top signal and every timeframe advice",
+        "GET /api/realtime-prices?symbols=DOGEUSDT streams depth_imbalance and top5 depth fields"
+      ],
+      "limitations": [
+        "Historical backtest is still a lightweight rolling signal-quality check; it now estimates fees/slippage and stop-first path, but does not model funding windows, liquidation, partial fills, queue position, account equity, or portfolio exposure.",
+        "Backtest samples are filtered by ATR/volume and should not be interpreted as all-market win rate.",
+        "Signals are suitable for assisted monitoring, not autonomous high-confidence trade execution."
+      ]
     }
   ]
 }
-

@@ -6,4 +6,23 @@
 - [x] Dashboard URL remains `/binance-futures-dashboard.html`.
 - [x] Static resources resolve from `web/assets/` and `web/_shared/`.
 - [x] Runtime cache path is isolated under `runtime/market_cache.json`.
-
+- [x] Analyzer JSON includes historical 5m/15m/1h backtest windows for directional signals.
+- [x] `confidence` is calibrated with historical quality and risk-gate penalties instead of only rule score.
+- [x] Timeframe advice marks candles as `实时预判` or `收盘确认`.
+- [x] Extreme ATR/BOLL conditions can downgrade advice to `禁止半仓` or `禁止开仓`.
+- [x] Entry trigger confirmation reports 1m volume, structure, book spread, and distance to entry.
+- [x] Stop hints and grid stops are rounded to tick size and do not fall to 0 in TLM smoke tests.
+- [x] Dashboard advice bar shows realtime price, K-line state, risk gate, backtest summary, and trigger status.
+- [x] Analyzer exposes separate `direction_score` and `execution_score`; position sizing uses the execution score.
+- [x] Global `禁止开仓` risk state is inherited by every timeframe advice item.
+- [x] Entry trigger confirmation requires an ATR-based near-entry threshold and 1m retest/touch confirmation.
+- [x] Backtest metrics include stop-first path accounting, estimated cost, stop rate, average loss, and net expectancy.
+- [x] Funding rate can downgrade the risk gate when funding becomes crowded.
+- [x] Trigger confirmation uses adaptive spread threshold, top5 depth, and depth imbalance.
+- [x] Unclosed 1m trigger candles cannot return `confirmed`.
+- [x] Dashboard top signal banner gives strong warnings for no-open gates, half-position bans, realtime-prejudge, and position conflicts.
+- [x] Historical backtest side threshold is shared with online scoring.
+- [x] Backtest exposes gross expectancy, net expectancy, filtered sample count, and price-path drawdown.
+- [x] Analyzer/server calls can reuse `runtime/backtest_cache.json`.
+- [x] Realtime SSE includes depth20 imbalance and top5 depth fields.
+- [x] `/api/market` returns HTTP 400 for invalid symbols instead of stale cache.
