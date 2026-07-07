@@ -7,7 +7,8 @@ python -B -m py_compile `
   .\bian.py `
   .\server.py `
   .\src\bian_dashboard\analyzer.py `
-  .\src\bian_dashboard\server.py
+  .\src\bian_dashboard\server.py `
+  .\src\bian_dashboard\storage.py
 
 node --check .\web\assets\charts.js
 

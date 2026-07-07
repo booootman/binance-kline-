@@ -19,6 +19,8 @@
   var TV_KLINE_INTERVAL_KEY = 'bian_dashboard_tv_kline_interval';
   var tvKlineInterval = loadTvKlineInterval();
   var tvKlineKey = '';
+  var pendingPreferencePatch = {};
+  var preferenceSaveTimer = null;
   var root = getComputedStyle(document.documentElement);
   var C = {
     ink: root.getPropertyValue('--ink').trim(),
@@ -118,6 +120,74 @@
   }
   function saveTvKlineInterval(v) {
     try { localStorage.setItem(TV_KLINE_INTERVAL_KEY, v); } catch (e) {}
+    saveServerPreferences({ tv_kline_interval: v });
+  }
+  function saveServerPreferences(patch) {
+    if (!patch || typeof patch !== 'object') return;
+    Object.keys(patch).forEach(function (key) { pendingPreferencePatch[key] = patch[key]; });
+    if (preferenceSaveTimer) clearTimeout(preferenceSaveTimer);
+    preferenceSaveTimer = setTimeout(flushServerPreferences, 350);
+  }
+  function flushServerPreferences() {
+    var prefs = pendingPreferencePatch;
+    pendingPreferencePatch = {};
+    preferenceSaveTimer = null;
+    if (!prefs || !Object.keys(prefs).length) return;
+    fetch('api/preferences', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preferences: prefs }),
+      cache: 'no-store'
+    }).catch(function (err) {
+      console.warn('[dashboard] preference sync failed:', err.message);
+    });
+  }
+  function applyServerPreferences(prefs) {
+    if (!prefs || typeof prefs !== 'object') return;
+    try {
+      if (Array.isArray(prefs.custom_symbols)) {
+        var custom = [];
+        prefs.custom_symbols.forEach(function (item) {
+          var sym = normalizeClientSymbol(item);
+          if (sym && custom.indexOf(sym) < 0) custom.push(sym);
+        });
+        localStorage.setItem(LS_KEY, JSON.stringify(custom));
+      }
+      if (Array.isArray(prefs.removed_symbols)) {
+        var removed = [];
+        prefs.removed_symbols.forEach(function (item) {
+          var sym = normalizeClientSymbol(item);
+          if (sym && removed.indexOf(sym) < 0) removed.push(sym);
+        });
+        localStorage.setItem(REMOVED_KEY, JSON.stringify(removed));
+      }
+      if (prefs.position_state && typeof prefs.position_state === 'object') {
+        localStorage.setItem(POSITION_STATE_KEY, JSON.stringify(prefs.position_state));
+      }
+      if (prefs.account_risk && typeof prefs.account_risk === 'object') {
+        localStorage.setItem(ACCOUNT_RISK_KEY, JSON.stringify(prefs.account_risk));
+      }
+      if (Array.isArray(prefs.signal_history)) {
+        localStorage.setItem(SIGNAL_HISTORY_KEY, JSON.stringify(prefs.signal_history.slice(0, 80)));
+      }
+      if (['1', '5', '15', '60', '240', 'D'].indexOf(String(prefs.tv_kline_interval || '')) >= 0) {
+        tvKlineInterval = String(prefs.tv_kline_interval);
+        localStorage.setItem(TV_KLINE_INTERVAL_KEY, tvKlineInterval);
+      }
+    } catch (e) {
+      console.warn('[dashboard] apply server preferences failed:', e.message);
+    }
+  }
+  function loadServerPreferences(done) {
+    fetch('api/preferences', { cache: 'no-store' })
+      .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+      .then(function (payload) {
+        applyServerPreferences(payload.preferences || {});
+      })
+      .catch(function (err) {
+        console.warn('[dashboard] preference load failed, using browser localStorage:', err.message);
+      })
+      .then(done);
   }
   function tvIntervalLabel(v) {
     return v === '60' ? '1h' : v === '240' ? '4h' : v === 'D' ? '1D' : v + 'm';
@@ -345,6 +415,7 @@
   }
   function saveAccountRiskState(state) {
     try { localStorage.setItem(ACCOUNT_RISK_KEY, JSON.stringify(state)); } catch (e) {}
+    saveServerPreferences({ account_risk: state || {} });
   }
   function resetAccountRiskState() {
     var state = { date: todayKey(), dailyLossPct: 0, consecutiveLosses: 0, singleLossPct: 0, fuseUntil: 0, fuseReasons: [] };
@@ -419,6 +490,38 @@
       });
       return r;
     });
+  }
+  function normalizeClientSymbol(raw) {
+    var symbol = String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (symbol && symbol.indexOf('USDT') < 0) symbol += 'USDT';
+    return symbol;
+  }
+  function wantedRefreshSymbols() {
+    var removed = loadRemovedSyms();
+    var out = [];
+    function add(sym) {
+      var symbol = normalizeClientSymbol(sym);
+      if (!symbol || removed.indexOf(symbol) >= 0 || out.indexOf(symbol) >= 0) return;
+      out.push(symbol);
+    }
+    DATA.forEach(function (r) { if (r && r.symbol) add(r.symbol); });
+    loadCustomSyms().forEach(add);
+    return out;
+  }
+  function mergeFreshReports(fresh) {
+    var removed = loadRemovedSyms();
+    var freshSymbols = {};
+    var merged = [];
+    (fresh || []).forEach(function (r) {
+      if (!r || !r.symbol || removed.indexOf(r.symbol) >= 0) return;
+      freshSymbols[r.symbol] = true;
+      merged.push(r);
+    });
+    DATA.forEach(function (old) {
+      if (!old || !old.symbol || freshSymbols[old.symbol] || removed.indexOf(old.symbol) >= 0) return;
+      merged.push(old);
+    });
+    return merged;
   }
   function directionScoreOf(advice, report) {
     if (advice && advice.direction_score != null) return Number(advice.direction_score) || 0;
@@ -703,6 +806,7 @@
   }
   function savePositionStates(map) {
     try { localStorage.setItem(POSITION_STATE_KEY, JSON.stringify(map || {})); } catch (e) {}
+    saveServerPreferences({ position_state: map || {} });
   }
   function getPositionState(sym) {
     var map = loadPositionStates();
@@ -737,6 +841,7 @@
   }
   function saveSignalHistory(arr) {
     try { localStorage.setItem(SIGNAL_HISTORY_KEY, JSON.stringify((arr || []).slice(0, 80))); } catch (e) {}
+    saveServerPreferences({ signal_history: (arr || []).slice(0, 80) });
   }
   function shortTime(ms) {
     var d = new Date(ms || Date.now());
@@ -929,8 +1034,9 @@
   }
   function refreshStrategyAnalysis() {
     if (strategyRefreshBusy || !DATA.length) return;
-    var symbols = DATA.map(function (r) { return r.symbol; }).join(',');
-    if (!symbols) return;
+    var wantedSymbols = wantedRefreshSymbols();
+    var symbols = wantedSymbols.join(',');
+    if (!wantedSymbols.length) return;
     strategyRefreshBusy = true;
     nextStrategyRefreshAt = Date.now();
     setGen();
@@ -940,7 +1046,7 @@
         applyMarketPayloadState(payload);
         var fresh = stampReports(payload.data || [], payload.generated_at);
         if (!fresh.length) throw new Error('empty data');
-        DATA = fresh;
+        DATA = mergeFreshReports(fresh);
         applyRemovedSyms();
         GEN = payload.generated_at || GEN;
         if (!DATA.some(function (r) { return r.symbol === currentSymbol; })) {
@@ -981,11 +1087,26 @@
 
   // localStorage: save / load / remove custom symbols
   function saveCustomSyms() {
-    var custom = DATA.map(function (r) { return r.symbol; }).filter(function (s) { return DEFAULT_SYMS.indexOf(s) < 0; });
+    var custom = [];
+    DATA.forEach(function (r) {
+      var sym = normalizeClientSymbol(r && r.symbol);
+      if (sym && DEFAULT_SYMS.indexOf(sym) < 0 && custom.indexOf(sym) < 0) custom.push(sym);
+    });
     try { localStorage.setItem(LS_KEY, JSON.stringify(custom)); } catch (e) {}
+    saveServerPreferences({ custom_symbols: custom });
   }
   function loadCustomSyms() {
-    try { var v = localStorage.getItem(LS_KEY); return v ? JSON.parse(v) : []; } catch (e) { return []; }
+    try {
+      var v = localStorage.getItem(LS_KEY);
+      var arr = v ? JSON.parse(v) : [];
+      if (!Array.isArray(arr)) return [];
+      var out = [];
+      arr.forEach(function (item) {
+        var sym = normalizeClientSymbol(item);
+        if (sym && out.indexOf(sym) < 0) out.push(sym);
+      });
+      return out;
+    } catch (e) { return []; }
   }
   function loadRemovedSyms() {
     try {
@@ -996,6 +1117,7 @@
   }
   function saveRemovedSyms(symbols) {
     try { localStorage.setItem(REMOVED_KEY, JSON.stringify(symbols || [])); } catch (e) {}
+    saveServerPreferences({ removed_symbols: symbols || [] });
   }
   function applyRemovedSyms() {
     var removed = loadRemovedSyms();
@@ -1887,6 +2009,9 @@
     window.addEventListener('beforeunload', cleanup);
     DATA = stampReports(DATA, GEN);
     showLoading('正在调用 bian.py 获取实时行情…');
+    loadServerPreferences(startMarketBoot);
+
+    function startMarketBoot() {
     // 1. load default symbols
     fetch('api/market', { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
@@ -1906,6 +2031,8 @@
         applyRemovedSyms();
         restoreCustomSymbols(restoreDone);
       });
+
+    }
 
     function restoreDone() {
       applyRemovedSyms();

@@ -11,6 +11,7 @@ Local dashboard server for Binance futures analysis.
 import http.server
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -18,6 +19,12 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
+
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("BIAN_LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+LOG = logging.getLogger("bian-dashboard")
 
 try:
     from binance import ThreadedWebsocketManager
@@ -29,7 +36,19 @@ try:
 except Exception:
     websockets = None
 
-PORT = 8000
+try:
+    from websockets.legacy.client import connect as websocket_connect
+except Exception:
+    websocket_connect = websockets.connect if websockets is not None else None
+
+try:
+    from .storage import storage
+except Exception:
+    storage = None
+    LOG.exception("optional storage module failed to initialize")
+
+HOST = os.environ.get("BIAN_HOST", "127.0.0.1")
+PORT = int(os.environ.get("BIAN_PORT", "8000"))
 PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(PACKAGE_ROOT))
 WEB_ROOT = os.path.join(ROOT, "web")
@@ -113,10 +132,11 @@ class RealtimePriceHub:
             self.error = None
             if not symbols:
                 return False
-            if websockets is not None:
+            if websocket_connect is not None:
                 return self.start_direct_locked(symbols)
             if ThreadedWebsocketManager is None:
                 self.error = "python-binance is not installed"
+                LOG.error("realtime unavailable: python-binance and websockets are not installed; symbols=%s", symbols)
                 return False
             try:
                 streams = []
@@ -133,6 +153,7 @@ class RealtimePriceHub:
                 return True
             except Exception as exc:
                 self.error = str(exc)
+                LOG.exception("realtime python-binance websocket start failed; symbols=%s; fallback=direct", symbols)
                 self.stop_locked()
                 return self.start_direct_locked(symbols)
 
@@ -159,8 +180,9 @@ class RealtimePriceHub:
             threading.Thread(target=old_thread.join, args=(1,), daemon=True).start()
 
     def start_direct_locked(self, symbols):
-        if websockets is None:
+        if websocket_connect is None:
             self.error = (self.error or "") + "; websockets is not installed"
+            LOG.error("realtime direct websocket unavailable: websockets is not installed; symbols=%s", symbols)
             return False
         self.direct_stop = threading.Event()
         self.direct_thread = threading.Thread(
@@ -178,6 +200,7 @@ class RealtimePriceHub:
             with self.lock:
                 self.error = str(exc)
                 self.direct_connected = False
+            LOG.exception("realtime direct websocket loop crashed; symbols=%s", symbols)
 
     async def direct_loop(self, symbols, stop_event):
         parts = []
@@ -189,7 +212,7 @@ class RealtimePriceHub:
         url = f"wss://fstream.binance.com/stream?streams={streams}"
         while not stop_event.is_set():
             try:
-                async with websockets.connect(
+                async with websocket_connect(
                     url,
                     ping_interval=20,
                     ping_timeout=10,
@@ -211,6 +234,12 @@ class RealtimePriceHub:
                     self.direct_connected = False
                 if stop_event.is_set():
                     break
+                LOG.error(
+                    "realtime websocket disconnected; reconnect_in=3s; symbols=%s; error=%s",
+                    symbols,
+                    exc,
+                    exc_info=True,
+                )
                 await asyncio.sleep(3)
 
     def handle_message(self, msg):
@@ -262,6 +291,8 @@ class RealtimePriceHub:
                     item["source"] = "futures_bookTicker+depth20" if item.get("price") else "futures_depth20"
                     self.latest[symbol] = item
                     self.error = None
+                if storage is not None:
+                    storage.set_realtime_price(symbol, item)
                 return
             price = data.get("p") or data.get("c")
             bid = bids_raw
@@ -286,9 +317,12 @@ class RealtimePriceHub:
                     old["source"] = "futures_bookTicker+depth20"
                 self.latest[symbol] = old
                 self.error = None
+            if storage is not None:
+                storage.set_realtime_price(symbol, old)
         except Exception as exc:
             with self.lock:
                 self.error = str(exc)
+            LOG.exception("realtime websocket message parse failed; error=%s; message=%r", exc, msg)
 
     def snapshot(self, symbols):
         with self.lock:
@@ -499,11 +533,29 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.serve_api(parsed.query)
         elif parsed.path == "/api/realtime-prices":
             self.serve_realtime_prices(parsed.query)
+        elif parsed.path == "/api/preferences":
+            self.serve_preferences()
+        elif parsed.path == "/api/storage-status":
+            self.serve_storage_status()
         elif parsed.path in ("", "/", "/index.html"):
             self.path = "/binance-futures-dashboard.html"
             super().do_GET()
         else:
             super().do_GET()
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/preferences":
+            self.save_preferences_api()
+        else:
+            self.send_json(404, {"error": "not found"})
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
     def serve_api(self, query):
         symbols = parse_symbols(query)
@@ -515,6 +567,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if entry and now - entry["ts"] <= CACHE_TTL_SECONDS:
                 cached = dict(entry["payload"])
                 cached["cache_hit"] = True
+                self.send_json(200, cached)
+                return
+
+        if storage is not None:
+            redis_cached = storage.get_market_payload(key)
+            if redis_cached and payload_matches(redis_cached, symbols):
+                cached = dict(redis_cached)
+                cached["cache_hit"] = True
+                cached["redis_hit"] = True
+                with _payload_lock:
+                    _last_payloads[key] = {"ts": now, "payload": redis_cached}
                 self.send_json(200, cached)
                 return
 
@@ -569,10 +632,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             with _payload_lock:
                 _last_payloads[cache_key(symbols)] = {"ts": now, "payload": payload}
             save_cache(symbols, payload)
+            if storage is not None:
+                storage.set_market_payload(cache_key(symbols), payload, CACHE_TTL_SECONDS)
+                storage.save_strategy_snapshot(symbols, payload)
             self.send_json(200, payload)
         except subprocess.TimeoutExpired:
+            LOG.error("market api analyzer timeout; symbols=%s; timeout=%ss", symbols, RUN_TIMEOUT_SECONDS)
             self.send_cached_or_error(f"bian.py timeout ({RUN_TIMEOUT_SECONDS}s)", "", symbols)
         except Exception as exc:
+            LOG.exception("market api uncached analysis failed; symbols=%s", symbols)
             self.send_cached_or_error(str(exc), "", symbols)
 
     def serve_realtime_prices(self, query):
@@ -606,10 +674,55 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         finally:
             hub.release()
 
+    def serve_preferences(self):
+        prefs = storage.load_preferences() if storage is not None else {}
+        self.send_json(200, {
+            "preferences": prefs,
+            "storage": storage.status() if storage is not None else {"mysql": {"configured": False}, "redis": {"configured": False}},
+        })
+
+    def save_preferences_api(self):
+        try:
+            body = self.read_json_body()
+            prefs = body.get("preferences") if isinstance(body, dict) and isinstance(body.get("preferences"), dict) else body
+            if not isinstance(prefs, dict):
+                self.send_json(400, {"saved": False, "error": "preferences must be a JSON object"})
+                return
+            saved = storage.save_preferences(prefs) if storage is not None else False
+            self.send_json(200, {
+                "saved": bool(saved),
+                "storage": storage.status() if storage is not None else {"mysql": {"configured": False}, "redis": {"configured": False}},
+            })
+        except Exception as exc:
+            LOG.exception("save preferences failed")
+            self.send_json(500, {"saved": False, "error": str(exc)})
+
+    def serve_storage_status(self):
+        self.send_json(200, storage.status() if storage is not None else {"mysql": {"configured": False}, "redis": {"configured": False}})
+
+    def read_json_body(self):
+        length = int(self.headers.get("Content-Length") or "0")
+        if length <= 0:
+            return {}
+        if length > 1024 * 1024:
+            raise ValueError("request body too large")
+        raw = self.rfile.read(length).decode("utf-8")
+        return json.loads(raw or "{}")
+
     def send_cached_or_error(self, error, stderr, symbols, extra=None):
         extra = extra or {}
         error_type, status, allow_stale, user_message = classify_api_error(error, stderr)
         cached = load_cache(symbols) if allow_stale else None
+        LOG.error(
+            "market api error; symbols=%s; error_type=%s; status=%s; stale_allowed=%s; stale_used=%s; detail=%s; stderr=%s",
+            symbols,
+            error_type,
+            status,
+            allow_stale,
+            bool(cached and cached.get("data")),
+            error,
+            (stderr or "")[-500:],
+        )
         if cached and cached.get("data"):
             payload = dict(cached)
             payload["stale"] = True
@@ -657,11 +770,12 @@ class ThreadingServer(http.server.ThreadingHTTPServer):
 
 
 def main():
-    with ThreadingServer(("127.0.0.1", PORT), Handler) as httpd:
+    with ThreadingServer((HOST, PORT), Handler) as httpd:
         print("=" * 52)
         print("  Binance futures dashboard server started")
-        print("  Page: http://127.0.0.1:%d/binance-futures-dashboard.html" % PORT)
-        print("  API : http://127.0.0.1:%d/api/market" % PORT)
+        print("  Bind: %s:%d" % (HOST, PORT))
+        print("  Page: http://%s:%d/binance-futures-dashboard.html" % (HOST, PORT))
+        print("  API : http://%s:%d/api/market" % (HOST, PORT))
         print("  Web root: %s" % WEB_ROOT)
         print("  Cache TTL: %ds, fallback file: %s" % (CACHE_TTL_SECONDS, CACHE_FILE))
         print("  Press Ctrl+C to stop")

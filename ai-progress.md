@@ -143,3 +143,38 @@
 
 - Passed `node --check web/assets/charts.js`.
 - Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1`.
+
+## 2026-07-07 Optional MySQL/Redis storage
+
+- Added `src/bian_dashboard/storage.py` with optional MySQL and Redis integration.
+- Added MySQL persistence for dashboard preferences: custom symbols, removed symbols, position state, account risk, signal history, and TradingView interval.
+- Added MySQL strategy snapshot writes after successful `/api/market` analysis.
+- Added Redis short cache for market payloads and latest realtime price/depth snapshots.
+- Added `GET /api/preferences`, `POST /api/preferences`, and `GET /api/storage-status`.
+- Updated frontend preference reads/writes to sync with the backend while keeping localStorage fallback.
+- Added `docs/storage.md` with MySQL/Redis environment variable configuration.
+
+## Optional Storage Verification
+
+- Passed `python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py`.
+- Passed `node --check web/assets/charts.js`.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1`.
+
+## 2026-07-07 Docker deployment
+
+- Added Docker deployment files for the dashboard API, isolated MySQL storage, and isolated Redis cache.
+- Added `BIAN_HOST` and `BIAN_PORT` server configuration so the app can bind to `0.0.0.0` inside a container while keeping the local default at `127.0.0.1:8000`.
+- Added Docker deployment notes under `docs/docker-deploy.md`.
+
+## Docker Deployment Verification
+
+- Passed `python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py`.
+- Passed `node --check web/assets/charts.js`.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1`.
+- Local `docker compose config` was skipped because Docker is not installed on this Windows machine.
+- Server `docker compose config` passed under `/opt/bian-dashboard`.
+- Server `docker compose up -d --build` started `bian-dashboard`, `bian-dashboard-mysql`, and `bian-dashboard-redis`; all containers reported healthy.
+- Public `GET http://159.223.91.36:8000/binance-futures-dashboard.html` returned HTTP 200.
+- Public `GET http://159.223.91.36:8000/api/storage-status` reported MySQL and Redis available.
+- Public `GET http://159.223.91.36:8000/api/market?symbols=DOGEUSDT,TLMUSDT` returned `stale=false`.
+- Public `GET http://159.223.91.36:8000/api/realtime-prices?symbols=DOGEUSDT` streamed SSE data with `connected=true`.

@@ -106,6 +106,70 @@
         "The embedded chart depends on TradingView's external widget CDN being reachable from the browser.",
         "The strategy calculations remain based on local Binance API data; the TradingView panel is a visual market-structure reference."
       ]
+    },
+    {
+      "id": "mysql-redis-storage",
+      "name": "Optional MySQL and Redis storage",
+      "status": "implemented",
+      "paths": [
+        "src/bian_dashboard/storage.py",
+        "src/bian_dashboard/server.py",
+        "web/assets/charts.js",
+        "docs/storage.md",
+        "requirements.txt",
+        "scripts/verify.ps1"
+      ],
+      "capabilities": [
+        "Optional MySQL persistence for custom symbols, removed symbols, position state, account risk state, signal history, TradingView interval, and strategy snapshots",
+        "Optional Redis cache for short market payloads and latest realtime price/depth snapshots",
+        "New GET/POST /api/preferences endpoints for browser-to-server preference sync",
+        "New GET /api/storage-status endpoint for checking configured storage availability",
+        "Browser localStorage remains the fallback when MySQL or Redis is not configured"
+      ],
+      "verification": [
+        "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py",
+        "node --check web/assets/charts.js",
+        "powershell -ExecutionPolicy Bypass -File scripts/verify.ps1"
+      ],
+      "limitations": [
+        "MySQL and Redis require optional Python drivers and external services to be installed/configured.",
+        "The dashboard does not store full historical tick/order-book streams in MySQL; Redis stores only latest realtime snapshots."
+      ]
+    },
+    {
+      "id": "docker-deployment",
+      "name": "Docker Compose deployment",
+      "status": "implemented",
+      "paths": [
+        "Dockerfile",
+        "docker-compose.yml",
+        ".dockerignore",
+        ".env.example",
+        "docs/docker-deploy.md",
+        "src/bian_dashboard/server.py"
+      ],
+      "capabilities": [
+        "Container image for the Python dashboard API and static web server",
+        "Compose stack with isolated dashboard, MySQL, and Redis services",
+        "Named Docker volumes for runtime cache, MySQL data, and Redis append-only data",
+        "Configurable public port and storage credentials through environment variables",
+        "Container host binding through BIAN_HOST/BIAN_PORT"
+      ],
+      "verification": [
+        "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py",
+        "node --check web/assets/charts.js",
+        "powershell -ExecutionPolicy Bypass -File scripts/verify.ps1",
+        "server-side docker compose config passed under /opt/bian-dashboard",
+        "server-side docker compose up -d --build started healthy dashboard, MySQL, and Redis containers",
+        "GET http://159.223.91.36:8000/binance-futures-dashboard.html returns HTTP 200",
+        "GET http://159.223.91.36:8000/api/storage-status reports MySQL and Redis available",
+        "GET http://159.223.91.36:8000/api/market?symbols=DOGEUSDT,TLMUSDT returns stale=false",
+        "GET http://159.223.91.36:8000/api/realtime-prices?symbols=DOGEUSDT streams connected=true SSE data"
+      ],
+      "limitations": [
+        "Server access to Binance APIs still depends on the hosting provider network not being blocked or rate-limited by Binance.",
+        "Production secrets should be set in a server-only .env file, not committed."
+      ]
     }
   ]
 }
