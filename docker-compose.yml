@@ -1,0 +1,77 @@
+name: bian-dashboard
+
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bian-dashboard:latest
+    container_name: bian-dashboard
+    restart: unless-stopped
+    ports:
+      - "${BIAN_PUBLIC_PORT:-8000}:8000"
+    environment:
+      BIAN_HOST: 0.0.0.0
+      BIAN_PORT: 8000
+      BIAN_LOG_LEVEL: ${BIAN_LOG_LEVEL:-INFO}
+      BIAN_AUTH_ENABLED: ${BIAN_AUTH_ENABLED:-1}
+      BIAN_AUTH_BOOTSTRAP_USER: ${BIAN_AUTH_BOOTSTRAP_USER:-admin}
+      BIAN_AUTH_BOOTSTRAP_PASSWORD: ${BIAN_AUTH_BOOTSTRAP_PASSWORD:-}
+      BIAN_AUTH_SESSION_TTL_SECONDS: ${BIAN_AUTH_SESSION_TTL_SECONDS:-604800}
+      BIAN_AUTH_COOKIE_SECURE: ${BIAN_AUTH_COOKIE_SECURE:-0}
+      BIAN_AUTH_MAX_FAILURES: ${BIAN_AUTH_MAX_FAILURES:-8}
+      BIAN_AUTH_LOCKOUT_SECONDS: ${BIAN_AUTH_LOCKOUT_SECONDS:-300}
+      BIAN_STORAGE_USER_ID: ${BIAN_STORAGE_USER_ID:-default}
+      BIAN_MYSQL_HOST: mysql
+      BIAN_MYSQL_PORT: 3306
+      BIAN_MYSQL_USER: ${BIAN_MYSQL_USER:-bian}
+      BIAN_MYSQL_PASSWORD: ${BIAN_MYSQL_PASSWORD:-bian_local_password_change_me}
+      BIAN_MYSQL_DATABASE: ${BIAN_MYSQL_DATABASE:-bian_dashboard}
+      BIAN_REDIS_HOST: redis
+      BIAN_REDIS_PORT: 6379
+      BIAN_REDIS_DB: 0
+    volumes:
+      - bian-runtime:/app/runtime
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  mysql:
+    image: mysql:8.4
+    container_name: bian-dashboard-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${BIAN_MYSQL_DATABASE:-bian_dashboard}
+      MYSQL_USER: ${BIAN_MYSQL_USER:-bian}
+      MYSQL_PASSWORD: ${BIAN_MYSQL_PASSWORD:-bian_local_password_change_me}
+      MYSQL_ROOT_PASSWORD: ${BIAN_MYSQL_ROOT_PASSWORD:-bian_root_password_change_me}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - bian-mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    container_name: bian-dashboard-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - bian-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  bian-runtime:
+  bian-mysql:
+  bian-redis:
