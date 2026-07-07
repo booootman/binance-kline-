@@ -12,8 +12,11 @@
   var strategyRefreshTimer = null;
   var strategyRefreshBusy = false;
   var nextStrategyRefreshAt = 0;
+  var lastGuardRenderAt = 0;
   var MARKET_STATE = { stale: false, warning: '', errorType: '' };
+  var CURRENT_USER = null;
   var SIGNAL_HISTORY_KEY = 'bian_dashboard_signal_history';
+  var SYMBOL_HISTORY_KEY = 'bian_dashboard_symbol_history';
   var POSITION_STATE_KEY = 'bian_dashboard_position_state';
   var ACCOUNT_RISK_KEY = 'bian_dashboard_account_risk';
   var TV_KLINE_INTERVAL_KEY = 'bian_dashboard_tv_kline_interval';
@@ -51,6 +54,11 @@
     return v.toFixed(0);
   }
   function fmtPct(v) { return (v >= 0 ? '+' : '') + v.toFixed(2) + '%'; }
+  function htmlSafe(v) {
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function (ch) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch];
+    });
+  }
   function biasClass(b) {
     if (b.indexOf('偏多') >= 0) return 'bull';
     if (b.indexOf('偏空') >= 0) return 'bear';
@@ -145,6 +153,10 @@
   function applyServerPreferences(prefs) {
     if (!prefs || typeof prefs !== 'object') return;
     try {
+      var symbolHistorySeed = [];
+      if (Array.isArray(prefs.symbol_history)) {
+        symbolHistorySeed = symbolHistorySeed.concat(prefs.symbol_history);
+      }
       if (Array.isArray(prefs.custom_symbols)) {
         var custom = [];
         prefs.custom_symbols.forEach(function (item) {
@@ -152,6 +164,7 @@
           if (sym && custom.indexOf(sym) < 0) custom.push(sym);
         });
         localStorage.setItem(LS_KEY, JSON.stringify(custom));
+        symbolHistorySeed = symbolHistorySeed.concat(custom);
       }
       if (Array.isArray(prefs.removed_symbols)) {
         var removed = [];
@@ -160,6 +173,7 @@
           if (sym && removed.indexOf(sym) < 0) removed.push(sym);
         });
         localStorage.setItem(REMOVED_KEY, JSON.stringify(removed));
+        symbolHistorySeed = symbolHistorySeed.concat(removed);
       }
       if (prefs.position_state && typeof prefs.position_state === 'object') {
         localStorage.setItem(POSITION_STATE_KEY, JSON.stringify(prefs.position_state));
@@ -169,11 +183,15 @@
       }
       if (Array.isArray(prefs.signal_history)) {
         localStorage.setItem(SIGNAL_HISTORY_KEY, JSON.stringify(prefs.signal_history.slice(0, 80)));
+        prefs.signal_history.forEach(function (item) {
+          if (item && item.symbol) symbolHistorySeed.push(item.symbol);
+        });
       }
       if (['1', '5', '15', '60', '240', 'D'].indexOf(String(prefs.tv_kline_interval || '')) >= 0) {
         tvKlineInterval = String(prefs.tv_kline_interval);
         localStorage.setItem(TV_KLINE_INTERVAL_KEY, tvKlineInterval);
       }
+      if (symbolHistorySeed.length) rememberSymbols(symbolHistorySeed, true);
     } catch (e) {
       console.warn('[dashboard] apply server preferences failed:', e.message);
     }
@@ -226,6 +244,256 @@
         saveTvKlineInterval(next);
         tvKlineKey = '';
         renderTradingViewKline();
+      });
+    }
+  }
+  function bindLogout() {
+    var btn = document.getElementById('logout-btn');
+    if (!btn || btn._bound) return;
+    btn._bound = true;
+    btn.addEventListener('click', function () {
+      fetch('api/logout', { method: 'POST', cache: 'no-store' })
+        .catch(function () {})
+        .then(function () { window.location.href = '/login'; });
+    });
+  }
+  function setPasswordMessage(text, cls) {
+    var el = document.getElementById('password-message');
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = 'password-message' + (cls ? ' ' + cls : '');
+  }
+  function closePasswordModal() {
+    var modal = document.getElementById('password-modal');
+    if (modal) {
+      modal.classList.remove('show');
+      modal.setAttribute('aria-hidden', 'true');
+    }
+    setPasswordMessage('', '');
+  }
+  function openPasswordModal() {
+    var modal = document.getElementById('password-modal');
+    if (!modal) return;
+    modal.classList.add('show');
+    modal.setAttribute('aria-hidden', 'false');
+    setPasswordMessage('', '');
+    ['password-current', 'password-new', 'password-confirm'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+    var first = document.getElementById('password-current');
+    if (first) first.focus();
+  }
+  function submitPasswordChange() {
+    var current = document.getElementById('password-current');
+    var next = document.getElementById('password-new');
+    var confirm = document.getElementById('password-confirm');
+    var submit = document.getElementById('password-submit');
+    var currentValue = current ? current.value : '';
+    var nextValue = next ? next.value : '';
+    var confirmValue = confirm ? confirm.value : '';
+    if (!currentValue || !nextValue) {
+      setPasswordMessage('请填写当前密码和新密码。', 'err');
+      return;
+    }
+    if (nextValue.length < 8) {
+      setPasswordMessage('新密码至少 8 位。', 'err');
+      return;
+    }
+    if (nextValue !== confirmValue) {
+      setPasswordMessage('两次新密码不一致。', 'err');
+      return;
+    }
+    if (nextValue === currentValue) {
+      setPasswordMessage('新密码不能和当前密码一样。', 'err');
+      return;
+    }
+    if (submit) submit.disabled = true;
+    setPasswordMessage('正在保存...', '');
+    fetch('api/auth/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        current_password: currentValue,
+        new_password: nextValue,
+        confirm_password: confirmValue
+      }),
+      cache: 'no-store'
+    })
+      .then(function (res) {
+        return res.json().then(function (body) { return { ok: res.ok, body: body }; });
+      })
+      .then(function (result) {
+        if (!result.ok || !result.body || !result.body.changed) {
+          throw new Error((result.body && result.body.error) || '修改失败');
+        }
+        setPasswordMessage('密码已修改，其他设备的旧登录会失效。', 'ok');
+        setTimeout(closePasswordModal, 900);
+      })
+      .catch(function (err) {
+        setPasswordMessage(err.message || '修改失败', 'err');
+      })
+      .then(function () {
+        if (submit) submit.disabled = false;
+      });
+  }
+  function bindPasswordChange() {
+    var btn = document.getElementById('change-password-btn');
+    var form = document.getElementById('password-form');
+    var close = document.getElementById('password-close');
+    var cancel = document.getElementById('password-cancel');
+    var modal = document.getElementById('password-modal');
+    if (btn && !btn._bound) {
+      btn._bound = true;
+      btn.addEventListener('click', openPasswordModal);
+    }
+    if (form && !form._bound) {
+      form._bound = true;
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        submitPasswordChange();
+      });
+    }
+    [close, cancel].forEach(function (item) {
+      if (item && !item._bound) {
+        item._bound = true;
+        item.addEventListener('click', closePasswordModal);
+      }
+    });
+    if (modal && !modal._bound) {
+      modal._bound = true;
+      modal.addEventListener('click', function (e) {
+        if (e.target === modal) closePasswordModal();
+      });
+    }
+  }
+  function setRegisterMessage(text, cls) {
+    var el = document.getElementById('register-message');
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = 'password-message' + (cls ? ' ' + cls : '');
+  }
+  function closeRegisterModal() {
+    var modal = document.getElementById('register-modal');
+    if (modal) {
+      modal.classList.remove('show');
+      modal.setAttribute('aria-hidden', 'true');
+    }
+    setRegisterMessage('', '');
+  }
+  function openRegisterModal() {
+    var modal = document.getElementById('register-modal');
+    if (!modal) return;
+    modal.classList.add('show');
+    modal.setAttribute('aria-hidden', 'false');
+    setRegisterMessage('', '');
+    ['register-username', 'register-password', 'register-confirm'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+    var role = document.getElementById('register-role');
+    if (role) role.value = 'user';
+    var first = document.getElementById('register-username');
+    if (first) first.focus();
+  }
+  function validRegisterUsername(name) {
+    return /^[A-Za-z0-9._@-]{3,64}$/.test(String(name || '').trim());
+  }
+  function submitCreateUser() {
+    var usernameEl = document.getElementById('register-username');
+    var passwordEl = document.getElementById('register-password');
+    var confirmEl = document.getElementById('register-confirm');
+    var roleEl = document.getElementById('register-role');
+    var submit = document.getElementById('register-submit');
+    var username = usernameEl ? usernameEl.value.trim() : '';
+    var password = passwordEl ? passwordEl.value : '';
+    var confirm = confirmEl ? confirmEl.value : '';
+    var role = roleEl ? roleEl.value : 'user';
+    if (!validRegisterUsername(username)) {
+      setRegisterMessage('账号 3-64 位，只能用英文、数字、点、横线、下划线或 @。', 'err');
+      return;
+    }
+    if (password.length < 8) {
+      setRegisterMessage('密码至少 8 位。', 'err');
+      return;
+    }
+    if (password !== confirm) {
+      setRegisterMessage('两次密码不一致。', 'err');
+      return;
+    }
+    if (submit) submit.disabled = true;
+    setRegisterMessage('正在创建账号...', '');
+    fetch('api/auth/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username, password: password, role: role }),
+      cache: 'no-store'
+    })
+      .then(function (res) {
+        return res.json().then(function (body) { return { ok: res.ok, body: body }; });
+      })
+      .then(function (result) {
+        if (!result.ok || !result.body || !result.body.created) {
+          throw new Error((result.body && result.body.error) || '创建失败');
+        }
+        setRegisterMessage('账号 ' + result.body.user.username + ' 已创建。', 'ok');
+        if (passwordEl) passwordEl.value = '';
+        if (confirmEl) confirmEl.value = '';
+      })
+      .catch(function (err) {
+        setRegisterMessage(err.message || '创建失败', 'err');
+      })
+      .then(function () {
+        if (submit) submit.disabled = false;
+      });
+  }
+  function updateAdminControls() {
+    var isAdmin = CURRENT_USER && CURRENT_USER.role === 'admin';
+    var items = document.querySelectorAll('[data-admin-only]');
+    for (var i = 0; i < items.length; i++) {
+      if (isAdmin) items[i].classList.remove('admin-only');
+      else if (!items[i].classList.contains('admin-only')) items[i].classList.add('admin-only');
+    }
+  }
+  function loadCurrentUser() {
+    fetch('api/auth/me', { cache: 'no-store' })
+      .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+      .then(function (payload) {
+        CURRENT_USER = payload && payload.authenticated ? payload.user : null;
+        updateAdminControls();
+      })
+      .catch(function () {
+        CURRENT_USER = null;
+        updateAdminControls();
+      });
+  }
+  function bindCreateUser() {
+    var btn = document.getElementById('create-user-btn');
+    var form = document.getElementById('register-form');
+    var close = document.getElementById('register-close');
+    var cancel = document.getElementById('register-cancel');
+    var modal = document.getElementById('register-modal');
+    if (btn && !btn._bound) {
+      btn._bound = true;
+      btn.addEventListener('click', openRegisterModal);
+    }
+    if (form && !form._bound) {
+      form._bound = true;
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        submitCreateUser();
+      });
+    }
+    [close, cancel].forEach(function (item) {
+      if (item && !item._bound) {
+        item._bound = true;
+        item.addEventListener('click', closeRegisterModal);
+      }
+    });
+    if (modal && !modal._bound) {
+      modal._bound = true;
+      modal.addEventListener('click', function (e) {
+        if (e.target === modal) closeRegisterModal();
       });
     }
   }
@@ -314,7 +582,7 @@
       strategyEl.title = (r && r._strategy_snapshot_at) || GEN || '';
     }
     if (priceEl) {
-      priceEl.textContent = priceMs ? relativeSnapshot(priceMs) : '等待实时价';
+      priceEl.textContent = priceMs ? '' : '等待实时价';
       priceEl.title = priceMs ? 'WebSocket 实时价格' : '';
     }
     if (countdownEl) {
@@ -347,9 +615,6 @@
   function realtimePriceText(r) {
     var v = r ? Number(r.last) : NaN;
     return isFinite(v) ? fmtPrice(v) : '--';
-  }
-  function realtimePriceAge(r) {
-    return r && r._price_snapshot_ms ? relativeSnapshot(r._price_snapshot_ms) : '等待实时';
   }
   function backtestSummary(bt) {
     if (!bt || !bt.windows || !bt.windows.length) return '暂无回测';
@@ -495,6 +760,55 @@
     var symbol = String(raw || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (symbol && symbol.indexOf('USDT') < 0) symbol += 'USDT';
     return symbol;
+  }
+  function normalizeSymbolList(items) {
+    var out = [];
+    (items || []).forEach(function (item) {
+      var sym = normalizeClientSymbol(item && item.symbol ? item.symbol : item);
+      if (sym && out.indexOf(sym) < 0) out.push(sym);
+    });
+    return out;
+  }
+  function loadSymbolHistory() {
+    try {
+      var v = localStorage.getItem(SYMBOL_HISTORY_KEY);
+      var arr = v ? JSON.parse(v) : [];
+      return normalizeSymbolList(Array.isArray(arr) ? arr : []);
+    } catch (e) { return []; }
+  }
+  function saveSymbolHistory(symbols, syncServer) {
+    var out = normalizeSymbolList(symbols).slice(0, 48);
+    try { localStorage.setItem(SYMBOL_HISTORY_KEY, JSON.stringify(out)); } catch (e) {}
+    if (syncServer !== false) saveServerPreferences({ symbol_history: out });
+  }
+  function rememberSymbols(symbols, syncServer) {
+    var merged = loadSymbolHistory();
+    normalizeSymbolList(symbols).forEach(function (sym) {
+      merged = merged.filter(function (item) { return item !== sym; });
+      merged.unshift(sym);
+    });
+    saveSymbolHistory(merged, syncServer);
+  }
+  function activeSymbolMap() {
+    var active = {};
+    DATA.forEach(function (r) {
+      var sym = normalizeClientSymbol(r && r.symbol);
+      if (sym) active[sym] = true;
+    });
+    return active;
+  }
+  function symbolHistoryCandidates() {
+    var active = activeSymbolMap();
+    return loadSymbolHistory().filter(function (sym) { return !active[sym]; }).slice(0, 18);
+  }
+  function seedSymbolHistoryFromLocal() {
+    var seed = [];
+    seed = seed.concat(loadCustomSyms(), loadRemovedSyms());
+    loadSignalHistory().forEach(function (item) {
+      if (item && item.symbol) seed.push(item.symbol);
+    });
+    DATA.forEach(function (r) { if (r && r.symbol) seed.push(r.symbol); });
+    if (seed.length) rememberSymbols(seed, true);
   }
   function wantedRefreshSymbols() {
     var removed = loadRemovedSyms();
@@ -801,6 +1115,96 @@
     }
     return null;
   }
+  function openingGuardDecision(r) {
+    if (!r) {
+      return {
+        key: 'wait',
+        label: '等待数据',
+        action: '先别开仓',
+        reasons: [{ type: 'warn', text: '暂无当前币种策略数据。' }],
+        metrics: []
+      };
+    }
+    var fuse = accountFuseStatus();
+    var snap = signalSnapshot(r);
+    var risk = riskLevel(r);
+    var trigger = snap && snap.trigger ? snap.trigger : {};
+    var reasons = [];
+    var hardBlocks = [];
+    var waits = [];
+    function add(type, text) {
+      var item = { type: type || '', text: text };
+      reasons.push(item);
+      if (type === 'block') hardBlocks.push(item);
+      if (type === 'warn') waits.push(item);
+    }
+
+    if (fuse.active) {
+      add('block', fuse.text + '。今日不要再开新仓。');
+    }
+
+    var staleText = marketWarningText();
+    if (staleText) add('warn', '策略数据可能延迟：' + staleText);
+
+    var priceAge = r._price_snapshot_ms ? Math.max(0, Math.floor((Date.now() - r._price_snapshot_ms) / 1000)) : null;
+    if (priceAge == null) add('warn', '实时价还没连上，不能用旧价格做触发判断。');
+    else if (priceAge > 20) add('warn', '实时价 ' + priceAge + ' 秒未更新，先等 WebSocket 恢复。');
+
+    if (!snap || !snap.advice) {
+      add('warn', '没有可执行周期建议，只能观察。');
+    } else {
+      if (!fuse.active && risk.key === 'block') add('block', risk.text || '当前风险等级为禁止开仓。');
+      else if (!fuse.active && risk.key === 'high') add('warn', risk.text || '当前属于高风险，只能观察或轻仓等待。');
+
+      if (snap.side !== 'long' && snap.side !== 'short') {
+        add('warn', '方向不是明确多/空，当前不适合开新仓。');
+      }
+      if (!isFinite(Number(snap.entry)) || Number(snap.entry) <= 0) {
+        add('block', '建议入场价无效，禁止开仓。');
+      }
+      if (!isFinite(Number(snap.stop)) || Number(snap.stop) <= 0) {
+        add('block', '风控止损无效，禁止开仓。');
+      }
+      if (isRealtimePrejudgeSnap(snap)) {
+        add('warn', '当前 K 线未收盘，这是实时预判，等收盘确认更稳。');
+      }
+      if (trigger.status === 'blocked') {
+        add('block', '入场触发不通过：' + ((trigger.reasons || []).join('；') || triggerLabel(trigger)));
+      } else if (trigger.status === 'watch') {
+        add('warn', '价格接近但还没确认：' + ((trigger.reasons || []).join('；') || triggerLabel(trigger)));
+      } else if (trigger.status !== 'confirmed') {
+        add('warn', '还没有 1m 触发确认，不能把入场价当下单指令。');
+      }
+      if (Number(snap.executionScore || 0) < 55) {
+        add('warn', '开仓执行分低于 55，信号质量不够。');
+      }
+      var posPct = snap.position ? Number(snap.position.sizePct || 0) : 0;
+      if (posPct <= 0) {
+        add('warn', '风险预算仓位为 0%，当前不建议开仓。');
+      }
+    }
+
+    var key = hardBlocks.length ? 'block' : (waits.length ? 'wait' : 'allow');
+    var label = key === 'allow' ? '允许观察开仓' : key === 'block' ? '禁止开仓' : '等待确认';
+    var action = key === 'allow'
+      ? '触发与风控通过，可按风险预算执行'
+      : key === 'block'
+        ? '禁止新开仓，先处理风险'
+        : '先别动，等触发确认或收盘确认';
+    if (!reasons.length) {
+      reasons.push({ type: '', text: '风控、触发、止损和实时价当前未发现硬性阻断。' });
+    }
+    var metrics = [];
+    if (snap && snap.advice) {
+      metrics.push(['风险等级', risk.label || '-']);
+      metrics.push(['开仓分', Math.round(Number(snap.executionScore || 0)) + '/100']);
+      metrics.push(['K线', snap.candleState || '-']);
+      metrics.push(['触发', triggerLabel(trigger)]);
+      metrics.push(['建议仓位', snap.position ? snap.position.text : '0%']);
+      metrics.push(['实时价', realtimePriceText(r)]);
+    }
+    return { key: key, label: label, action: action, reasons: reasons, metrics: metrics };
+  }
   function loadPositionStates() {
     try { var v = localStorage.getItem(POSITION_STATE_KEY); return v ? JSON.parse(v) : {}; } catch (e) { return {}; }
   }
@@ -929,7 +1333,6 @@
     var bestAdvice = snap.advice;
     var state = getPositionState(r.symbol);
     var livePriceEl = document.querySelector('#signal-banner .js-signal-live-price');
-    var liveAgeEl = document.querySelector('#signal-banner .js-signal-live-age');
     var entryLabelEl = document.querySelector('#signal-banner .js-signal-entry-label');
     var entryEl = document.querySelector('#signal-banner .js-signal-entry');
     var distanceEl = document.querySelector('#signal-banner .js-signal-distance');
@@ -945,10 +1348,6 @@
       sbEl.className = 'sb risk-' + risk.key + (bestAdvice && bestAdvice.candle_state === '实时预判' ? ' realtime-prejudge' : '');
     }
     if (livePriceEl) livePriceEl.textContent = realtimePriceText(r);
-    if (liveAgeEl) {
-      liveAgeEl.textContent = realtimePriceAge(r);
-      liveAgeEl.title = r._price_snapshot_ms ? 'WebSocket 实时价格' : '等待 WebSocket 实时价格';
-    }
     if (entryLabelEl) entryLabelEl.textContent = snap.entryLabel;
     if (entryEl && snap.entry != null) entryEl.textContent = fmtPrice(snap.entry);
     if (distanceEl) distanceEl.textContent = snap.entryDistance || '';
@@ -1027,6 +1426,7 @@
         el.title = '实时价格';
       }
       updateRealtimeSignal();
+      refreshOpeningGuardSoon();
       renderDepthDom();
       setGen();
       updateLiveBadge(true);
@@ -1093,6 +1493,7 @@
       if (sym && DEFAULT_SYMS.indexOf(sym) < 0 && custom.indexOf(sym) < 0) custom.push(sym);
     });
     try { localStorage.setItem(LS_KEY, JSON.stringify(custom)); } catch (e) {}
+    rememberSymbols(DATA.map(function (r) { return r && r.symbol; }), true);
     saveServerPreferences({ custom_symbols: custom });
   }
   function loadCustomSyms() {
@@ -1201,6 +1602,7 @@
   }
 
   function removeSymbol(sym) {
+    rememberSymbols([sym], true);
     var removed = loadRemovedSyms();
     if (DEFAULT_SYMS.indexOf(sym) >= 0 && removed.indexOf(sym) < 0) {
       removed.push(sym);
@@ -1223,48 +1625,77 @@
   function bindAddSymbol() {
     var btn = document.getElementById('add-sym-btn');
     var input = document.getElementById('add-sym-input');
+    renderSymbolHistorySuggestions();
     if (!btn || !input || btn._bound) return;
     btn._bound = true;
-    function doAdd() {
-      var raw = (input.value || '').trim().toUpperCase();
-      if (!raw) { setAddStatus('请输入币种', 'err'); return; }
-      if (!raw.endsWith('USDT')) raw = raw + 'USDT';
-      if (DATA.some(function (r) { return r.symbol === raw; })) {
-        setAddStatus(raw + ' 已存在', 'err');
-        return;
-      }
-      var btn2 = document.getElementById('add-sym-btn');
-      btn2.disabled = true;
-      setAddStatus('正在获取 ' + raw + ' 实时数据…', '');
-      showLoading('正在获取 ' + raw + ' …');
-      fetch('api/market?symbol=' + encodeURIComponent(raw), { cache: 'no-store' })
-        .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
-        .then(function (payload) {
-          applyMarketPayloadState(payload);
-          var arr = stampReports(payload.data || [], payload.generated_at);
-          if (!arr.length) throw new Error('未取到数据');
-          DATA = DATA.concat(arr);
-          GEN = payload.generated_at || GEN;
-          updateLiveBadge(true, payload);
-          forgetRemovedSym(arr[0].symbol);
-          currentSymbol = arr[0].symbol;
-          saveCustomSyms();
-          recordSignalHistory('添加币种');
-          renderSymbolTabs();
-          render();
-          setAddStatus(raw + ' 添加成功 ✓', 'ok');
-          input.value = '';
-        })
-        .catch(function (err) {
-          setAddStatus('添加失败: ' + err.message, 'err');
-        })
-        .then(function () {
-          btn2.disabled = false;
-          hideLoading();
-        });
-    }
+    function doAdd() { addSymbol(input.value, 'input'); }
     btn.addEventListener('click', doAdd);
     input.addEventListener('keydown', function (e) { if (e.key === 'Enter') doAdd(); });
+  }
+
+  function renderSymbolHistorySuggestions() {
+    var host = document.getElementById('symbol-history-suggestions');
+    if (!host) return;
+    var candidates = symbolHistoryCandidates();
+    if (!candidates.length) {
+      host.innerHTML = '';
+      return;
+    }
+    host.innerHTML = '<span class="sym-history-label">最近币种</span>' + candidates.map(function (sym) {
+      return '<button class="sym-history-btn" type="button" data-history-symbol="' + sym + '" title="添加 ' + sym + '">' + sym.replace('USDT', '') + '</button>';
+    }).join('');
+    var btns = host.querySelectorAll('[data-history-symbol]');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].addEventListener('click', function () {
+        addSymbol(this.getAttribute('data-history-symbol'), 'history');
+      });
+    }
+  }
+
+  function addSymbol(rawSymbol, source) {
+    var raw = normalizeClientSymbol(rawSymbol);
+    if (!raw) { setAddStatus('请输入币种', 'err'); return; }
+    if (DATA.some(function (r) { return r.symbol === raw; })) {
+      currentSymbol = raw;
+      rememberSymbols([raw], true);
+      renderSymbolTabs();
+      render();
+      setAddStatus(raw + ' 已打开', 'ok');
+      return;
+    }
+    var btn2 = document.getElementById('add-sym-btn');
+    var input = document.getElementById('add-sym-input');
+    if (btn2) btn2.disabled = true;
+    setAddStatus('正在获取 ' + raw + ' 实时数据…', '');
+    showLoading('正在获取 ' + raw + ' …');
+    fetch('api/market?symbol=' + encodeURIComponent(raw), { cache: 'no-store' })
+      .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+      .then(function (payload) {
+        applyMarketPayloadState(payload);
+        var arr = stampReports(payload.data || [], payload.generated_at);
+        if (!arr.length) throw new Error('未取到数据');
+        arr.forEach(function (item) {
+          if (!DATA.some(function (r) { return r.symbol === item.symbol; })) DATA.push(item);
+        });
+        GEN = payload.generated_at || GEN;
+        updateLiveBadge(true, payload);
+        forgetRemovedSym(arr[0].symbol);
+        rememberSymbols([arr[0].symbol], true);
+        currentSymbol = arr[0].symbol;
+        saveCustomSyms();
+        recordSignalHistory(source === 'history' ? '历史币种恢复' : '添加币种');
+        renderSymbolTabs();
+        render();
+        setAddStatus(raw + ' 添加成功 ✓', 'ok');
+        if (input) input.value = '';
+      })
+      .catch(function (err) {
+        setAddStatus('添加失败: ' + err.message, 'err');
+      })
+      .then(function () {
+        if (btn2) btn2.disabled = false;
+        hideLoading();
+      });
   }
 
   /* ---------- P0: main signal banner ---------- */
@@ -1286,7 +1717,7 @@
     var title = r.symbol.replace('USDT', '') + ' ' + (bestAdvice ? bestAdvice.name : '当前') + '：' + biasPlain(signalBias);
     var reason = bestAdvice ? bestAdvice.action : (r.summary || '');
     // 主行 5 核心:实时价 / 方向 / 开仓分 / 触发状态 / 建议仓位
-    var majorHtml = '<div class="sb-act major">实时价<b class="js-signal-live-price" style="color:' + C.accent + '">' + realtimePriceText(r) + '</b><span class="minor js-signal-live-age" title="' + (r._price_snapshot_ms ? 'WebSocket 实时价格' : '等待 WebSocket 实时价格') + '">' + realtimePriceAge(r) + '</span></div>';
+    var majorHtml = '<div class="sb-act major">实时价<b class="js-signal-live-price" style="color:' + C.accent + '">' + realtimePriceText(r) + '</b></div>';
     if (bestAdvice) {
       var entryColor = snap.side === 'short' ? C.bear : snap.side === 'long' ? C.bull : C.accent;
       majorHtml += '<div class="sb-act major">方向分<b style="color:' + C.accent + '">' + Math.round(snap.directionScore || 0) + '</b></div>';
@@ -1750,6 +2181,7 @@
         this.classList.add('active');
         renderSignal();
         renderRisks();
+        renderAccountRisk();
         renderSignalHistory();
         updateAdviceHighlight();
       });
@@ -1815,16 +2247,38 @@
   function renderAccountRisk() {
     var host = document.getElementById('account-risk');
     if (!host) return;
+    lastGuardRenderAt = Date.now();
+    var oldManual = host.querySelector('.manual-fuse');
+    var manualOpen = !!(oldManual && oldManual.open);
+    var r = cur();
+    var guard = openingGuardDecision(r);
     var fuse = accountFuseStatus();
     var state = fuse.state;
     var cls = fuse.active ? 'danger' : (state.dailyLossPct || state.consecutiveLosses || state.singleLossPct ? 'warn' : 'ok');
     var untilText = fuse.active && fuse.until ? ' · 恢复 ' + shortTime(fuse.until) : '';
+    var reasonsHtml = guard.reasons.map(function (item) {
+      return '<div class="guard-reason ' + (item.type || '') + '">' + htmlSafe(item.text) + '</div>';
+    }).join('');
+    var metricsHtml = guard.metrics.map(function (m) {
+      return '<div class="guard-metric"><span>' + htmlSafe(m[0]) + '</span><b title="' + htmlSafe(m[1]) + '">' + htmlSafe(m[1]) + '</b></div>';
+    }).join('');
     host.innerHTML =
-      '<div class="ar-status ' + cls + '">' + fuse.text + untilText + '</div>' +
-      '<div class="ar-field"><label for="ar-daily-loss">今日亏损%</label><input id="ar-daily-loss" type="number" step="0.1" min="0" value="' + state.dailyLossPct + '"></div>' +
-      '<div class="ar-field"><label for="ar-losses">连续亏损</label><input id="ar-losses" type="number" step="1" min="0" value="' + state.consecutiveLosses + '"></div>' +
-      '<div class="ar-field"><label for="ar-single-loss">单笔亏损%</label><input id="ar-single-loss" type="number" step="0.1" min="0" value="' + state.singleLossPct + '"></div>' +
-      '<div class="ar-actions"><button class="primary" id="ar-save">保存</button><button id="ar-reset">重置今日</button></div>';
+      '<div class="guard-head">' +
+        '<div><div class="guard-title">当前开仓结论</div><div class="guard-action">' + htmlSafe(guard.action) + '</div></div>' +
+        '<div class="guard-pill ' + guard.key + '">' + htmlSafe(guard.label) + '</div>' +
+      '</div>' +
+      '<div class="guard-reasons">' + reasonsHtml + '</div>' +
+      (metricsHtml ? '<div class="guard-metrics">' + metricsHtml + '</div>' : '') +
+      '<details class="manual-fuse"' + (manualOpen ? ' open' : '') + '>' +
+        '<summary>手动账户熔断备用（未接交易账户 API 时使用）</summary>' +
+        '<div class="manual-fuse-body">' +
+          '<div class="ar-status ' + cls + '">' + fuse.text + untilText + '</div>' +
+          '<div class="ar-field"><label for="ar-daily-loss">今日亏损%</label><input id="ar-daily-loss" type="number" step="0.1" min="0" value="' + state.dailyLossPct + '"></div>' +
+          '<div class="ar-field"><label for="ar-losses">连续亏损</label><input id="ar-losses" type="number" step="1" min="0" value="' + state.consecutiveLosses + '"></div>' +
+          '<div class="ar-field"><label for="ar-single-loss">单笔亏损%</label><input id="ar-single-loss" type="number" step="0.1" min="0" value="' + state.singleLossPct + '"></div>' +
+          '<div class="ar-actions"><button class="primary" id="ar-save">保存</button><button id="ar-reset">重置今日</button></div>' +
+        '</div>' +
+      '</details>';
     var saveBtn = document.getElementById('ar-save');
     var resetBtn = document.getElementById('ar-reset');
     function readInput(id) {
@@ -1853,6 +2307,12 @@
         render();
       });
     }
+  }
+  function refreshOpeningGuardSoon() {
+    var active = document.activeElement;
+    if (active && /^ar-/.test(active.id || '')) return;
+    if (Date.now() - lastGuardRenderAt < 2000) return;
+    renderAccountRisk();
   }
 
   /* ---------- risks (current symbol only, plain language) ---------- */
@@ -1986,6 +2446,7 @@
       return !DATA.some(function (r) { return r.symbol === sym; });
     });
     if (!custom.length) { done(); return; }
+    rememberSymbols(custom, true);
     showLoading('正在恢复 ' + custom.length + ' 个自定义币种…');
     fetch('api/market?symbols=' + encodeURIComponent(custom.join(',')), { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
@@ -2004,6 +2465,10 @@
 
   function boot() {
     tick();
+    bindLogout();
+    bindPasswordChange();
+    bindCreateUser();
+    loadCurrentUser();
     if (!clockTimer) clockTimer = setInterval(tick, 1000);
     window.addEventListener('resize', onResize);
     window.addEventListener('beforeunload', cleanup);
@@ -2012,7 +2477,8 @@
     loadServerPreferences(startMarketBoot);
 
     function startMarketBoot() {
-    // 1. load default symbols
+      seedSymbolHistoryFromLocal();
+      // 1. load default symbols
     fetch('api/market', { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {

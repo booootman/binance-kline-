@@ -61,6 +61,7 @@
         "TLM extreme-rally downgrade is applied before side, backtest, and stop selection, with downgraded direction-score caps",
         "Backend risk-budget sizing with suggested_size_pct, stop_distance_pct, max_loss_pct, and allowed/note metadata",
         "Frontend account-risk fuse for daily loss, consecutive losses, and max single loss, blocking new-open suggestions until next local day",
+        "Opening-risk decision panel that automatically summarizes allow/wait/block status from strategy risk, trigger confirmation, candle state, stop validity, realtime price freshness, and manual fuse state",
         "Frontend position display uses risk-budget percentage instead of score-to-star position labels",
         "Same-side altcoin correlation exposure warning across loaded symbols",
         "Frontend stale/warning/error_type handling for delayed cached snapshots",
@@ -169,6 +170,48 @@
       "limitations": [
         "Server access to Binance APIs still depends on the hosting provider network not being blocked or rate-limited by Binance.",
         "Production secrets should be set in a server-only .env file, not committed."
+      ]
+    },
+    {
+      "id": "database-login-gate",
+      "name": "Database-backed login gate",
+      "status": "implemented",
+      "paths": [
+        "src/bian_dashboard/storage.py",
+        "src/bian_dashboard/server.py",
+        "web/binance-futures-dashboard.html",
+        "web/assets/charts.js",
+        "docker-compose.yml",
+        ".env.example",
+        "scripts/deploy.py",
+        "docs/docker-deploy.md"
+      ],
+      "capabilities": [
+        "MySQL-backed dashboard users and sessions",
+        "PBKDF2-SHA256 password hashes instead of plaintext passwords",
+        "HttpOnly session cookie with hashed session token stored in MySQL",
+        "Server-side auth gate for dashboard pages, APIs, preferences, and realtime SSE",
+        "Public health endpoint for Docker health checks",
+        "Login and logout endpoints plus dashboard logout button",
+        "Authenticated password change endpoint and dashboard modal",
+        "Password changes verify the current password, store a fresh PBKDF2-SHA256 hash, and invalidate other sessions for the same user",
+        "Admin-only user registration endpoint and dashboard modal for creating user or admin accounts",
+        "Bootstrap admin creation only when the users table is empty",
+        "Basic per-IP login failure lockout"
+      ],
+      "verification": [
+        "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py scripts/deploy.py bian.py server.py",
+        "node --check web/assets/charts.js",
+        "powershell -ExecutionPolicy Bypass -File scripts/verify.ps1",
+        "password-hash smoke test validates the right password and rejects a wrong password",
+        "auth username validation smoke test covers accepted and rejected account names",
+        "local auth smoke: health 200, dashboard redirects to /login, login page renders"
+      ],
+      "limitations": [
+        "Bootstrap credentials are still provided through server-only environment variables for first-user creation.",
+        "Anonymous public registration is intentionally not exposed; only admin users can create accounts.",
+        "There is not yet a web UI for disabling users.",
+        "Set BIAN_AUTH_COOKIE_SECURE=1 when serving behind HTTPS."
       ]
     }
   ]

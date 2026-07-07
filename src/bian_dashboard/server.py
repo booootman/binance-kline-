@@ -10,6 +10,8 @@ Local dashboard server for Binance futures analysis.
 """
 import http.server
 import asyncio
+from http import cookies
+import html
 import json
 import logging
 import os
@@ -18,7 +20,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, quote
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get("BIAN_LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -49,6 +51,12 @@ except Exception:
 
 HOST = os.environ.get("BIAN_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BIAN_PORT", "8000"))
+AUTH_ENABLED = os.environ.get("BIAN_AUTH_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+AUTH_COOKIE_NAME = os.environ.get("BIAN_AUTH_COOKIE_NAME", "bian_session")
+AUTH_SESSION_TTL_SECONDS = int(os.environ.get("BIAN_AUTH_SESSION_TTL_SECONDS", str(7 * 24 * 3600)))
+AUTH_COOKIE_SECURE = os.environ.get("BIAN_AUTH_COOKIE_SECURE", "0").lower() in ("1", "true", "yes", "on")
+AUTH_MAX_FAILURES = int(os.environ.get("BIAN_AUTH_MAX_FAILURES", "8"))
+AUTH_LOCKOUT_SECONDS = int(os.environ.get("BIAN_AUTH_LOCKOUT_SECONDS", "300"))
 PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(PACKAGE_ROOT))
 WEB_ROOT = os.path.join(ROOT, "web")
@@ -523,18 +531,158 @@ def symbols_from_market_data(data):
     return symbols
 
 
+_auth_bootstrap_done = False
+_auth_bootstrap_lock = threading.RLock()
+_login_failures = {}
+_login_failures_lock = threading.RLock()
+
+
+def auth_enabled():
+    return AUTH_ENABLED
+
+
+def ensure_auth_ready():
+    global _auth_bootstrap_done
+    if not auth_enabled() or storage is None:
+        return True
+    with _auth_bootstrap_lock:
+        if _auth_bootstrap_done:
+            return True
+        _auth_bootstrap_done = bool(storage.ensure_auth_bootstrap())
+        return _auth_bootstrap_done
+
+
+def is_public_path(path):
+    if not auth_enabled():
+        return True
+    if path in ("/login", "/api/login", "/api/health", "/favicon.ico"):
+        return True
+    if path == "/assets/favicon.svg":
+        return True
+    return False
+
+
+def login_page(next_path="", error=""):
+    next_url = next_path if str(next_path or "").startswith("/") else "/binance-futures-dashboard.html"
+    safe_next = html.escape(next_url, quote=True)
+    safe_error = html.escape(error or "", quote=True)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bian 登录</title>
+<link rel="icon" href="./assets/favicon.svg" type="image/svg+xml">
+<style>
+body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#050a14;color:#e8f1ff;font-family:Arial,'Microsoft YaHei',sans-serif}}
+.box{{width:min(420px,calc(100vw - 36px));background:#0b182b;border:1px solid #1a2c4a;border-radius:14px;padding:28px;box-shadow:0 16px 42px rgba(0,0,0,.38)}}
+.logo{{width:54px;height:54px;border-radius:14px;background:linear-gradient(135deg,#00e5ff,#00ff9d);display:grid;place-items:center;color:#06111f;font-weight:800;font-size:24px;margin-bottom:18px}}
+h1{{margin:0 0 8px;font-size:22px;font-weight:700}}
+p{{margin:0 0 22px;color:#8aa0c0;font-size:13px;line-height:1.6}}
+label{{display:block;margin:14px 0 7px;color:#b8c8e0;font-size:13px}}
+input{{width:100%;box-sizing:border-box;border:1px solid #1a2c4a;border-radius:10px;background:#07111f;color:#e8f1ff;padding:12px 13px;font-size:15px;outline:none}}
+input:focus{{border-color:#00e5ff;box-shadow:0 0 0 3px rgba(0,229,255,.14)}}
+button{{width:100%;margin-top:20px;border:0;border-radius:10px;padding:12px 14px;background:linear-gradient(135deg,#00e5ff,#00ff9d);color:#06111f;font-size:15px;font-weight:800;cursor:pointer}}
+.err{{display:none;margin-top:14px;color:#ff6b82;background:rgba(255,59,92,.1);border:1px solid rgba(255,59,92,.28);border-radius:10px;padding:10px;font-size:13px}}
+.err.show{{display:block}}
+</style>
+</head>
+<body>
+<form class="box" id="login-form">
+  <div class="logo">↗</div>
+  <h1>Bian 合约助手</h1>
+  <p>请输入数据库账号登录。登录后会写入 HttpOnly 会话 Cookie。</p>
+  <label for="username">账号</label>
+  <input id="username" name="username" autocomplete="username" autofocus>
+  <label for="password">密码</label>
+  <input id="password" name="password" type="password" autocomplete="current-password">
+  <button type="submit">登录</button>
+  <div class="err{(' show' if error else '')}" id="err">{safe_error}</div>
+</form>
+<script>
+var form=document.getElementById('login-form');
+var err=document.getElementById('err');
+form.addEventListener('submit',function(e){{
+  e.preventDefault();
+  err.className='err';
+  fetch('/api/login',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{
+    username:document.getElementById('username').value,
+    password:document.getElementById('password').value
+  }}),cache:'no-store'}}).then(function(res){{return res.json().then(function(body){{return {{ok:res.ok,body:body}};}});}})
+  .then(function(result){{
+    if(result.ok&&result.body.authenticated) window.location.href={json.dumps(next_url)};
+    else throw new Error((result.body&&result.body.error)||'登录失败');
+  }}).catch(function(ex){{err.textContent=ex.message;err.className='err show';}});
+}});
+</script>
+</body>
+</html>"""
+
+
+def login_failure_key(client_ip, username):
+    return (client_ip or "", (username or "").strip().lower())
+
+
+def login_locked(client_ip, username):
+    key = login_failure_key(client_ip, username)
+    now = time.time()
+    with _login_failures_lock:
+        item = _login_failures.get(key)
+        if not item:
+            return False
+        if item.get("until", 0) <= now:
+            _login_failures.pop(key, None)
+            return False
+        return True
+
+
+def record_login_failure(client_ip, username):
+    key = login_failure_key(client_ip, username)
+    now = time.time()
+    with _login_failures_lock:
+        item = _login_failures.get(key, {"count": 0, "until": 0})
+        count = int(item.get("count", 0)) + 1
+        until = now + AUTH_LOCKOUT_SECONDS if count >= AUTH_MAX_FAILURES else 0
+        _login_failures[key] = {"count": count, "until": until}
+
+
+def clear_login_failures(client_ip, username):
+    with _login_failures_lock:
+        _login_failures.pop(login_failure_key(client_ip, username), None)
+
+
+def valid_auth_username(username):
+    text = str(username or "").strip()
+    if len(text) < 3 or len(text) > 64:
+        return False
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-@")
+    return all(ch in allowed for ch in text)
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=WEB_ROOT, **kw)
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
+            self.send_json(200, {"ok": True})
+            return
+        if parsed.path == "/login":
+            params = parse_qs(parsed.query)
+            self.serve_login(params.get("next", ["/binance-futures-dashboard.html"])[0])
+            return
+        if not self.require_auth(parsed.path):
+            return
         if parsed.path == "/api/market":
             self.serve_api(parsed.query)
         elif parsed.path == "/api/realtime-prices":
             self.serve_realtime_prices(parsed.query)
         elif parsed.path == "/api/preferences":
             self.serve_preferences()
+        elif parsed.path == "/api/auth/me":
+            user = self.current_user()
+            self.send_json(200, {"authenticated": bool(user), "user": user})
         elif parsed.path == "/api/storage-status":
             self.serve_storage_status()
         elif parsed.path in ("", "/", "/index.html"):
@@ -545,7 +693,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/api/preferences":
+        if parsed.path == "/api/login":
+            self.login_api()
+        elif not self.require_auth(parsed.path):
+            return
+        elif parsed.path == "/api/logout":
+            self.logout_api()
+        elif parsed.path == "/api/auth/password":
+            self.change_password_api()
+        elif parsed.path == "/api/auth/users":
+            self.create_user_api()
+        elif parsed.path == "/api/preferences":
             self.save_preferences_api()
         else:
             self.send_json(404, {"error": "not found"})
@@ -556,6 +714,209 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
+
+    def client_ip(self):
+        forwarded = self.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()
+        return self.client_address[0] if self.client_address else ""
+
+    def auth_token(self):
+        raw = self.headers.get("Cookie", "")
+        if not raw:
+            return ""
+        jar = cookies.SimpleCookie()
+        try:
+            jar.load(raw)
+        except Exception:
+            return ""
+        item = jar.get(AUTH_COOKIE_NAME)
+        return item.value if item else ""
+
+    def current_user(self):
+        if not auth_enabled():
+            return {"id": 0, "username": "local", "role": "admin"}
+        if storage is None:
+            return None
+        ensure_auth_ready()
+        return storage.user_for_session(self.auth_token())
+
+    def require_auth(self, path):
+        if is_public_path(path):
+            return True
+        user = self.current_user()
+        if user:
+            return True
+        if path.startswith("/api/"):
+            self.send_json(401, {"authenticated": False, "error": "login required"})
+        else:
+            self.send_response(302)
+            self.send_header("Location", "/login?next=" + quote(self.path or "/", safe=""))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        return False
+
+    def serve_login(self, next_path="/binance-futures-dashboard.html", error=""):
+        if self.current_user():
+            self.send_response(302)
+            self.send_header("Location", next_path or "/binance-futures-dashboard.html")
+            self.end_headers()
+            return
+        body = login_page(next_path, error).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def login_api(self):
+        try:
+            if not auth_enabled():
+                self.send_json(200, {"authenticated": True, "user": {"username": "local"}})
+                return
+            if storage is None or not ensure_auth_ready():
+                self.send_json(503, {"authenticated": False, "error": "auth database is not ready"})
+                return
+            body = self.read_json_body()
+            username = str(body.get("username", "")).strip()
+            password = str(body.get("password", ""))
+            client_ip = self.client_ip()
+            if login_locked(client_ip, username):
+                self.send_json(429, {"authenticated": False, "error": "登录失败过多，请稍后再试"})
+                return
+            user = storage.verify_auth_user(username, password)
+            if not user:
+                record_login_failure(client_ip, username)
+                self.send_json(401, {"authenticated": False, "error": "账号或密码错误"})
+                return
+            clear_login_failures(client_ip, username)
+            session = storage.create_auth_session(
+                user["id"],
+                self.headers.get("User-Agent", ""),
+                client_ip,
+                AUTH_SESSION_TTL_SECONDS,
+            )
+            if not session:
+                self.send_json(503, {"authenticated": False, "error": "session create failed"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            cookie = (
+                f"{AUTH_COOKIE_NAME}={session['token']}; Path=/; HttpOnly; SameSite=Lax; "
+                f"Max-Age={AUTH_SESSION_TTL_SECONDS}"
+            )
+            if AUTH_COOKIE_SECURE:
+                cookie += "; Secure"
+            self.send_header("Set-Cookie", cookie)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(json.dumps({"authenticated": True, "user": user}, ensure_ascii=False).encode("utf-8"))
+        except Exception as exc:
+            LOG.exception("login failed")
+            self.send_json(500, {"authenticated": False, "error": str(exc)})
+
+    def logout_api(self):
+        token = self.auth_token()
+        if storage is not None:
+            storage.delete_auth_session(token)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", f"{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(b'{"authenticated":false}')
+
+    def change_password_api(self):
+        try:
+            if not auth_enabled():
+                self.send_json(200, {"changed": True})
+                return
+            if storage is None or not ensure_auth_ready():
+                self.send_json(503, {"changed": False, "error": "auth database is not ready"})
+                return
+            token = self.auth_token()
+            user = self.current_user()
+            if not user:
+                self.send_json(401, {"changed": False, "error": "login required"})
+                return
+            body = self.read_json_body()
+            current_password = str(body.get("current_password", ""))
+            new_password = str(body.get("new_password", ""))
+            confirm_password = str(body.get("confirm_password", ""))
+            if not current_password or not new_password:
+                self.send_json(400, {"changed": False, "error": "current and new password are required"})
+                return
+            if confirm_password and confirm_password != new_password:
+                self.send_json(400, {"changed": False, "error": "new password confirmation does not match"})
+                return
+            if len(new_password) < 8:
+                self.send_json(400, {"changed": False, "error": "new password must be at least 8 characters"})
+                return
+            if len(new_password) > 128:
+                self.send_json(400, {"changed": False, "error": "new password is too long"})
+                return
+            if new_password == current_password:
+                self.send_json(400, {"changed": False, "error": "new password must be different"})
+                return
+            ok, error = storage.change_auth_password(user["id"], current_password, new_password)
+            if not ok:
+                self.send_json(401, {"changed": False, "error": error or "password change failed"})
+                return
+            storage.delete_other_auth_sessions(user["id"], token)
+            LOG.warning("auth password changed; user=%s; client_ip=%s", user.get("username"), self.client_ip())
+            self.send_json(200, {"changed": True, "user": {"username": user.get("username"), "role": user.get("role")}})
+        except Exception as exc:
+            LOG.exception("password change failed")
+            self.send_json(500, {"changed": False, "error": str(exc)})
+
+    def create_user_api(self):
+        try:
+            if not auth_enabled():
+                self.send_json(200, {"created": True, "user": {"username": "local", "role": "admin"}})
+                return
+            if storage is None or not ensure_auth_ready():
+                self.send_json(503, {"created": False, "error": "auth database is not ready"})
+                return
+            current = self.current_user()
+            if not current:
+                self.send_json(401, {"created": False, "error": "login required"})
+                return
+            if current.get("role") != "admin":
+                self.send_json(403, {"created": False, "error": "admin role required"})
+                return
+            body = self.read_json_body()
+            username = str(body.get("username", "")).strip()
+            password = str(body.get("password", ""))
+            role = "admin" if str(body.get("role", "user")).strip().lower() == "admin" else "user"
+            if not valid_auth_username(username):
+                self.send_json(400, {
+                    "created": False,
+                    "error": "username must be 3-64 characters: letters, numbers, dot, dash, underscore or @",
+                })
+                return
+            if len(password) < 8:
+                self.send_json(400, {"created": False, "error": "password must be at least 8 characters"})
+                return
+            if len(password) > 128:
+                self.send_json(400, {"created": False, "error": "password is too long"})
+                return
+            user, error = storage.create_auth_user(username, password, role)
+            if not user:
+                status = 409 if error == "username already exists" else 400
+                self.send_json(status, {"created": False, "error": error or "create user failed"})
+                return
+            LOG.warning(
+                "auth user created; username=%s; role=%s; operator=%s; client_ip=%s",
+                user.get("username"),
+                user.get("role"),
+                current.get("username"),
+                self.client_ip(),
+            )
+            self.send_json(200, {"created": True, "user": user})
+        except Exception as exc:
+            LOG.exception("create auth user failed")
+            self.send_json(500, {"created": False, "error": str(exc)})
 
     def serve_api(self, query):
         symbols = parse_symbols(query)

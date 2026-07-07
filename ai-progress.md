@@ -178,3 +178,31 @@
 - Public `GET http://159.223.91.36:8000/api/storage-status` reported MySQL and Redis available.
 - Public `GET http://159.223.91.36:8000/api/market?symbols=DOGEUSDT,TLMUSDT` returned `stale=false`.
 - Public `GET http://159.223.91.36:8000/api/realtime-prices?symbols=DOGEUSDT` streamed SSE data with `connected=true`.
+
+## 2026-07-07 Database-backed login gate
+
+- Added MySQL-backed auth tables for dashboard users and sessions.
+- Passwords are stored as PBKDF2-SHA256 hashes; session cookies store only random tokens, with hashed tokens persisted in MySQL.
+- Added `/login`, `/api/login`, `/api/logout`, and `/api/health`.
+- Added server-side auth checks for dashboard pages, APIs, and realtime SSE endpoints.
+- Added a dashboard logout button.
+- Added `/api/auth/password` plus a dashboard password-change modal; the current password is required, the new password is stored as a fresh hash, and other sessions for the same user are invalidated.
+- Added admin-only `/api/auth/users` plus a dashboard registration modal for creating additional `user` or `admin` accounts; public anonymous registration is intentionally not exposed.
+- Added per-IP login failure lockout.
+- Docker and the Python deploy script now configure a bootstrap admin user only when the auth users table is empty.
+
+## Login Gate Verification
+
+- Passed `python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py scripts/deploy.py bian.py server.py`.
+- Passed `node --check web/assets/charts.js`.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1`.
+- Passed password-hash smoke test: generated PBKDF2-SHA256 hash validates the right password and rejects a wrong password.
+- Passed auth username validation smoke test for allowed and rejected account names.
+- Passed local smoke test: `/api/health` returns 200 without auth, dashboard HTML redirects to `/login`, and `/login` renders.
+
+## 2026-07-07 Opening guard panel upgrade
+
+- Reworked the former manual-only account fuse panel into an automatic opening-risk decision panel.
+- The panel now shows allow/wait/block status based on current strategy risk, trigger confirmation, candle state, stop validity, realtime price freshness, and manual fuse status.
+- Kept daily-loss/consecutive-loss/single-loss fields as a collapsed manual fuse fallback because the app is not connected to exchange account equity.
+- The opening guard refreshes lightly with realtime price updates without interrupting manual fuse input.
