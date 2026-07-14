@@ -5,9 +5,14 @@ __pycache__/
 .venv/
 venv/
 node_modules/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.trae-html-share-packages/
 archive/
 backups/
 .agents/
 runtime/*.json
 runtime/*.tmp
 runtime/*.log
+runtime/*.lock

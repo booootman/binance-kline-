@@ -8,12 +8,14 @@ installed, this module persists browser preferences and caches hot market data.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import hashlib
 import hmac
 import secrets
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
@@ -21,6 +23,13 @@ from urllib.parse import parse_qs, urlparse
 
 LOG = logging.getLogger("bian-dashboard.storage")
 PASSWORD_HASH_ITERATIONS = 260000
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+SIGNAL_REVIEW_FILE = os.environ.get(
+    "BIAN_SIGNAL_REVIEW_FILE",
+    os.path.join(ROOT, "runtime", "signal_reviews.json"),
+)
+SIGNAL_REVIEW_LIMIT = int(os.environ.get("BIAN_SIGNAL_REVIEW_LIMIT", "5000"))
+STRATEGY_SNAPSHOT_LIMIT = max(10, int(os.environ.get("BIAN_STRATEGY_SNAPSHOT_LIMIT", "1000")))
 
 
 def _utc_datetime(value=None):
@@ -62,6 +71,12 @@ def session_token_hash(token):
     return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
 
 
+def _is_duplicate_key_error(exc):
+    text = str(exc)
+    code = getattr(exc, "args", [None])[0] if getattr(exc, "args", None) else None
+    return code == 1062 or "Duplicate entry" in text or "UNIQUE constraint" in text
+
+
 class DashboardStorage:
     def __init__(self):
         self.user_id = os.environ.get("BIAN_STORAGE_USER_ID", "default").strip() or "default"
@@ -72,6 +87,20 @@ class DashboardStorage:
         self._mysql_checked = False
         self._redis_checked = False
         self._redis_block_until = 0.0
+        self._signal_review_lock = threading.RLock()
+        self._schema_lock = threading.RLock()
+        self._mysql_schema_ready = False
+        self._signal_review_schema_ready = False
+        self._auth_schema_ready = False
+        self._last_session_cleanup = 0.0
+
+    def for_user(self, user_id):
+        """Return a request-scoped view without mutating shared storage state."""
+        scoped = copy.copy(self)
+        scoped._scope_parent = self
+        value = str(user_id or "").strip()
+        scoped.user_id = value or self.user_id
+        return scoped
 
     def status(self):
         return {
@@ -90,11 +119,41 @@ class DashboardStorage:
 
     def auth_status(self):
         configured = bool(os.environ.get("BIAN_AUTH_ENABLED", "1").lower() not in ("0", "false", "no", "off"))
-        return {
+        first_admin_secret_configured = bool(
+            (os.environ.get("BIAN_AUTH_BOOTSTRAP_USER") or "admin").strip()
+            and os.environ.get("BIAN_AUTH_BOOTSTRAP_PASSWORD", "").strip()
+        )
+        status = {
             "enabled": configured,
-            "mysql_available": self.mysql_available(),
-            "bootstrap_user": os.environ.get("BIAN_AUTH_BOOTSTRAP_USER", "admin"),
+            "mysql_available": False,
+            "user_count_known": False,
+            "has_users": None,
+            "first_admin_secret_configured": first_admin_secret_configured,
+            "can_create_first_admin": False,
+            "login_ready": not configured,
+            "issue": "" if configured else "disabled",
         }
+        if not configured:
+            return status
+        if not self.mysql_available():
+            status["issue"] = "mysql_unavailable"
+            return status
+        status["mysql_available"] = True
+        conn = self._mysql_connect()
+        try:
+            count, count_error = self._auth_user_count(conn)
+        finally:
+            conn.close()
+        if count is None:
+            status["issue"] = count_error or "user_count_unknown"
+            return status
+        status["user_count_known"] = True
+        status["has_users"] = count > 0
+        status["can_create_first_admin"] = count == 0 and first_admin_secret_configured
+        status["login_ready"] = bool(count > 0 or first_admin_secret_configured)
+        if not status["login_ready"]:
+            status["issue"] = "first_admin_secret_missing"
+        return status
 
     def mysql_available(self):
         if not self.mysql_configured:
@@ -193,10 +252,88 @@ class DashboardStorage:
                     payload_json,
                 ),
             )
+            self._trim_strategy_snapshots_mysql(cur)
             conn.commit()
             return True
         finally:
             conn.close()
+
+    def _trim_strategy_snapshots_mysql(self, cur):
+        cur.execute(
+            """
+            SELECT id
+            FROM bian_strategy_snapshots
+            WHERE user_id=%s
+            ORDER BY created_at DESC, id DESC
+            LIMIT %s, 1
+            """,
+            (self.user_id, STRATEGY_SNAPSHOT_LIMIT - 1),
+        )
+        cutoff = cur.fetchone()
+        if not cutoff:
+            return 0
+        cur.execute(
+            "DELETE FROM bian_strategy_snapshots WHERE user_id=%s AND id<%s",
+            (self.user_id, int(cutoff[0])),
+        )
+        return max(0, int(cur.rowcount or 0))
+
+    def save_signal_reviews(self, records):
+        if not isinstance(records, list) or not records:
+            return {"backend": "none", "inserted": 0, "skipped": 0}
+        if self.mysql_available():
+            try:
+                return self._save_signal_reviews_mysql(records)
+            except Exception as exc:
+                LOG.warning("mysql signal review save failed; fallback=file; error=%s", exc)
+        return self._save_signal_reviews_file(records)
+
+    def load_signal_reviews(self, symbols=None, limit=200):
+        symbols = {str(item).upper() for item in (symbols or []) if item}
+        limit = max(1, min(int(limit or 200), 1000))
+        if self.mysql_available():
+            try:
+                return self._load_signal_reviews_mysql(symbols, limit)
+            except Exception as exc:
+                LOG.warning("mysql signal review load failed; fallback=file; error=%s", exc)
+        return self._load_signal_reviews_file(symbols, limit)
+
+    def load_due_signal_reviews(self, now_ms, max_rows=50, all_users=False):
+        max_rows = max(1, min(int(max_rows or 50), 200))
+        cutoff_ms = int(now_ms or 0) - 5 * 60 * 1000
+        if cutoff_ms <= 0:
+            return []
+        if self.mysql_available():
+            try:
+                return self._load_due_signal_reviews_mysql(cutoff_ms, max_rows, all_users=all_users)
+            except Exception as exc:
+                LOG.warning("mysql due signal review load failed; fallback=file; error=%s", exc)
+        records = self._load_signal_reviews_file(set(), SIGNAL_REVIEW_LIMIT, all_users=all_users)
+        due = []
+        for item in records:
+            if item.get("status") == "evaluated":
+                continue
+            if str(item.get("side") or "") not in ("long", "short"):
+                continue
+            if int(item.get("snapshot_at_ms") or 0) <= cutoff_ms:
+                due.append(item)
+            if len(due) >= max_rows:
+                break
+        return due
+
+    def update_signal_review_evaluation(self, signal_key, status, failure_reason, evaluation, user_id=None):
+        signal_key = str(signal_key or "")
+        if not signal_key:
+            return False
+        status = str(status or "partial")
+        failure_reason = str(failure_reason or "")[:64]
+        evaluation = evaluation if isinstance(evaluation, dict) else {}
+        if self.mysql_available():
+            try:
+                return self._update_signal_review_mysql(signal_key, status, failure_reason, evaluation, user_id=user_id)
+            except Exception as exc:
+                LOG.warning("mysql signal review update failed; fallback=file; error=%s", exc)
+        return self._update_signal_review_file(signal_key, status, failure_reason, evaluation, user_id=user_id)
 
     def ensure_auth_bootstrap(self):
         if not self.mysql_available():
@@ -226,6 +363,21 @@ class DashboardStorage:
             return True
         finally:
             conn.close()
+
+    def _auth_user_count(self, conn):
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT COUNT(*) FROM bian_auth_users")
+            return int(cur.fetchone()[0]), ""
+        except Exception as exc:
+            text = str(exc).lower()
+            args = getattr(exc, "args", ()) or ()
+            code = args[0] if args else None
+            sqlstate = str(args[1] if len(args) > 1 else "")
+            if code in (1146, "1146") or sqlstate == "42S02" or "doesn't exist" in text or "no such table" in text:
+                return 0, "auth_table_missing"
+            LOG.warning("auth user count check failed: %s", exc)
+            return None, "user_count_unavailable"
 
     def verify_auth_user(self, username, password):
         if not self.mysql_available():
@@ -273,8 +425,22 @@ class DashboardStorage:
                 """,
                 (username, hash_password(password), role),
             )
-            conn.commit()
-            return {"id": int(cur.lastrowid), "username": username, "role": role}, ""
+            try:
+                conn.commit()
+                return {"id": int(cur.lastrowid), "username": username, "role": role}, ""
+            except Exception as exc:
+                conn.rollback()
+                if _is_duplicate_key_error(exc):
+                    return None, "username already exists"
+                raise
+        except Exception as exc:
+            if _is_duplicate_key_error(exc):
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                return None, "username already exists"
+            raise
         finally:
             conn.close()
 
@@ -306,16 +472,17 @@ class DashboardStorage:
         finally:
             conn.close()
 
-    def user_for_session(self, token):
+    def user_for_session(self, token, touch_interval_seconds=60):
         if not token or not self.mysql_available():
             return None
         conn = self._mysql_connect()
         try:
             self._ensure_auth_schema(conn)
+            self._cleanup_expired_sessions_if_due(conn)
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT u.id, u.username, u.role, s.expires_at
+                SELECT u.id, u.username, u.role, s.expires_at, s.last_seen_at
                 FROM bian_auth_sessions s
                 JOIN bian_auth_users u ON u.id=s.user_id
                 WHERE s.token_hash=%s
@@ -328,11 +495,22 @@ class DashboardStorage:
             row = cur.fetchone()
             if not row:
                 return None
-            cur.execute(
-                "UPDATE bian_auth_sessions SET last_seen_at=UTC_TIMESTAMP() WHERE token_hash=%s",
-                (session_token_hash(token),),
-            )
-            conn.commit()
+            should_touch = True
+            last_seen = row[4]
+            min_interval = max(0, int(touch_interval_seconds or 0))
+            if min_interval and last_seen:
+                try:
+                    if last_seen.tzinfo is None:
+                        last_seen = last_seen.replace(tzinfo=timezone.utc)
+                    should_touch = (datetime.now(timezone.utc) - last_seen).total_seconds() >= min_interval
+                except Exception:
+                    should_touch = True
+            if should_touch:
+                cur.execute(
+                    "UPDATE bian_auth_sessions SET last_seen_at=UTC_TIMESTAMP() WHERE token_hash=%s",
+                    (session_token_hash(token),),
+                )
+                conn.commit()
             return {"id": int(row[0]), "username": row[1], "role": row[2] or "user"}
         finally:
             conn.close()
@@ -442,6 +620,277 @@ class DashboardStorage:
             self._block_redis(exc)
             return False
 
+    def _save_signal_reviews_mysql(self, records):
+        conn = self._mysql_connect()
+        try:
+            self._ensure_signal_review_schema(conn)
+            cur = conn.cursor()
+            rows = []
+            for item in records:
+                if not isinstance(item, dict) or not item.get("signal_key"):
+                    continue
+                rows.append(
+                    (
+                        self.user_id,
+                        str(item.get("signal_key"))[:191],
+                        str(item.get("symbol") or "")[:32],
+                        str(item.get("advice_name") or "")[:96],
+                        str(item.get("side") or "")[:12],
+                        float(item.get("entry_price") or 0.0),
+                        float(item.get("stop_price") or 0.0),
+                        float(item.get("snapshot_price") or 0.0),
+                        int(item.get("snapshot_at_ms") or 0),
+                        str(item.get("snapshot_at") or "")[:64],
+                        int(item.get("confidence") or 0),
+                        int(item.get("direction_score") or 0),
+                        int(item.get("execution_score") or 0),
+                        str(item.get("risk_gate") or "")[:64],
+                        str(item.get("candle_state") or "")[:64],
+                        str(item.get("trigger_status") or "")[:32],
+                        str(item.get("status") or "pending")[:32],
+                        str(item.get("failure_reason") or "")[:64],
+                        json.dumps(item.get("payload") or {}, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(item.get("evaluation") or {}, ensure_ascii=False, separators=(",", ":")),
+                    )
+                )
+            if not rows:
+                return {"backend": "mysql", "inserted": 0, "skipped": 0}
+            cur.executemany(
+                """
+                INSERT IGNORE INTO bian_signal_reviews
+                  (user_id, signal_key, symbol, advice_name, side, entry_price, stop_price,
+                   snapshot_price, snapshot_at_ms, snapshot_at, confidence, direction_score,
+                   execution_score, risk_gate, candle_state, trigger_status, status,
+                   failure_reason, payload_json, evaluation_json)
+                VALUES
+                  (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                rows,
+            )
+            conn.commit()
+            inserted = max(0, int(cur.rowcount or 0))
+            return {"backend": "mysql", "inserted": inserted, "skipped": max(0, len(rows) - inserted)}
+        finally:
+            conn.close()
+
+    def _load_signal_reviews_mysql(self, symbols, limit):
+        conn = self._mysql_connect()
+        try:
+            self._ensure_signal_review_schema(conn)
+            cur = conn.cursor()
+            params = [self.user_id]
+            where = "user_id=%s"
+            if symbols:
+                placeholders = ",".join(["%s"] * len(symbols))
+                where += f" AND symbol IN ({placeholders})"
+                params.extend(sorted(symbols))
+            params.append(int(limit))
+            cur.execute(
+                f"""
+                SELECT signal_key, symbol, advice_name, side, entry_price, stop_price,
+                       snapshot_price, snapshot_at_ms, snapshot_at, confidence,
+                       direction_score, execution_score, risk_gate, candle_state,
+                       trigger_status, status, failure_reason, payload_json,
+                       evaluation_json, UNIX_TIMESTAMP(created_at) * 1000
+                FROM bian_signal_reviews
+                WHERE {where}
+                ORDER BY snapshot_at_ms DESC, id DESC
+                LIMIT %s
+                """,
+                tuple(params),
+            )
+            return [self._signal_review_from_row(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def _load_due_signal_reviews_mysql(self, cutoff_ms, max_rows, all_users=False):
+        conn = self._mysql_connect()
+        try:
+            self._ensure_signal_review_schema(conn)
+            cur = conn.cursor()
+            where_user = "" if all_users else "AND user_id=%s"
+            params = [int(cutoff_ms), int(max_rows)]
+            if not all_users:
+                params.insert(1, self.user_id)
+            cur.execute(
+                f"""
+                SELECT user_id, signal_key, symbol, advice_name, side, entry_price, stop_price,
+                       snapshot_price, snapshot_at_ms, snapshot_at, confidence,
+                       direction_score, execution_score, risk_gate, candle_state,
+                       trigger_status, status, failure_reason, payload_json,
+                       evaluation_json, UNIX_TIMESTAMP(created_at) * 1000
+                FROM bian_signal_reviews
+                WHERE status IN ('pending', 'partial')
+                  AND side IN ('long', 'short')
+                  AND snapshot_at_ms <= %s
+                  {where_user}
+                ORDER BY updated_at ASC, snapshot_at_ms ASC, id ASC
+                LIMIT %s
+                """,
+                tuple(params),
+            )
+            records = []
+            for row in cur.fetchall():
+                record = self._signal_review_from_row(row[1:])
+                record["storage_user_id"] = row[0]
+                records.append(record)
+            return records
+        finally:
+            conn.close()
+
+    def _update_signal_review_mysql(self, signal_key, status, failure_reason, evaluation, user_id=None):
+        conn = self._mysql_connect()
+        try:
+            self._ensure_signal_review_schema(conn)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE bian_signal_reviews
+                SET status=%s,
+                    failure_reason=%s,
+                    evaluation_json=%s,
+                    evaluated_at=CASE WHEN %s='evaluated' THEN UTC_TIMESTAMP() ELSE evaluated_at END
+                WHERE user_id=%s AND signal_key=%s
+                """,
+                (
+                    status[:32],
+                    failure_reason[:64],
+                    json.dumps(evaluation, ensure_ascii=False, separators=(",", ":")),
+                    status,
+                    str(user_id or self.user_id),
+                    signal_key[:191],
+                ),
+            )
+            conn.commit()
+            return bool(cur.rowcount)
+        finally:
+            conn.close()
+
+    def _signal_review_from_row(self, row):
+        payload = {}
+        evaluation = {}
+        try:
+            payload = json.loads(row[17] or "{}")
+        except Exception:
+            payload = {}
+        try:
+            evaluation = json.loads(row[18] or "{}")
+        except Exception:
+            evaluation = {}
+        return {
+            "signal_key": row[0],
+            "symbol": row[1],
+            "advice_name": row[2],
+            "side": row[3],
+            "entry_price": float(row[4] or 0.0),
+            "stop_price": float(row[5] or 0.0),
+            "snapshot_price": float(row[6] or 0.0),
+            "snapshot_at_ms": int(row[7] or 0),
+            "snapshot_at": row[8] or "",
+            "confidence": int(row[9] or 0),
+            "direction_score": int(row[10] or 0),
+            "execution_score": int(row[11] or 0),
+            "risk_gate": row[12] or "",
+            "candle_state": row[13] or "",
+            "trigger_status": row[14] or "",
+            "status": row[15] or "pending",
+            "failure_reason": row[16] or "",
+            "payload": payload,
+            "evaluation": evaluation,
+            "created_at_ms": int(row[19] or 0),
+        }
+
+    def _read_signal_review_file(self):
+        with self._signal_review_lock:
+            if not os.path.exists(SIGNAL_REVIEW_FILE):
+                return {"version": 1, "records": []}
+            try:
+                with open(SIGNAL_REVIEW_FILE, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict) and isinstance(data.get("records"), list):
+                    return data
+            except Exception as exc:
+                LOG.warning("signal review file read failed: %s", exc)
+            return {"version": 1, "records": []}
+
+    def _write_signal_review_file(self, data):
+        with self._signal_review_lock:
+            os.makedirs(os.path.dirname(SIGNAL_REVIEW_FILE), exist_ok=True)
+            tmp = SIGNAL_REVIEW_FILE + f".{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, SIGNAL_REVIEW_FILE)
+
+    def _save_signal_reviews_file(self, records):
+        with self._signal_review_lock:
+            data = self._read_signal_review_file()
+            items = data.setdefault("records", [])
+            existing = {
+                (str(item.get("storage_user_id") or "default"), str(item.get("signal_key")))
+                for item in items
+                if isinstance(item, dict)
+            }
+            inserted = 0
+            skipped = 0
+            now_ms = int(time.time() * 1000)
+            for item in records:
+                if not isinstance(item, dict) or not item.get("signal_key"):
+                    continue
+                key = str(item.get("signal_key"))
+                scoped_key = (self.user_id, key)
+                if scoped_key in existing:
+                    skipped += 1
+                    continue
+                clone = dict(item)
+                clone["storage_user_id"] = self.user_id
+                clone["created_at_ms"] = now_ms
+                items.append(clone)
+                existing.add(scoped_key)
+                inserted += 1
+            items.sort(key=lambda x: int(x.get("snapshot_at_ms") or 0), reverse=True)
+            del items[SIGNAL_REVIEW_LIMIT:]
+            self._write_signal_review_file(data)
+            return {"backend": "file", "inserted": inserted, "skipped": skipped}
+
+    def _load_signal_reviews_file(self, symbols, limit, all_users=False):
+        data = self._read_signal_review_file()
+        out = []
+        for item in data.get("records", []):
+            if not isinstance(item, dict):
+                continue
+            if not all_users and str(item.get("storage_user_id") or "default") != self.user_id:
+                continue
+            if symbols and str(item.get("symbol") or "").upper() not in symbols:
+                continue
+            out.append(item)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _update_signal_review_file(self, signal_key, status, failure_reason, evaluation, user_id=None):
+        with self._signal_review_lock:
+            data = self._read_signal_review_file()
+            updated = False
+            expected_user_id = str(user_id or self.user_id)
+            for item in data.get("records", []):
+                if (
+                    not isinstance(item, dict)
+                    or str(item.get("signal_key")) != signal_key
+                    or str(item.get("storage_user_id") or "default") != expected_user_id
+                ):
+                    continue
+                item["status"] = status
+                item["failure_reason"] = failure_reason
+                item["evaluation"] = evaluation
+                item["updated_at_ms"] = int(time.time() * 1000)
+                if status == "evaluated":
+                    item["evaluated_at_ms"] = int(time.time() * 1000)
+                updated = True
+                break
+            if updated:
+                self._write_signal_review_file(data)
+            return updated
+
     def _redis_safe_client(self):
         if not self.redis_configured or time.time() < self._redis_block_until:
             return None
@@ -463,11 +912,14 @@ class DashboardStorage:
 
     def _mysql_connect(self):
         config = self._mysql_config()
+        shared = getattr(self, "_scope_parent", self)
         try:
             import pymysql
 
             self._mysql_driver = "pymysql"
             self._mysql_checked = True
+            shared._mysql_driver = "pymysql"
+            shared._mysql_checked = True
             return pymysql.connect(
                 host=config["host"],
                 port=config["port"],
@@ -485,6 +937,8 @@ class DashboardStorage:
 
             self._mysql_driver = "mysql.connector"
             self._mysql_checked = True
+            shared._mysql_driver = "mysql.connector"
+            shared._mysql_checked = True
             return mysql.connector.connect(
                 host=config["host"],
                 port=config["port"],
@@ -495,6 +949,7 @@ class DashboardStorage:
             )
         except ImportError as exc:
             self._mysql_checked = True
+            shared._mysql_checked = True
             raise RuntimeError("install pymysql or mysql-connector-python to enable MySQL storage") from exc
 
     def _redis_connect(self):
@@ -539,75 +994,169 @@ class DashboardStorage:
         }
 
     def _ensure_mysql_schema(self, conn):
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bian_dashboard_kv (
-              id BIGINT NOT NULL AUTO_INCREMENT,
-              user_id VARCHAR(64) NOT NULL,
-              item_key VARCHAR(128) NOT NULL,
-              value_json LONGTEXT NOT NULL,
-              updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-              PRIMARY KEY (id),
-              UNIQUE KEY uniq_bian_dashboard_kv_user_key (user_id, item_key)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bian_strategy_snapshots (
-              id BIGINT NOT NULL AUTO_INCREMENT,
-              user_id VARCHAR(64) NOT NULL,
-              symbols_key VARCHAR(512) NOT NULL,
-              symbols_json LONGTEXT NOT NULL,
-              generated_at VARCHAR(32) NULL,
-              payload_json LONGTEXT NOT NULL,
-              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              PRIMARY KEY (id),
-              KEY idx_bian_strategy_snapshots_user_created (user_id, created_at),
-              KEY idx_bian_strategy_snapshots_symbols (symbols_key)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        conn.commit()
+        shared = getattr(self, "_scope_parent", self)
+        if shared._mysql_schema_ready:
+            return
+        with shared._schema_lock:
+            if shared._mysql_schema_ready:
+                return
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bian_dashboard_kv (
+                  id BIGINT NOT NULL AUTO_INCREMENT,
+                  user_id VARCHAR(64) NOT NULL,
+                  item_key VARCHAR(128) NOT NULL,
+                  value_json LONGTEXT NOT NULL,
+                  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  PRIMARY KEY (id),
+                  UNIQUE KEY uniq_bian_dashboard_kv_user_key (user_id, item_key)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bian_strategy_snapshots (
+                  id BIGINT NOT NULL AUTO_INCREMENT,
+                  user_id VARCHAR(64) NOT NULL,
+                  symbols_key VARCHAR(512) NOT NULL,
+                  symbols_json LONGTEXT NOT NULL,
+                  generated_at VARCHAR(32) NULL,
+                  payload_json LONGTEXT NOT NULL,
+                  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  PRIMARY KEY (id),
+                  KEY idx_bian_strategy_snapshots_user_created (user_id, created_at, id),
+                  KEY idx_bian_strategy_snapshots_symbols (symbols_key)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            self._ensure_signal_review_schema(conn, commit=False)
+            conn.commit()
+            shared._mysql_schema_ready = True
+
+    def _ensure_signal_review_schema(self, conn, commit=True):
+        shared = getattr(self, "_scope_parent", self)
+        if shared._signal_review_schema_ready:
+            return
+        with shared._schema_lock:
+            if shared._signal_review_schema_ready:
+                return
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bian_signal_reviews (
+                  id BIGINT NOT NULL AUTO_INCREMENT,
+                  user_id VARCHAR(64) NOT NULL,
+                  signal_key VARCHAR(191) NOT NULL,
+                  symbol VARCHAR(32) NOT NULL,
+                  advice_name VARCHAR(96) NOT NULL,
+                  side VARCHAR(12) NOT NULL,
+                  entry_price DOUBLE NOT NULL DEFAULT 0,
+                  stop_price DOUBLE NOT NULL DEFAULT 0,
+                  snapshot_price DOUBLE NOT NULL DEFAULT 0,
+                  snapshot_at_ms BIGINT NOT NULL DEFAULT 0,
+                  snapshot_at VARCHAR(64) NULL,
+                  confidence INT NOT NULL DEFAULT 0,
+                  direction_score INT NOT NULL DEFAULT 0,
+                  execution_score INT NOT NULL DEFAULT 0,
+                  risk_gate VARCHAR(64) NULL,
+                  candle_state VARCHAR(64) NULL,
+                  trigger_status VARCHAR(32) NULL,
+                  status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                  failure_reason VARCHAR(64) NULL,
+                  payload_json LONGTEXT NULL,
+                  evaluation_json LONGTEXT NULL,
+                  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  evaluated_at TIMESTAMP NULL DEFAULT NULL,
+                  PRIMARY KEY (id),
+                  UNIQUE KEY uniq_bian_signal_reviews_user_key (user_id, signal_key),
+                  KEY idx_bian_signal_reviews_user_symbol_time (user_id, symbol, snapshot_at_ms),
+                  KEY idx_bian_signal_reviews_due (user_id, status, snapshot_at_ms),
+                  KEY idx_bian_signal_reviews_due_all (status, updated_at, snapshot_at_ms)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            self._ensure_mysql_index(
+                cur,
+                "bian_signal_reviews",
+                "idx_bian_signal_reviews_due_all",
+                "status, updated_at, snapshot_at_ms",
+            )
+            if commit:
+                conn.commit()
+            shared._signal_review_schema_ready = True
 
     def _ensure_auth_schema(self, conn):
-        cur = conn.cursor()
+        shared = getattr(self, "_scope_parent", self)
+        if shared._auth_schema_ready:
+            return
+        with shared._schema_lock:
+            if shared._auth_schema_ready:
+                return
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bian_auth_users (
+                  id BIGINT NOT NULL AUTO_INCREMENT,
+                  username VARCHAR(64) NOT NULL,
+                  password_hash VARCHAR(255) NOT NULL,
+                  role VARCHAR(32) NOT NULL DEFAULT 'user',
+                  disabled TINYINT NOT NULL DEFAULT 0,
+                  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                  last_login_at TIMESTAMP NULL DEFAULT NULL,
+                  PRIMARY KEY (id),
+                  UNIQUE KEY uniq_bian_auth_users_username (username)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bian_auth_sessions (
+                  id BIGINT NOT NULL AUTO_INCREMENT,
+                  token_hash CHAR(64) NOT NULL,
+                  user_id BIGINT NOT NULL,
+                  expires_at DATETIME NOT NULL,
+                  user_agent VARCHAR(255) NULL,
+                  client_ip VARCHAR(64) NULL,
+                  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  last_seen_at TIMESTAMP NULL DEFAULT NULL,
+                  PRIMARY KEY (id),
+                  UNIQUE KEY uniq_bian_auth_sessions_token (token_hash),
+                  KEY idx_bian_auth_sessions_user (user_id),
+                  KEY idx_bian_auth_sessions_expires (expires_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            conn.commit()
+            shared._auth_schema_ready = True
+
+    def _ensure_mysql_index(self, cur, table_name, index_name, columns):
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS bian_auth_users (
-              id BIGINT NOT NULL AUTO_INCREMENT,
-              username VARCHAR(64) NOT NULL,
-              password_hash VARCHAR(255) NOT NULL,
-              role VARCHAR(32) NOT NULL DEFAULT 'user',
-              disabled TINYINT NOT NULL DEFAULT 0,
-              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-              last_login_at TIMESTAMP NULL DEFAULT NULL,
-              PRIMARY KEY (id),
-              UNIQUE KEY uniq_bian_auth_users_username (username)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
+            SELECT COUNT(*)
+            FROM information_schema.statistics
+            WHERE table_schema=DATABASE() AND table_name=%s AND index_name=%s
+            """,
+            (table_name, index_name),
         )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS bian_auth_sessions (
-              id BIGINT NOT NULL AUTO_INCREMENT,
-              token_hash CHAR(64) NOT NULL,
-              user_id BIGINT NOT NULL,
-              expires_at DATETIME NOT NULL,
-              user_agent VARCHAR(255) NULL,
-              client_ip VARCHAR(64) NULL,
-              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              last_seen_at TIMESTAMP NULL DEFAULT NULL,
-              PRIMARY KEY (id),
-              UNIQUE KEY uniq_bian_auth_sessions_token (token_hash),
-              KEY idx_bian_auth_sessions_user (user_id),
-              KEY idx_bian_auth_sessions_expires (expires_at)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        conn.commit()
+        row = cur.fetchone()
+        if not row or int(row[0] or 0) == 0:
+            cur.execute(f"ALTER TABLE {table_name} ADD INDEX {index_name} ({columns})")
+
+    def _cleanup_expired_sessions_if_due(self, conn, interval_seconds=3600):
+        shared = getattr(self, "_scope_parent", self)
+        now = time.time()
+        if now - float(shared._last_session_cleanup or 0.0) < interval_seconds:
+            return
+        with shared._schema_lock:
+            if now - float(shared._last_session_cleanup or 0.0) < interval_seconds:
+                return
+            cur = conn.cursor()
+            cur.execute("DELETE FROM bian_auth_sessions WHERE expires_at<=UTC_TIMESTAMP()")
+            conn.commit()
+            shared._last_session_cleanup = now
 
 
 storage = DashboardStorage()

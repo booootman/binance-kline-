@@ -3,16 +3,32 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $Root
 
-python -B -m py_compile `
+function Invoke-NativeChecked {
+  param(
+    [Parameter(Mandatory = $true)][string]$Label,
+    [Parameter(Mandatory = $true)][string]$Command,
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments
+  )
+  & $Command @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "$Label failed with exit code $LASTEXITCODE"
+  }
+}
+
+Invoke-NativeChecked "python py_compile" python -B -m py_compile `
   .\bian.py `
   .\server.py `
   .\src\bian_dashboard\analyzer.py `
   .\src\bian_dashboard\server.py `
-  .\src\bian_dashboard\storage.py
+  .\src\bian_dashboard\storage.py `
+  .\scripts\deploy.py `
+  .\scripts\smoke.py
 
-node --check .\web\assets\charts.js
+Invoke-NativeChecked "node syntax check" node --check .\web\assets\charts.js
 
-python -B .\bian.py --help | Out-Null
+Invoke-NativeChecked "bian help" python -B .\bian.py --help | Out-Null
+
+Invoke-NativeChecked "offline smoke tests" python -B .\scripts\smoke.py
 
 Get-ChildItem -Path $Root -Directory -Recurse -Filter "__pycache__" |
   Where-Object {

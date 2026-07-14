@@ -113,6 +113,19 @@
   .password-message{min-height:18px;margin-top:12px;font-size:var(--fs-meta);line-height:1.5;color:var(--muted-strong)}
   .password-message.ok{color:var(--accent2)}
   .password-message.err{color:var(--bear)}
+  .diagnostics-dialog{width:min(760px,100%);max-height:min(86vh,780px);overflow:auto}
+  .diagnostics-body{display:flex;flex-direction:column;gap:10px;margin-top:10px}
+  .diagnostics-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  @media(max-width:720px){.diagnostics-grid{grid-template-columns:1fr}}
+  .diag-card{border:1px solid var(--rule);border-radius:8px;background:rgba(16,32,58,.28);padding:10px 12px}
+  .diag-card h3{font-family:var(--mono);font-size:var(--fs-meta);color:var(--muted-strong);margin-bottom:7px;font-weight:700}
+  .diag-line{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:var(--fs-meta);line-height:1.6;color:var(--ink-dim)}
+  .diag-line b{font-family:var(--mono);color:var(--ink);font-weight:700;text-align:right}
+  .diag-pill{display:inline-flex;align-items:center;border:1px solid var(--rule);border-radius:999px;padding:2px 7px;font-family:var(--mono);font-size:10px;color:var(--muted-strong);background:rgba(16,32,58,.34)}
+  .diag-pill.good{color:var(--bull);border-color:rgba(0,255,157,.28);background:rgba(0,255,157,.07)}
+  .diag-pill.warn{color:var(--warn);border-color:rgba(255,176,32,.3);background:rgba(255,176,32,.07)}
+  .diag-pill.bad{color:var(--bear);border-color:rgba(255,59,92,.3);background:rgba(255,59,92,.07)}
+  .diag-code{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:10px;line-height:1.5;color:var(--muted-strong);max-height:140px;overflow:auto}
 
   /* ===== Grid ===== */
   .grid{display:grid;gap:16px}
@@ -137,6 +150,9 @@
   .ph h2{font-family:var(--disp);font-weight:500;font-size:var(--fs-h2);letter-spacing:.05em;color:var(--ink)}
   .ph h2 .ic{color:var(--accent);margin-right:7px}
   .ph .sub{font-family:var(--mono);font-size:var(--fs-meta);color:var(--muted-strong);letter-spacing:.1em}
+  .ph-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  .mini-btn{font-family:var(--ui);font-size:var(--fs-meta);padding:6px 10px;border-radius:8px;border:1px solid var(--rule);background:rgba(16,32,58,.35);color:var(--muted-strong);cursor:pointer}
+  .mini-btn:hover{border-color:var(--accent);color:var(--accent);background:rgba(0,229,255,.08)}
 
   /* ===== KPI cards ===== */
   .kpi{padding:18px 20px}
@@ -310,6 +326,9 @@
   .pos-state .ps-label{font-size:var(--fs-meta);color:var(--muted-strong)}
   .pos-btn{font-family:var(--ui);font-size:var(--fs-meta);padding:5px 10px;border-radius:8px;border:1px solid var(--rule);background:rgba(16,32,58,.35);color:var(--muted);cursor:pointer}
   .pos-btn.active{color:var(--bg);background:linear-gradient(135deg,var(--accent),var(--accent2));border-color:transparent}
+  .alert-toggle{font-family:var(--mono);font-size:var(--fs-meta);padding:5px 10px;border-radius:8px;border:1px solid var(--rule);background:rgba(16,32,58,.35);color:var(--muted);cursor:pointer}
+  .alert-toggle:hover{border-color:rgba(0,229,255,.45);color:var(--accent)}
+  .alert-toggle.active{color:var(--bg);background:linear-gradient(135deg,var(--accent2),var(--accent));border-color:transparent}
   .sb-alert{display:none;margin-top:8px;padding:8px 11px;border-radius:8px;font-size:var(--fs-body);line-height:1.45;border:1px solid var(--rule);background:rgba(16,32,58,.45)}
   .sb-alert.show{display:block}
   .sb-alert.watch{color:var(--accent);border-color:rgba(0,229,255,.28);background:rgba(0,229,255,.06)}
@@ -424,6 +443,61 @@
   .history-item .hb .hl-risk{color:var(--ink-dim)}
   .history-empty{text-align:center;padding:24px;color:var(--muted);font-size:var(--fs-body)}
 
+  /* live signal review */
+  .review-wrap{display:flex;flex-direction:column;gap:12px}
+  .review-note{display:flex;justify-content:space-between;gap:12px;align-items:center;border:1px solid var(--rule);border-radius:8px;background:rgba(16,32,58,.24);padding:10px 12px;color:var(--ink-dim);font-size:var(--fs-body)}
+  .review-note b{font-family:var(--mono);font-size:var(--fs-meta)}
+  .review-note.low b,.review-quality.low{color:var(--warn)}
+  .review-note.mid b,.review-quality.mid{color:var(--accent)}
+  .review-note.good b,.review-quality.good{color:var(--bull)}
+  .review-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+  @media(max-width:900px){.review-summary{grid-template-columns:1fr}}
+  .review-stat{border:1px solid var(--rule);border-radius:8px;background:rgba(16,32,58,.3);padding:10px 12px}
+  .review-stat .rs-head{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}
+  .review-stat .rs-h{font-family:var(--mono);font-size:var(--fs-meta);color:var(--ink-dim)}
+  .review-stat .rs-n{font-family:var(--mono);font-size:var(--fs-meta);color:var(--muted-strong)}
+  .review-stat .rs-main{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .review-stat .rs-k{font-size:10px;color:var(--muted);margin-bottom:3px}
+  .review-stat .rs-v{font-family:var(--mono);font-weight:700;font-size:var(--fs-body);color:var(--ink)}
+  .review-stat .rs-v.good{color:var(--bull)}
+  .review-stat .rs-v.bad{color:var(--bear)}
+  .review-stat .rs-v.warn{color:var(--warn)}
+  .review-quality{font-family:var(--mono);font-size:10px;margin-top:8px;color:var(--muted-strong)}
+  .review-segments{display:flex;gap:8px;flex-wrap:wrap}
+  .review-seg{border:1px solid var(--rule);border-radius:8px;background:rgba(16,32,58,.26);padding:7px 9px;min-width:150px;font-size:10px;color:var(--muted-strong);line-height:1.45}
+  .review-seg b{display:block;font-family:var(--mono);font-size:10px;color:var(--ink);margin-bottom:3px}
+  .review-seg.low b{color:var(--warn)}
+  .review-seg.mid b{color:var(--accent)}
+  .review-seg.good b{color:var(--bull)}
+  .review-calibration{border:1px solid var(--rule);border-radius:8px;background:rgba(16,32,58,.26);padding:10px 12px;color:var(--ink-dim);font-size:var(--fs-body)}
+  .review-calibration.low{border-color:rgba(255,176,32,.28);background:rgba(255,176,32,.06)}
+  .review-calibration.warn{border-color:rgba(255,176,32,.35);background:rgba(255,176,32,.08)}
+  .review-calibration.good{border-color:rgba(0,255,157,.25);background:rgba(0,255,157,.06)}
+  .review-cal-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+  .review-cal-head b{font-family:var(--mono);font-size:var(--fs-meta);color:var(--ink);white-space:nowrap}
+  .review-cal-head span{line-height:1.45}
+  .review-cal-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:9px}
+  @media(max-width:900px){.review-cal-list{grid-template-columns:1fr}.review-cal-head{flex-direction:column;gap:5px}}
+  .review-cal-item{border:1px solid var(--rule);border-radius:8px;background:rgba(5,10,20,.28);padding:8px 9px;font-size:10.5px;line-height:1.45;color:var(--muted-strong)}
+  .review-cal-item b{display:block;font-family:var(--mono);font-size:10px;margin-bottom:3px;color:var(--ink)}
+  .review-cal-item.bad b{color:var(--bear)}
+  .review-cal-item.good b{color:var(--bull)}
+  .review-list{display:flex;flex-direction:column;gap:8px;max-height:360px;overflow-y:auto;padding-right:6px}
+  .review-row{display:grid;grid-template-columns:92px 82px 1fr;gap:10px;align-items:start;border:1px solid var(--rule);border-radius:8px;background:rgba(16,32,58,.28);padding:10px 12px}
+  @media(max-width:900px){.review-row{grid-template-columns:1fr}}
+  .review-time{font-family:var(--mono);font-size:var(--fs-meta);color:var(--muted-strong)}
+  .review-side{font-family:var(--mono);font-size:var(--fs-meta);font-weight:700}
+  .review-side.long{color:var(--bull)}
+  .review-side.short{color:var(--bear)}
+  .review-body{font-size:var(--fs-meta);line-height:1.55;color:var(--ink-dim)}
+  .review-body b{font-family:var(--mono);color:var(--ink)}
+  .review-tags{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+  .review-tag{font-family:var(--mono);font-size:10px;border:1px solid var(--rule);border-radius:6px;padding:2px 6px;color:var(--muted-strong)}
+  .review-tag.good{color:var(--bull);border-color:rgba(0,255,157,.25);background:rgba(0,255,157,.07)}
+  .review-tag.bad{color:var(--bear);border-color:rgba(255,59,92,.3);background:rgba(255,59,92,.07)}
+  .review-tag.warn{color:var(--warn);border-color:rgba(255,176,32,.3);background:rgba(255,176,32,.07)}
+  .review-empty{text-align:center;padding:24px;color:var(--muted);font-size:var(--fs-body)}
+
   /* horizon guide */
   .horizon-guide{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
   .hg-label{font-size:var(--fs-body);color:var(--ink-dim)}
@@ -463,6 +537,7 @@
       </div>
       <div class="live"><span class="dot"></span>LIVE</div>
       <div class="auth-actions">
+        <button id="diagnostics-btn" class="auth-btn admin-only" data-admin-only type="button">诊断</button>
         <button id="create-user-btn" class="auth-btn admin-only" data-admin-only type="button">注册账号</button>
         <button id="change-password-btn" class="auth-btn" type="button">改密码</button>
         <button id="logout-btn" class="auth-btn danger" type="button">退出</button>
@@ -513,6 +588,21 @@
         <button type="submit" class="primary" id="register-submit">创建</button>
       </div>
     </form>
+  </div>
+
+  <div id="diagnostics-modal" class="password-modal" aria-hidden="true">
+    <div class="password-dialog diagnostics-dialog" role="dialog" aria-modal="true">
+      <div class="password-head">
+        <h2>系统诊断</h2>
+        <button id="diagnostics-close" class="password-close" type="button">关闭</button>
+      </div>
+      <div id="diagnostics-message" class="password-message"></div>
+      <div id="diagnostics-body" class="diagnostics-body"></div>
+      <div class="password-actions">
+        <button type="button" id="diagnostics-raw">打开 JSON</button>
+        <button type="button" class="primary" id="diagnostics-refresh">刷新</button>
+      </div>
+    </div>
   </div>
 
   <!-- Symbol switcher -->
@@ -578,6 +668,12 @@
   <section class="panel" style="margin-bottom:16px">
     <div class="ph"><h2><span class="ic">▧</span>信号历史</h2><span class="sub">记录每次完整策略刷新后的变化</span></div>
     <div id="signal-history" class="history-list"></div>
+  </section>
+
+  <!-- Live signal review -->
+  <section class="panel" style="margin-bottom:16px">
+    <div class="ph"><h2><span class="ic">R</span>实盘信号复盘</h2><div class="ph-actions"><span class="sub">按 5m / 15m / 1h 追踪入场、止损、最大盈利和最大回撤</span><button id="signal-review-evaluate" class="mini-btn admin-only" data-admin-only type="button">评估</button><button id="signal-review-export" class="mini-btn" type="button">导出 CSV</button></div></div>
+    <div id="signal-review" class="review-wrap"></div>
   </section>
 
   <!-- Charts row 1 -->

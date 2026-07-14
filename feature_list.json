@@ -1,6 +1,6 @@
 {
   "project": "binance-futures-dashboard",
-  "updated_at": "2026-07-07",
+  "updated_at": "2026-07-08",
   "features": [
     {
       "id": "project-structure",
@@ -16,6 +16,17 @@
         "archive"
       ],
       "verification": "scripts/verify.ps1",
+      "capabilities": [
+        "Project verification script checks Python source/script compilation, frontend JavaScript syntax, CLI help, and offline smoke regressions",
+        "Offline smoke tests cover auth redirect safety, password hashing, duplicate-user race handling, signal-review records, and signal-review stats",
+        "Offline smoke tests exercise real Handler.do_POST routing for same-origin login blocking, authenticated preference saves, and manual signal-review evaluation triggers",
+        "Malformed JSON POST bodies, invalid UTF-8 request bodies, and invalid Content-Length headers return controlled 400 responses instead of generic server failures",
+        "Market, signal-review, and realtime symbol requests share normalization, deduplication, and an eight-symbol cap in offline regression coverage",
+        "Signal-review list requests validate the record limit as a bounded 1-1000 integer and return controlled 400 client errors",
+        "Offline smoke tests suppress expected error-path logs so verification output stays focused on real failures",
+        "PowerShell verification fails on native Python/Node command failures instead of continuing after a non-zero exit",
+        "Git ignore rules exclude local tool share packages, Python tool caches, and runtime lock/cache artifacts from accidental review"
+      ],
       "delivery_assets": [
         "docs/architecture.md",
         "docs/acceptance-checklist.md",
@@ -35,7 +46,7 @@
       ],
       "capabilities": [
         "Historical 5m/15m/1h signal backtest metrics",
-        "Confidence calibrated by historical quality and risk penalties",
+        "Execution confidence applies trigger and risk penalties; the non-isomorphic 5m proxy backtest is informational only",
         "Realtime-prejudge versus closed-candle confirmation labels",
         "Extreme ATR/BOLL risk gates for small volatile coins",
         "Entry trigger confirmation using 1m volume, structure, spread, and entry distance",
@@ -55,17 +66,25 @@
         "Price-path drawdown kept separate from execution cost",
         "Reusable runtime backtest cache for analyzer/server calls",
         "Realtime SSE depth20 stream with depth imbalance and top5/top20 depth",
+        "Realtime WebSocket hubs normalize symbol-set keys so differently cased shorthand symbols and different request orders share one backend stream",
+        "Realtime SSE requests for a symbol subset can reuse an already-active superset WebSocket hub to reduce duplicate Binance connections",
+        "Realtime diagnostics count exact/new/superset SSE sharing modes and expose reuse rate for multi-user connection monitoring",
         "API error classification for invalid symbols, rate limits, timeouts, network errors, and upstream failures",
+        "Market API analyzer detail/stderr fields are hidden by default and only exposed when BIAN_EXPOSE_ERROR_DETAILS=1 for debugging",
         "Partial-symbol API responses are rejected with missing/returned symbol metadata instead of cached as successful snapshots",
         "Backtest cache writes use lock-file protection and unique temp files for concurrent analyzer subprocesses",
+        "Analyzer caches Binance exchangeInfo metadata per process so multi-symbol refreshes reuse tick-size and precision data instead of refetching it for every symbol",
         "TLM extreme-rally downgrade is applied before side, backtest, and stop selection, with downgraded direction-score caps",
         "Backend risk-budget sizing with suggested_size_pct, stop_distance_pct, max_loss_pct, and allowed/note metadata",
         "Frontend account-risk fuse for daily loss, consecutive losses, and max single loss, blocking new-open suggestions until next local day",
         "Opening-risk decision panel that automatically summarizes allow/wait/block status from strategy risk, trigger confirmation, candle state, stop validity, realtime price freshness, and manual fuse state",
+        "Opening guard distinguishes hard no-open blocks from wait states: trigger-confirmation failure and zero risk size are shown as waiting/failed-trigger guidance unless a true backend/account/invalid-price block exists",
         "Frontend position display uses risk-budget percentage instead of score-to-star position labels",
         "Same-side altcoin correlation exposure warning across loaded symbols",
         "Frontend stale/warning/error_type handling for delayed cached snapshots",
-        "Realtime depth fields are preserved across bookTicker-only updates and strategy refreshes"
+        "Realtime depth fields are preserved across bookTicker-only updates and strategy refreshes",
+        "Realtime entry, stop, chase, and strategy-snapshot drift warnings use ATR-adaptive thresholds instead of fixed percentages",
+        "Optional browser-local ALERT toggle plays cooldown-limited sound cues for visible near-entry and near-stop signal warnings"
       ],
       "verification": [
         "node --check web/assets/charts.js",
@@ -121,8 +140,10 @@
         "scripts/verify.ps1"
       ],
       "capabilities": [
-        "Optional MySQL persistence for custom symbols, removed symbols, position state, account risk state, signal history, TradingView interval, and strategy snapshots",
+        "Optional MySQL persistence for custom symbols, removed symbols, position state, account risk state, signal history, TradingView interval, and strategy snapshots, isolated by authenticated user",
+        "Per-user MySQL strategy snapshots retain a bounded recent history (1000 by default, configurable through BIAN_STRATEGY_SNAPSHOT_LIMIT) to prevent long-running storage growth",
         "Optional Redis cache for short market payloads and latest realtime price/depth snapshots",
+        "Fresh runtime disk market snapshots are reused within the normal cache TTL after server restart before spawning a new analyzer subprocess",
         "New GET/POST /api/preferences endpoints for browser-to-server preference sync",
         "New GET /api/storage-status endpoint for checking configured storage availability",
         "Browser localStorage remains the fallback when MySQL or Redis is not configured"
@@ -135,6 +156,51 @@
       "limitations": [
         "MySQL and Redis require optional Python drivers and external services to be installed/configured.",
         "The dashboard does not store full historical tick/order-book streams in MySQL; Redis stores only latest realtime snapshots."
+      ]
+    },
+    {
+      "id": "live-signal-review-loop",
+      "name": "Live signal review loop",
+      "status": "implemented",
+      "paths": [
+        "src/bian_dashboard/storage.py",
+        "src/bian_dashboard/server.py",
+        "web/binance-futures-dashboard.html",
+        "web/assets/charts.js"
+      ],
+      "capabilities": [
+        "Persistent records for every directional timeframe advice after successful strategy snapshots",
+        "MySQL table bian_signal_reviews plus runtime/signal_reviews.json fallback when MySQL is unavailable, both isolated by authenticated user scope",
+        "Background signal-review evaluation loads due records across authenticated users and writes each result back to its owning user",
+        "Authenticated viewers receiving a fresh shared market cache still receive their own deduplicated live-review records without rerunning market analysis",
+        "Background 5m, 15m, and 1h evaluation using Binance USD-M 1m klines",
+        "Evaluation tracks entry reached, stop hit, same-bar stop ambiguity, max profit, max drawdown, final outcome, and failure reason",
+        "Live-review max profit and outcome are net of estimated round-trip fee/slippage, while gross fields are preserved for audit/export",
+        "Legacy live-review records without cost fields are normalized to net outcomes at API/statistics read time so old gross samples do not inflate hit rate",
+        "Background live-review evaluation triggers are debounced so repeated page/API refreshes do not spawn redundant evaluator threads",
+        "GET /api/signal-reviews returns recent records and aggregate stats for active symbols",
+        "Dashboard panel shows real sample count, triggered count, hit rate, stop rate, not-triggered rate, average max profit/drawdown/outcome, and recent outcomes",
+        "Dashboard review panel shows live-review evaluator status so users can distinguish started, cooling down, running, and storage-unavailable states",
+        "Live-review sample-quality labels prevent low-sample or incomplete-horizon stats from being read as reliable win rate",
+        "Live-review calibration is segmented by risk gate, trigger status, and candle state so weak signal buckets can be identified before changing thresholds",
+        "Invalid live-review signals such as illegal entry/stop are counted separately in failure stats and segment invalid rates instead of being hidden from summary quality",
+        "Live-review stats and UI surface due-pending evaluation backlog so missing samples are distinguishable from delayed background evaluation",
+        "Authenticated users can manually trigger a debounced live-review evaluation catch-up from the dashboard review panel",
+        "New live-review records persist structured market regime buckets from the advice anchor interval, including trend, ATR regime, BOLL width regime, and BOLL position regime",
+        "Dashboard can export the active symbol's live signal review records as UTF-8 CSV with horizon outcomes and regime fields",
+        "Deployment docs explain that CSV net fields should drive hit-rate/expectancy review while gross fields are for raw price-path audit",
+        "Live-review calibration candidates require sufficient independent signals and independent triggers, and use the declared 1h terminal outcome so overlapping 5m/15m/1h paths cannot inflate threshold-tuning confidence"
+      ],
+      "verification": [
+        "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py",
+        "node --check web/assets/charts.js",
+        "offline evaluate_horizon_from_klines smoke test for long entry/max profit/drawdown/outcome"
+      ],
+      "limitations": [
+        "Evaluation uses 1m candle OHLC, so same-bar entry and stop order is treated conservatively as ambiguous/stop-first.",
+        "Net live-review outcomes subtract estimated fee/slippage but still do not model funding payments, liquidation, partial fills, order-book queue position, exchange outages, margin mode, or fast-market slippage expansion.",
+        "The loop records signal quality for calibration; it does not automatically retune strategy thresholds yet.",
+        "Fresh deployments need time to accumulate live samples before hit-rate statistics become meaningful."
       ]
     },
     {
@@ -154,7 +220,9 @@
         "Compose stack with isolated dashboard, MySQL, and Redis services",
         "Named Docker volumes for runtime cache, MySQL data, and Redis append-only data",
         "Configurable public port and storage credentials through environment variables",
-        "Container host binding through BIAN_HOST/BIAN_PORT"
+        "Container host binding through BIAN_HOST/BIAN_PORT",
+        "Docker health checks surface a fresh auth deployment that has no users and no first-admin secret instead of leaving an unusable login page",
+        "Python deployment script skips protected /api/market curl checks when auth is enabled and asks for logged-in verification instead"
       ],
       "verification": [
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py",
@@ -192,12 +260,23 @@
         "HttpOnly session cookie with hashed session token stored in MySQL",
         "Server-side auth gate for dashboard pages, APIs, preferences, and realtime SSE",
         "Public health endpoint for Docker health checks",
+        "Public /api/health returns non-secret deployment diagnostics including uptime, auth readiness, storage availability, cache counts, and required runtime path checks",
+        "/api/health returns HTTP 503 when auth is enabled but MySQL is unavailable, or when a fresh empty users table has no first-admin secret configured",
+        "Auth readiness reports has_users, login_ready, and issue fields without exposing bootstrap usernames or passwords",
+        "Admin-only /api/diagnostics returns operator cache, analyzer, storage, realtime WebSocket state, and signal-review queue state without exposing credentials",
+        "Dashboard header shows an admin-only diagnostics button with a readable diagnostics modal, realtime sharing counters, signal-review queue/evaluator counters, live-review cost assumptions, and a raw JSON fallback",
         "Login and logout endpoints plus dashboard logout button",
         "Authenticated password change endpoint and dashboard modal",
         "Password changes verify the current password, store a fresh PBKDF2-SHA256 hash, and invalidate other sessions for the same user",
         "Admin-only user registration endpoint and dashboard modal for creating user or admin accounts",
         "Bootstrap admin creation only when the users table is empty",
-        "Basic per-IP login failure lockout"
+        "Basic per-IP login failure lockout",
+        "Sanitized login next redirects to prevent external or API-target redirects",
+        "Dashboard POST APIs, including login, enforce same-origin Origin/Referer host checks by default while preserving non-browser CLI compatibility when no source header is present; X-Forwarded-Host is trusted only behind trusted local/private proxies",
+        "Unexpected 500 errors on login, password change, user creation, preferences, and signal-review APIs return a generic browser-safe message while details stay in server logs",
+        "Optional trusted-proxy X-Forwarded-For support through BIAN_AUTH_TRUST_PROXY_HEADERS, disabled by default",
+        "Session last_seen_at touch interval through BIAN_AUTH_SESSION_TOUCH_INTERVAL_SECONDS to reduce MySQL write load",
+        "Duplicate admin-created usernames return a controlled duplicate-user error even under concurrent requests"
       ],
       "verification": [
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py scripts/deploy.py bian.py server.py",
@@ -205,13 +284,17 @@
         "powershell -ExecutionPolicy Bypass -File scripts/verify.ps1",
         "password-hash smoke test validates the right password and rejects a wrong password",
         "auth username validation smoke test covers accepted and rejected account names",
-        "local auth smoke: health 200, dashboard redirects to /login, login page renders"
+        "local auth smoke: health 200, dashboard redirects to /login, login page renders",
+        "safe login redirect smoke covers external URLs, protocol-relative URLs, API paths, and valid dashboard paths",
+        "offline smoke verifies /api/health payload shape, auth-readiness failure, and checks that password/bootstrap details are not exposed",
+        "offline smoke verifies /api/diagnostics payload shape and checks that password/bootstrap details are not exposed"
       ],
       "limitations": [
         "Bootstrap credentials are still provided through server-only environment variables for first-user creation.",
         "Anonymous public registration is intentionally not exposed; only admin users can create accounts.",
         "There is not yet a web UI for disabling users.",
-        "Set BIAN_AUTH_COOKIE_SECURE=1 when serving behind HTTPS."
+        "Set BIAN_AUTH_COOKIE_SECURE=1 when serving behind HTTPS.",
+        "Set BIAN_AUTH_TRUST_PROXY_HEADERS=1 only behind a trusted local/private reverse proxy."
       ]
     }
   ]

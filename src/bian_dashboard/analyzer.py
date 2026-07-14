@@ -17,10 +17,12 @@ Run:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -48,9 +50,13 @@ SLIPPAGE_BPS = DEFAULT_SLIPPAGE_BPS
 SIGNAL_SIDE_THRESHOLD = 5
 BACKTEST_ATR_FILTER_PCT = 18.0
 BACKTEST_VOLUME_FILTER_MIN = 0.55
-BACKTEST_SAMPLE_FILTER_NOTE = "样本经ATR/量能过滤，仅代表通过风控过滤后的历史信号"
+BACKTEST_SAMPLE_FILTER_NOTE = "5m代理回测；样本经ATR/量能过滤，不等同于线上多周期执行策略"
 BACKTEST_CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "runtime", "backtest_cache.json")
 BACKTEST_CACHE_TTL_SECONDS = 10 * 60
+BACKTEST_MODEL_VERSION = 2
+EXCHANGE_INFO_CACHE_TTL_SECONDS = int(os.environ.get("BIAN_EXCHANGE_INFO_CACHE_TTL_SECONDS", "3600"))
+_EXCHANGE_INFO_CACHE: Dict[str, object] = {"ts": 0.0, "data": None}
+_EXCHANGE_INFO_LOCK = threading.RLock()
 
 
 @dataclass
@@ -62,6 +68,9 @@ class CandleIndicators:
     candle_state: str
     progress_pct: float
     age_seconds: float
+    open: float
+    high: float
+    low: float
     close: float
     ema20: float
     ema50: float
@@ -92,6 +101,7 @@ class CandleIndicators:
 class SymbolMeta:
     tick_size: float
     price_precision: int
+    tick_size_verified: bool
 
 
 @dataclass
@@ -149,6 +159,7 @@ class TimeframeAdvice:
     execution_score: int
     confidence_note: str
     execution_note: str
+    anchor_interval: str
     candle_state: str
     risk_gate: str
     action: str
@@ -201,6 +212,26 @@ def request_json(path: str, params: Dict[str, str | int | float]) -> object:
         if attempt < 3:
             time.sleep(0.7 * attempt)
     raise RuntimeError(f"Network error while calling Binance after retries: {last_error}")
+
+
+def fetch_exchange_info() -> Dict[str, object]:
+    with _EXCHANGE_INFO_LOCK:
+        now = time.time()
+        cached = _EXCHANGE_INFO_CACHE.get("data")
+        cached_ts = float(_EXCHANGE_INFO_CACHE.get("ts") or 0.0)
+        if isinstance(cached, dict) and now - cached_ts <= EXCHANGE_INFO_CACHE_TTL_SECONDS:
+            return cached
+        try:
+            fresh = request_json("/fapi/v1/exchangeInfo", {})
+        except Exception:
+            if isinstance(cached, dict):
+                return cached
+            raise
+        if isinstance(fresh, dict):
+            _EXCHANGE_INFO_CACHE["data"] = fresh
+            _EXCHANGE_INFO_CACHE["ts"] = now
+            return fresh
+        return {}
 
 
 def fetch_klines(symbol: str, interval: str, limit: int = 220) -> List[list]:
@@ -264,7 +295,7 @@ def fetch_book_ticker(symbol: str) -> Dict[str, float]:
 
 def fetch_symbol_meta(symbol: str) -> SymbolMeta:
     try:
-        data = request_json("/fapi/v1/exchangeInfo", {})
+        data = fetch_exchange_info()
         for item in data.get("symbols", []):
             if item.get("symbol") != symbol:
                 continue
@@ -275,10 +306,10 @@ def fetch_symbol_meta(symbol: str) -> SymbolMeta:
                     break
             precision = int(item.get("pricePrecision", 8))
             if tick_size > 0:
-                return SymbolMeta(tick_size=tick_size, price_precision=precision)
+                return SymbolMeta(tick_size=tick_size, price_precision=precision, tick_size_verified=True)
     except Exception:
         pass
-    return SymbolMeta(tick_size=guess_tick_size(0.0), price_precision=8)
+    return SymbolMeta(tick_size=0.0, price_precision=8, tick_size_verified=False)
 
 
 def ema(values: Sequence[float], period: int) -> List[float]:
@@ -338,7 +369,13 @@ def atr(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], 
                 abs(lows[idx] - closes[idx - 1]),
             )
         )
-    return sma(trs, period)
+    if len(trs) < period:
+        raise ValueError(f"need at least {period + 1} values for ATR")
+    # TradingView ta.atr uses Wilder's RMA rather than a rolling SMA.
+    value = sum(trs[:period]) / period
+    for true_range in trs[period:]:
+        value = (value * (period - 1) + true_range) / period
+    return value
 
 
 def macd(values: Sequence[float]) -> tuple[float, float, float]:
@@ -409,6 +446,7 @@ def build_indicators(interval: str, candles: Sequence[list]) -> CandleIndicators
     lows = [float(item[3]) for item in candles]
     closes = [float(item[4]) for item in candles]
     volumes = [float(item[5]) for item in candles]
+    average_prior_volume = sma(volumes[:-1], 20)
 
     ema20 = ema(closes, 20)[-1]
     ema50 = ema(closes, 50)[-1]
@@ -440,9 +478,12 @@ def build_indicators(interval: str, candles: Sequence[list]) -> CandleIndicators
         open_time_utc=datetime.fromtimestamp(open_time_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         close_time_utc=datetime.fromtimestamp(close_time_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         is_closed=is_closed,
-        candle_state="收盘确认" if is_closed else "实时预判",
+        candle_state="已完成K线" if is_closed else "实时K线",
         progress_pct=progress_pct,
         age_seconds=max(0.0, (now_ms - open_time_ms) / 1000.0),
+        open=open_price,
+        high=highs[-1],
+        low=lows[-1],
         close=close,
         ema20=ema20,
         ema50=ema50,
@@ -456,7 +497,7 @@ def build_indicators(interval: str, candles: Sequence[list]) -> CandleIndicators
         macd_hist_closed=macd_hist_closed,
         atr14=atr14,
         atr14_pct=atr14 / close * 100.0,
-        vol_ratio_20=volumes[-1] / sma(volumes, 20),
+        vol_ratio_20=volumes[-1] / average_prior_volume if average_prior_volume > 0 else 0.0,
         recent_high_20=max(highs[-20:]),
         recent_low_20=min(lows[-20:]),
         boll_mid=boll_mid,
@@ -543,7 +584,8 @@ def historical_side_with_filter(
     boll_range = boll_upper - boll_lower
     boll_pos = 50.0 if boll_range == 0 else (close - boll_lower) / boll_range * 100.0
     atr_pct = atr14 / close * 100.0 if close else 0.0
-    vol_ratio = volume_window[-1] / sma(volume_window, 20)
+    average_prior_volume = sma(volume_window[:-1], 20)
+    vol_ratio = volume_window[-1] / average_prior_volume if average_prior_volume > 0 else 0.0
     score = 0
     if close > ema20 > ema50:
         score += 4
@@ -726,6 +768,7 @@ def simulate_backtest_trade(
 
 
 def build_directional_backtests(candles: Sequence[list]) -> Dict[str, DirectionalBacktest]:
+    opens = [float(item[1]) for item in candles]
     highs = [float(item[2]) for item in candles]
     lows = [float(item[3]) for item in candles]
     closes = [float(item[4]) for item in candles]
@@ -736,6 +779,7 @@ def build_directional_backtests(candles: Sequence[list]) -> Dict[str, Directiona
         "short": {h: [] for h, _ in lookaheads},
     }
     filtered_counts = {"long": 0, "short": 0}
+    next_allowed_idx = {"long": 0, "short": 0}
     max_lookahead = max(count for _, count in lookaheads)
     start = max(80, len(candles) - 260)
     end = len(candles) - max_lookahead - 1
@@ -745,7 +789,9 @@ def build_directional_backtests(candles: Sequence[list]) -> Dict[str, Directiona
             filtered_counts[raw_side] += 1
         if side not in ("long", "short"):
             continue
-        entry = closes[idx]
+        if idx < next_allowed_idx[side]:
+            continue
+        entry = opens[idx + 1]
         if entry <= 0:
             continue
         stop = historical_stop(side, entry, highs, lows, closes, idx)
@@ -753,6 +799,7 @@ def build_directional_backtests(candles: Sequence[list]) -> Dict[str, Directiona
             records[side][horizon].append(
                 simulate_backtest_trade(side, entry, stop, highs, lows, closes, idx, count)
             )
+        next_allowed_idx[side] = idx + max_lookahead + 1
 
     out: Dict[str, DirectionalBacktest] = {}
     for side in ("long", "short"):
@@ -774,7 +821,10 @@ def backtest_cache_key(symbol: str, candles: Sequence[list]) -> str:
         return f"{symbol}:empty"
     usable_idx = max(0, len(candles) - 13)
     marker = candles[usable_idx][6] if len(candles[usable_idx]) > 6 else candles[-1][0]
-    return f"{symbol.upper()}:{len(candles)}:{marker}:{TAKER_FEE_BPS:.4f}:{SLIPPAGE_BPS:.4f}"
+    return (
+        f"v{BACKTEST_MODEL_VERSION}:{symbol.upper()}:{len(candles)}:{marker}:"
+        f"{TAKER_FEE_BPS:.4f}:{SLIPPAGE_BPS:.4f}"
+    )
 
 
 def backtest_from_dict(data: Dict[str, object]) -> DirectionalBacktest:
@@ -917,11 +967,13 @@ def bias_from_score(score: int) -> tuple[str, int]:
 
 def downgrade_extreme_symbol_bias(symbol: str, pct_24h: float, bias: str, confidence: int) -> tuple[str, int, bool]:
     if symbol.upper().startswith("TLM") and pct_24h > 25 and bias == "偏多":
-        return "观望偏空", min(confidence, 58), True
+        return "观望", min(confidence, 45), True
     return bias, confidence, False
 
 
 def side_from_bias(bias: str) -> str:
+    if "观望" in bias:
+        return "wait"
     if "偏多" in bias:
         return "long"
     if "偏空" in bias:
@@ -1007,10 +1059,11 @@ def merge_global_gate(
 def direction_quality(raw: int, side: str, backtest: DirectionalBacktest) -> tuple[int, str]:
     if side == "wait":
         return min(raw, 58), "观望信号不做胜率放大"
-    sample_weight = 0.35 if backtest.sample_count < 20 else 0.55 if backtest.sample_count < 45 else 0.7
-    score = round(raw * (1.0 - sample_weight) + backtest.quality_score * sample_weight)
-    score = max(20, min(88, score))
-    note = f"方向规则{raw}/100，历史质量{backtest.quality_score}/100({backtest.grade})，样本{backtest.sample_count}"
+    score = max(20, min(88, raw))
+    note = (
+        f"方向规则{raw}/100；5m代理回测质量{backtest.quality_score}/100"
+        f"({backtest.grade})，样本{backtest.sample_count}，不参与开仓分"
+    )
     if backtest.sample_count < 20:
         note += "，样本偏少"
     return score, note
@@ -1022,6 +1075,7 @@ def execution_confidence(
     trigger_check: TriggerCheck,
     gate: str,
     candle_state: str,
+    risk_penalty: int = 0,
 ) -> tuple[int, str]:
     score = direction_score
     notes: List[str] = []
@@ -1047,9 +1101,13 @@ def execution_confidence(
             notes.append("到位但还要确认")
         elif status == "confirmed":
             notes.append("触发确认通过")
-    if candle_state == "实时预判":
+    effective_penalty = max(0, risk_penalty - gate_floor_penalty(gate))
+    if effective_penalty > 0:
+        score -= effective_penalty
+        notes.append(f"风险扣分{effective_penalty}")
+    if candle_state == "实时K线":
         score -= 5
-        notes.append("K线未收盘")
+        notes.append("当前周期K线仍在形成")
     score = max(10, min(88, round(score)))
     return score, "；".join(notes) if notes else "触发与风控正常"
 
@@ -1077,6 +1135,7 @@ def build_risk_sizing(
     confidence: int,
     gate: str,
     trigger_check: TriggerCheck | None = None,
+    tick_size_verified: bool = True,
 ) -> Dict[str, object]:
     budget_pct = risk_budget_from_confidence(confidence, gate, side)
     allowed = True
@@ -1102,9 +1161,11 @@ def build_risk_sizing(
         stop_legal = False
     if side == "short" and stop <= entry:
         stop_legal = False
+    if not tick_size_verified:
+        stop_legal = False
     if not stop_legal:
         allowed = False
-        note = "止损不合法，不给开仓仓位"
+        note = "交易所tick size缺失，无法确认止损合法性" if not tick_size_verified else "止损不合法，不给开仓仓位"
     max_size_pct = 0.0
     if allowed:
         if confidence >= 75:
@@ -1139,9 +1200,18 @@ def build_risk_sizing(
     }
 
 
-def build_trigger_check(side: str, entry: float, ind: Dict[str, CandleIndicators], book: Dict[str, float]) -> TriggerCheck:
-    one_min = ind["1m"]
-    price = one_min.close
+def build_trigger_check(
+    side: str,
+    entry: float,
+    ind: Dict[str, CandleIndicators],
+    book: Dict[str, float],
+    confirmed_ind: Dict[str, CandleIndicators] | None = None,
+) -> TriggerCheck:
+    live_one_min = ind["1m"]
+    one_min = (confirmed_ind or ind)["1m"]
+    bid = float(book.get("bid", 0.0) or 0.0)
+    ask = float(book.get("ask", 0.0) or 0.0)
+    price = (bid + ask) / 2.0 if bid and ask else live_one_min.close
     spread_pct = float(book.get("spread_pct", 0.0) or 0.0)
     spread_threshold = max(0.08, one_min.atr14_pct * 0.15)
     depth_imbalance = float(book.get("depth_imbalance", 0.0) or 0.0)
@@ -1155,7 +1225,6 @@ def build_trigger_check(side: str, entry: float, ind: Dict[str, CandleIndicators
     near_threshold = min(0.7, max(0.25, one_min.atr14_pct * 2.0))
     near = distance_pct <= near_threshold
     reasons: List[str] = []
-    realtime_prejudge = one_min.candle_state == "实时预判"
 
     def result(status: str, label: str, is_near: bool, structure: str, items: List[str], depth_pass: bool) -> TriggerCheck:
         return TriggerCheck(
@@ -1187,14 +1256,14 @@ def build_trigger_check(side: str, entry: float, ind: Dict[str, CandleIndicators
     else:
         imbalance_ok = depth_size_ok and depth_imbalance >= 0.15
     touch_tolerance = max(0.0015, near_threshold / 100.0 * 0.7)
-    ema20_ref = one_min.ema20_closed if realtime_prejudge else one_min.ema20
-    macd_hist_ref = one_min.macd_hist_closed if realtime_prejudge else one_min.macd_hist
+    ema20_ref = one_min.ema20
+    macd_hist_ref = one_min.macd_hist
     if side == "short":
-        retest_ok = one_min.recent_high_20 >= entry * (1.0 - touch_tolerance)
+        retest_ok = one_min.high >= entry * (1.0 - touch_tolerance)
         structure_ok = retest_ok and one_min.close < ema20_ref and macd_hist_ref <= 0
         structure = "反抽失败" if structure_ok else "反抽未确认"
     else:
-        retest_ok = one_min.recent_low_20 <= entry * (1.0 + touch_tolerance)
+        retest_ok = one_min.low <= entry * (1.0 + touch_tolerance)
         structure_ok = retest_ok and one_min.close > ema20_ref and macd_hist_ref >= 0
         structure = "突破站稳" if structure_ok else "突破未确认"
     if not volume_ok:
@@ -1213,13 +1282,8 @@ def build_trigger_check(side: str, entry: float, ind: Dict[str, CandleIndicators
         reasons.append(structure)
     depth_pass = depth_size_ok and imbalance_ok
     if volume_ok and spread_ok and structure_ok and depth_pass:
-        if realtime_prejudge:
-            reasons = ["1m K线仍是实时预判，禁止直接确认，等收盘确认"]
-            return result("watch", "实时预判，等1m收盘确认", True, structure, reasons, depth_pass)
         return result("confirmed", "入场触发已确认", True, structure, ["量能、价差、深度和1m结构均通过"], depth_pass)
     if spread_ok and depth_pass and (volume_ok or structure_ok):
-        if realtime_prejudge:
-            reasons.append("1m K线未收盘，只能观察")
         return result("watch", "到位但等最后确认", True, structure, reasons, depth_pass)
     return result("blocked", "到位但不建议动手", True, structure, reasons, depth_pass)
 
@@ -1233,7 +1297,9 @@ def build_timeframe_advice(
     book: Dict[str, float],
     backtests: Dict[str, DirectionalBacktest],
     global_gate: str,
+    confirmed_ind: Dict[str, CandleIndicators] | None = None,
 ) -> List[TimeframeAdvice]:
+    signal_ind = confirmed_ind or ind
     configs = [
         ("超短线1-15分钟", "适合看1m、5m、15m，只适合快进快出", [("1m", 2), ("5m", 4), ("15m", 2), ("1h", 1)], "5m"),
         ("短线1小时", "适合看5m、15m和1h，偏快进快出", [("5m", 1), ("15m", 3), ("1h", 3), ("4h", 1)], "1h"),
@@ -1242,11 +1308,11 @@ def build_timeframe_advice(
     ]
     advice: List[TimeframeAdvice] = []
     for name, horizon, weights, anchor_interval in configs:
-        score = score_timeframe(pct_24h, ind, weights)
+        score = score_timeframe(pct_24h, signal_ind, weights)
         bias, raw_confidence = bias_from_score(score)
         bias, raw_confidence, extreme_downgraded = downgrade_extreme_symbol_bias(symbol, pct_24h, bias, raw_confidence)
-        anchor = ind[anchor_interval]
-        gate, gate_warnings, gate_penalty = risk_gate(anchor, ind, pct_24h, funding_rate)
+        anchor = signal_ind[anchor_interval]
+        gate, gate_warnings, gate_penalty = risk_gate(ind[anchor_interval], ind, pct_24h, funding_rate)
         gate, gate_warnings, gate_penalty = merge_global_gate(gate, gate_warnings, gate_penalty, global_gate)
         side = side_from_bias(bias)
         selected_backtest = backtests.get(side, neutral_backtest()) if side != "wait" else neutral_backtest()
@@ -1288,8 +1354,8 @@ def build_timeframe_advice(
             stop_hint = legal_stop(min(anchor.recent_low_20, anchor.boll_lower) - 0.8 * anchor.atr14, "long", long_entry, anchor, meta.tick_size)
 
         if extreme_downgraded:
-            action = "暴涨后不追多，优先等反弹高位空网格或观望。"
-            reasons.append("TLM暴涨后按妖币风控降级，禁止把追多信号当成开仓信号")
+            action = "暴涨后不追多，也不自动反手做空；等待新方向确认。"
+            reasons.append("TLM暴涨后按妖币风控降级为观望，禁止把追多或自动反手当成开仓信号")
         if gate == "禁止开仓":
             action = "全局或当前周期极端波动，禁止新开仓；只允许观察或处理已有仓位。"
         elif gate == "禁止半仓" and direction_score >= 60:
@@ -1299,10 +1365,14 @@ def build_timeframe_advice(
         short_entry = legal_zone_price(short_entry, meta.tick_size)
         trigger_side = "wait" if gate == "禁止开仓" else side
         trigger_entry = short_entry if trigger_side == "short" else long_entry
-        trigger_check = build_trigger_check(trigger_side, trigger_entry, ind, book)
-        confidence, execution_note = execution_confidence(direction_score, side, trigger_check, gate, anchor.candle_state)
+        trigger_check = build_trigger_check(trigger_side, trigger_entry, ind, book, signal_ind)
+        confidence, execution_note = execution_confidence(
+            direction_score, side, trigger_check, gate, anchor.candle_state, gate_penalty
+        )
         sizing_entry = short_entry if side == "short" else long_entry
-        risk_sizing = build_risk_sizing(side, sizing_entry, stop_hint, confidence, gate, trigger_check)
+        risk_sizing = build_risk_sizing(
+            side, sizing_entry, stop_hint, confidence, gate, trigger_check, meta.tick_size_verified
+        )
         reasons.append(execution_note)
         reasons.append(
             f"风险预算仓位：{risk_sizing['suggested_size_pct']}%权益，"
@@ -1320,6 +1390,7 @@ def build_timeframe_advice(
                 execution_score=confidence,
                 confidence_note=confidence_note,
                 execution_note=execution_note,
+                anchor_interval=anchor_interval,
                 candle_state=anchor.candle_state,
                 risk_gate=gate,
                 action=action,
@@ -1401,7 +1472,7 @@ def explain(symbol: str, pct_24h: float, ind: Dict[str, CandleIndicators], score
         summary = "方向不够干净，更适合等价格靠近支撑/压力后再开网格。"
 
     if symbol.upper().startswith("TLM") and pct_24h > 25:
-        summary = "暴涨后偏过热，更适合反弹高位空网格或观望，追多风险大。"
+        summary = "暴涨后偏过热，禁止追多，也不自动反手做空，等待新方向确认。"
         bias, confidence, _ = downgrade_extreme_symbol_bias(symbol, pct_24h, bias, confidence)
 
     return bias, confidence, summary, risks
@@ -1409,23 +1480,38 @@ def explain(symbol: str, pct_24h: float, ind: Dict[str, CandleIndicators], score
 
 def analyze_symbol(symbol: str) -> SymbolReport:
     symbol = symbol.upper().strip()
-    ticker = request_json("/fapi/v1/ticker/24hr", {"symbol": symbol})
-    premium = request_json("/fapi/v1/premiumIndex", {"symbol": symbol})
-    meta = fetch_symbol_meta(symbol)
-    book = fetch_book_ticker(symbol)
-    candles_by_interval = {
-        interval: fetch_klines(symbol, interval, 420 if interval == "5m" else 220)
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix=f"bian-{symbol}") as pool:
+        ticker_future = pool.submit(request_json, "/fapi/v1/ticker/24hr", {"symbol": symbol})
+        premium_future = pool.submit(request_json, "/fapi/v1/premiumIndex", {"symbol": symbol})
+        meta_future = pool.submit(fetch_symbol_meta, symbol)
+        book_future = pool.submit(fetch_book_ticker, symbol)
+        candle_futures = {
+            interval: pool.submit(fetch_klines, symbol, interval, 420 if interval == "5m" else 220)
+            for interval in INTERVALS
+        }
+        ticker = ticker_future.result()
+        premium = premium_future.result()
+        meta = meta_future.result()
+        book = book_future.result()
+        candles_by_interval = {interval: candle_futures[interval].result() for interval in INTERVALS}
+    indicators = {interval: build_indicators(interval, candles_by_interval[interval]) for interval in INTERVALS}
+    confirmed_indicators = {
+        interval: build_indicators(
+            interval,
+            candles_by_interval[interval]
+            if indicators[interval].is_closed
+            else candles_by_interval[interval][:-1],
+        )
         for interval in INTERVALS
     }
-    indicators = {interval: build_indicators(interval, candles_by_interval[interval]) for interval in INTERVALS}
     backtests = load_or_build_directional_backtests(symbol, candles_by_interval["5m"])
 
     last = float(ticker["lastPrice"])
     pct_24h = float(ticker["priceChangePercent"])
     funding_rate = float(premium["lastFundingRate"])
-    score = score_symbol(pct_24h, indicators)
+    score = score_symbol(pct_24h, confirmed_indicators)
     bias, raw_confidence, summary, risks = explain(symbol, pct_24h, indicators, score)
-    top_extreme_downgraded = symbol.upper().startswith("TLM") and pct_24h > 25 and bias == "观望偏空"
+    top_extreme_downgraded = symbol.upper().startswith("TLM") and pct_24h > 25 and bias == "观望"
     top_side = side_from_bias(bias)
     top_backtest = backtests.get(top_side, neutral_backtest()) if top_side != "wait" else neutral_backtest()
     top_gate, top_gate_warnings, top_gate_penalty = risk_gate(indicators["1h"], indicators, pct_24h, funding_rate)
@@ -1433,17 +1519,36 @@ def analyze_symbol(symbol: str) -> SymbolReport:
     if top_extreme_downgraded:
         direction_score = min(direction_score, 59)
         direction_note += "，TLM极端波动降级"
-    long_grid = build_grid(last, indicators["1h"], "long", meta)
-    short_grid = build_grid(last, indicators["1h"], "short", meta)
+    long_grid = build_grid(last, confirmed_indicators["1h"], "long", meta)
+    short_grid = build_grid(last, confirmed_indicators["1h"], "short", meta)
     top_entry = short_grid["entry"] if top_side == "short" else long_grid["entry"]
     top_stop = short_grid["stop"] if top_side == "short" else long_grid["stop"]
     top_trigger_side = "wait" if top_gate == "禁止开仓" else top_side
-    top_trigger = build_trigger_check(top_trigger_side, top_entry, indicators, book)
-    confidence, execution_note = execution_confidence(direction_score, top_side, top_trigger, top_gate, indicators["1h"].candle_state)
-    top_risk_sizing = build_risk_sizing(top_side, top_entry, top_stop, confidence, top_gate, top_trigger)
+    top_trigger = build_trigger_check(top_trigger_side, top_entry, indicators, book, confirmed_indicators)
+    confidence, execution_note = execution_confidence(
+        direction_score,
+        top_side,
+        top_trigger,
+        top_gate,
+        confirmed_indicators["1h"].candle_state,
+        top_gate_penalty,
+    )
+    top_risk_sizing = build_risk_sizing(
+        top_side, top_entry, top_stop, confidence, top_gate, top_trigger, meta.tick_size_verified
+    )
     confidence_note = f"{direction_note}；{execution_note}"
     risks.extend(x for x in top_gate_warnings if x not in risks)
-    timeframe_advice = build_timeframe_advice(symbol, pct_24h, funding_rate, indicators, meta, book, backtests, top_gate)
+    timeframe_advice = build_timeframe_advice(
+        symbol,
+        pct_24h,
+        funding_rate,
+        indicators,
+        meta,
+        book,
+        backtests,
+        top_gate,
+        confirmed_indicators,
+    )
 
     return SymbolReport(
         symbol=symbol,
@@ -1465,7 +1570,9 @@ def analyze_symbol(symbol: str) -> SymbolReport:
             "raw_confidence": raw_confidence,
             "direction_score": direction_score,
             "execution_score": confidence,
-            "calibrated_confidence": confidence,
+            "calibrated_confidence": None,
+            "calibration_status": "5m_proxy_not_live_isomorphic",
+            "confidence_source": "rules+risk+trigger; 5m proxy backtest is informational only",
             "confidence_note": confidence_note,
             "direction_note": direction_note,
             "execution_note": execution_note,
@@ -1473,6 +1580,7 @@ def analyze_symbol(symbol: str) -> SymbolReport:
             "trigger_check": top_trigger,
             "risk_sizing": top_risk_sizing,
             "tick_size": meta.tick_size,
+            "tick_size_verified": meta.tick_size_verified,
             "bid": book.get("bid", 0.0),
             "ask": book.get("ask", 0.0),
             "spread_pct": book.get("spread_pct", 0.0),
@@ -1560,12 +1668,13 @@ def main(argv: Sequence[str]) -> int:
 
     symbols = parse_symbols(args)
     reports: List[SymbolReport] = []
-    for symbol in symbols:
-        try:
-            reports.append(analyze_symbol(symbol))
-            time.sleep(0.15)
-        except Exception as exc:  # Keep one failed symbol from hiding the rest.
-            print(f"ERROR {symbol}: {exc}", file=sys.stderr)
+    with ThreadPoolExecutor(max_workers=min(2, len(symbols)), thread_name_prefix="bian-symbol") as pool:
+        futures = {symbol: pool.submit(analyze_symbol, symbol) for symbol in symbols}
+        for symbol in symbols:
+            try:
+                reports.append(futures[symbol].result())
+            except Exception as exc:  # Keep one failed symbol from hiding the rest.
+                print(f"ERROR {symbol}: {exc}", file=sys.stderr)
 
     if args.json:
         print(json.dumps([to_jsonable(report) for report in reports], ensure_ascii=True, indent=2))

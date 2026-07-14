@@ -10,6 +10,8 @@ Local dashboard server for Binance futures analysis.
 """
 import http.server
 import asyncio
+import copy
+import hashlib
 from http import cookies
 import html
 import json
@@ -19,7 +21,11 @@ import subprocess
 import sys
 import threading
 import time
+import ipaddress
 from datetime import datetime, timedelta, timezone
+import urllib.error
+import urllib.parse
+import urllib.request
 from urllib.parse import parse_qs, urlparse, quote
 
 logging.basicConfig(
@@ -57,6 +63,11 @@ AUTH_SESSION_TTL_SECONDS = int(os.environ.get("BIAN_AUTH_SESSION_TTL_SECONDS", s
 AUTH_COOKIE_SECURE = os.environ.get("BIAN_AUTH_COOKIE_SECURE", "0").lower() in ("1", "true", "yes", "on")
 AUTH_MAX_FAILURES = int(os.environ.get("BIAN_AUTH_MAX_FAILURES", "8"))
 AUTH_LOCKOUT_SECONDS = int(os.environ.get("BIAN_AUTH_LOCKOUT_SECONDS", "300"))
+AUTH_TRUST_PROXY_HEADERS = os.environ.get("BIAN_AUTH_TRUST_PROXY_HEADERS", "0").lower() in ("1", "true", "yes", "on")
+AUTH_SESSION_TOUCH_INTERVAL_SECONDS = int(os.environ.get("BIAN_AUTH_SESSION_TOUCH_INTERVAL_SECONDS", "60"))
+AUTH_REQUIRE_SAME_ORIGIN_POST = os.environ.get("BIAN_AUTH_REQUIRE_SAME_ORIGIN_POST", "1").lower() not in ("0", "false", "no", "off")
+INTERNAL_ERROR_MESSAGE = "internal server error; check server logs"
+EXPOSE_ERROR_DETAILS = os.environ.get("BIAN_EXPOSE_ERROR_DETAILS", "0").lower() in ("1", "true", "yes", "on")
 PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(PACKAGE_ROOT))
 WEB_ROOT = os.path.join(ROOT, "web")
@@ -69,6 +80,15 @@ BACKTEST_CACHE_TTL_SECONDS = 10 * 60
 RUN_TIMEOUT_SECONDS = 120
 DEFAULT_SYMBOLS = ["DOGEUSDT", "TLMUSDT"]
 MAX_SYMBOLS = 8
+SIGNAL_REVIEW_DEFAULT_LIMIT = 240
+SIGNAL_REVIEW_MAX_LIMIT = 1000
+BINANCE_FAPI_BASE = os.environ.get("BIAN_BINANCE_FAPI_BASE", "https://fapi.binance.com").rstrip("/")
+SIGNAL_REVIEW_HORIZONS = (("5m", 5 * 60 * 1000), ("15m", 15 * 60 * 1000), ("1h", 60 * 60 * 1000))
+SIGNAL_REVIEW_CALIBRATION_HORIZON = "1h"
+SIGNAL_REVIEW_MIN_PROFIT_PCT = {"5m": 0.25, "15m": 0.45, "1h": 0.75}
+SIGNAL_REVIEW_TRIGGER_MIN_INTERVAL_SECONDS = float(os.environ.get("BIAN_SIGNAL_REVIEW_TRIGGER_MIN_INTERVAL_SECONDS", "20"))
+SIGNAL_REVIEW_TAKER_FEE_BPS = float(os.environ.get("BIAN_SIGNAL_REVIEW_TAKER_FEE_BPS", "5"))
+SIGNAL_REVIEW_SLIPPAGE_BPS = float(os.environ.get("BIAN_SIGNAL_REVIEW_SLIPPAGE_BPS", "2"))
 SSE_MAX_SECONDS = 30 * 60
 SSE_HEARTBEAT_SECONDS = 15
 REALTIME_IDLE_SECONDS = 30
@@ -78,10 +98,31 @@ _last_payloads = {}
 _payload_lock = threading.RLock()
 _cache_lock = threading.RLock()
 _market_locks = {}
+_market_lock_refs = {}
 _market_locks_guard = threading.RLock()
 _run_semaphore = threading.Semaphore(2)
 _realtime_hubs = {}
 _realtime_hubs_lock = threading.RLock()
+_realtime_sharing_counts = {"exact": 0, "new": 0, "superset": 0}
+_realtime_sharing_lock = threading.RLock()
+_realtime_storage_lock = threading.RLock()
+_realtime_storage_event = threading.Event()
+_realtime_storage_pending = {}
+_realtime_storage_thread = None
+_signal_review_eval_lock = threading.Lock()
+_signal_review_trigger_lock = threading.RLock()
+_signal_review_eval_state = {
+    "trigger_count": 0,
+    "thread_started_count": 0,
+    "skipped_recent_count": 0,
+    "skipped_running_count": 0,
+    "last_trigger_at": 0.0,
+    "last_started_at": 0.0,
+    "last_finished_at": 0.0,
+    "last_result": {},
+    "last_error": "",
+}
+SERVER_STARTED_AT = time.time()
 
 
 class RealtimePriceHub:
@@ -299,8 +340,7 @@ class RealtimePriceHub:
                     item["source"] = "futures_bookTicker+depth20" if item.get("price") else "futures_depth20"
                     self.latest[symbol] = item
                     self.error = None
-                if storage is not None:
-                    storage.set_realtime_price(symbol, item)
+                persist_realtime_later(symbol, item)
                 return
             price = data.get("p") or data.get("c")
             bid = bids_raw
@@ -325,8 +365,7 @@ class RealtimePriceHub:
                     old["source"] = "futures_bookTicker+depth20"
                 self.latest[symbol] = old
                 self.error = None
-            if storage is not None:
-                storage.set_realtime_price(symbol, old)
+            persist_realtime_later(symbol, old)
         except Exception as exc:
             with self.lock:
                 self.error = str(exc)
@@ -341,6 +380,18 @@ class RealtimePriceHub:
                 "connected": bool((self.twm and self.socket_key) or self.direct_connected),
             }
 
+    def is_active_for(self, symbols):
+        requested = set(symbols or [])
+        if not requested:
+            return False
+        with self.lock:
+            active = bool((self.twm and self.socket_key) or self.direct_connected)
+            return active and requested.issubset(set(self.symbols or []))
+
+
+class BadRequestError(ValueError):
+    pass
+
 
 def now_bj() -> str:
     return datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -353,27 +404,37 @@ def normalize_symbol(raw):
     return symbol
 
 
-def parse_symbols(query):
-    params = parse_qs(query)
-    raw_parts = []
-    for item in params.get("symbol", []):
-        raw_parts.append(item)
-    for item in params.get("symbols", []):
-        raw_parts.extend(item.split(","))
+def normalize_symbols(raw_parts, fallback=None, limit=MAX_SYMBOLS):
     symbols = []
     seen = set()
-    for raw in raw_parts:
+    for raw in raw_parts or []:
         symbol = normalize_symbol(raw)
         if symbol and symbol not in seen:
             symbols.append(symbol)
             seen.add(symbol)
-        if len(symbols) >= MAX_SYMBOLS:
+        if len(symbols) >= limit:
             break
-    return symbols or list(DEFAULT_SYMBOLS)
+    return symbols or list(fallback or [])
+
+
+def parse_query_symbols(query, fallback=None, limit=MAX_SYMBOLS):
+    params = parse_qs(query or "")
+    raw_parts = list(params.get("symbol", []))
+    for item in params.get("symbols", []):
+        raw_parts.extend(item.split(","))
+    return normalize_symbols(raw_parts, fallback=fallback, limit=limit)
+
+
+def parse_symbols(query):
+    return parse_query_symbols(query, fallback=DEFAULT_SYMBOLS)
 
 
 def cache_key(symbols):
     return ",".join(symbols)
+
+
+def realtime_cache_key(symbols):
+    return ",".join(sorted(normalize_symbols(symbols)))
 
 
 def market_lock_for(key):
@@ -382,7 +443,19 @@ def market_lock_for(key):
         if lock is None:
             lock = threading.RLock()
             _market_locks[key] = lock
+        _market_lock_refs[key] = int(_market_lock_refs.get(key, 0)) + 1
         return lock
+
+
+def release_market_lock(key, lock):
+    with _market_locks_guard:
+        if _market_locks.get(key) is not lock:
+            return
+        refs = max(0, int(_market_lock_refs.get(key, 0)) - 1)
+        if refs:
+            _market_lock_refs[key] = refs
+        else:
+            _market_lock_refs.pop(key, None)
 
 
 def prune_memory_cache(now=None):
@@ -401,18 +474,94 @@ def prune_memory_cache(now=None):
         active_keys = set(_last_payloads.keys())
     with _market_locks_guard:
         for key in list(_market_locks.keys()):
-            if key not in active_keys:
+            if key not in active_keys and not _market_lock_refs.get(key):
                 _market_locks.pop(key, None)
 
 
+def _realtime_storage_worker():
+    while True:
+        _realtime_storage_event.wait()
+        time.sleep(0.05)
+        with _realtime_storage_lock:
+            pending = dict(_realtime_storage_pending)
+            _realtime_storage_pending.clear()
+            _realtime_storage_event.clear()
+        if storage is None:
+            continue
+        for symbol, item in pending.items():
+            try:
+                storage.set_realtime_price(symbol, item)
+            except Exception:
+                LOG.exception("realtime Redis persistence failed; symbol=%s", symbol)
+
+
+def persist_realtime_later(symbol, item):
+    global _realtime_storage_thread
+    if storage is None or not symbol or not item:
+        return
+    with _realtime_storage_lock:
+        _realtime_storage_pending[symbol] = dict(item)
+        if _realtime_storage_thread is None or not _realtime_storage_thread.is_alive():
+            _realtime_storage_thread = threading.Thread(
+                target=_realtime_storage_worker,
+                name="bian-realtime-storage",
+                daemon=True,
+            )
+            _realtime_storage_thread.start()
+        _realtime_storage_event.set()
+
+
 def realtime_hub_for(symbols):
-    key = cache_key(symbols)
+    key = realtime_cache_key(symbols)
     with _realtime_hubs_lock:
         hub = _realtime_hubs.get(key)
         if hub is None:
             hub = RealtimePriceHub(key)
             _realtime_hubs[key] = hub
         return hub
+
+
+def realtime_hub_for_request(symbols):
+    requested = sorted(normalize_symbols(symbols))
+    key = realtime_cache_key(requested)
+    with _realtime_hubs_lock:
+        exact = _realtime_hubs.get(key)
+        if exact is not None:
+            return exact, requested, "exact"
+        requested_set = set(requested)
+        reusable = []
+        for hub in _realtime_hubs.values():
+            with hub.lock:
+                hub_symbols = list(hub.symbols or [])
+                active = bool((hub.twm and hub.socket_key) or hub.direct_connected)
+            if active and requested_set.issubset(set(hub_symbols)):
+                reusable.append((len(hub_symbols), hub.key, hub, hub_symbols))
+        if reusable:
+            reusable.sort(key=lambda item: (item[0], item[1]))
+            _, _, hub, hub_symbols = reusable[0]
+            return hub, hub_symbols, "superset"
+        hub = RealtimePriceHub(key)
+        _realtime_hubs[key] = hub
+        return hub, requested, "new"
+
+
+def record_realtime_sharing(mode):
+    mode = mode if mode in _realtime_sharing_counts else "new"
+    with _realtime_sharing_lock:
+        _realtime_sharing_counts[mode] = int(_realtime_sharing_counts.get(mode, 0)) + 1
+
+
+def realtime_sharing_stats():
+    with _realtime_sharing_lock:
+        counts = {key: int(_realtime_sharing_counts.get(key, 0)) for key in ("exact", "new", "superset")}
+    total = sum(counts.values())
+    saved = counts.get("exact", 0) + counts.get("superset", 0)
+    return {
+        "counts": counts,
+        "total_requests": total,
+        "reused_requests": saved,
+        "reuse_rate_pct": round((saved / total) * 100.0, 2) if total else 0.0,
+    }
 
 
 def payload_matches(payload, symbols):
@@ -446,6 +595,24 @@ def load_cache(symbols):
     return None
 
 
+def payload_age_seconds(payload, now=None):
+    if not isinstance(payload, dict) or not payload.get("generated_at"):
+        return None
+    snapshot_ms = parse_snapshot_ms(payload.get("generated_at"), fallback=-1)
+    if snapshot_ms <= 0:
+        return None
+    return max(0.0, (now or time.time()) - snapshot_ms / 1000.0)
+
+
+def fresh_disk_cache(symbols, now=None):
+    now = now or time.time()
+    payload = load_cache(symbols)
+    age = payload_age_seconds(payload, now)
+    if payload and age is not None and age <= CACHE_TTL_SECONDS:
+        return payload, age
+    return None, None
+
+
 def save_cache(symbols, payload):
     key = cache_key(symbols)
     with _cache_lock:
@@ -464,7 +631,18 @@ def save_cache(symbols, payload):
                 pass
         cache["version"] = 2
         cache["last_key"] = key
-        cache.setdefault("payloads", {})[key] = payload
+        payloads = cache.setdefault("payloads", {})
+        payloads[key] = payload
+        if len(payloads) > MEMORY_CACHE_MAX_ITEMS:
+            ordered = sorted(
+                payloads,
+                key=lambda item_key: parse_snapshot_ms(
+                    (payloads.get(item_key) or {}).get("generated_at"),
+                    fallback=0,
+                ),
+            )
+            for stale_key in ordered[: len(payloads) - MEMORY_CACHE_MAX_ITEMS]:
+                payloads.pop(stale_key, None)
         try:
             os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
             tmp = CACHE_FILE + ".tmp"
@@ -472,7 +650,7 @@ def save_cache(symbols, payload):
                 json.dump(cache, fh, ensure_ascii=False)
             os.replace(tmp, CACHE_FILE)
         except Exception:
-            pass
+            LOG.exception("market disk cache write failed; key=%s", key)
 
 
 def run_bian_json(symbols):
@@ -531,6 +709,969 @@ def symbols_from_market_data(data):
     return symbols
 
 
+def parse_symbol_filter(query):
+    return parse_query_symbols(query)
+
+
+def parse_signal_review_limit(query):
+    params = parse_qs(query or "")
+    raw = params.get("limit", [str(SIGNAL_REVIEW_DEFAULT_LIMIT)])[0]
+    text = str(raw or "").strip()
+    if not text:
+        return SIGNAL_REVIEW_DEFAULT_LIMIT
+    try:
+        limit = int(text)
+    except (TypeError, ValueError):
+        raise BadRequestError("limit must be an integer")
+    if not 1 <= limit <= SIGNAL_REVIEW_MAX_LIMIT:
+        raise BadRequestError(f"limit must be between 1 and {SIGNAL_REVIEW_MAX_LIMIT}")
+    return limit
+
+
+def parse_snapshot_ms(text, fallback=None):
+    if text:
+        raw = str(text).strip().replace("/", "-")
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return int(datetime.strptime(raw[:19], fmt).replace(tzinfo=BJ_TZ).timestamp() * 1000)
+            except Exception:
+                pass
+        try:
+            return int(datetime.fromisoformat(raw).timestamp() * 1000)
+        except Exception:
+            pass
+    return int((fallback or time.time()) * 1000)
+
+
+def side_from_bias_text(text):
+    value = str(text or "").lower()
+    if "偏空" in value or "short" in value or "bear" in value:
+        return "short"
+    if "偏多" in value or "long" in value or "bull" in value:
+        return "long"
+    return "wait"
+
+
+def float_or_zero(value):
+    try:
+        num = float(value)
+        return num if num == num and abs(num) != float("inf") else 0.0
+    except Exception:
+        return 0.0
+
+
+def signal_review_roundtrip_cost_pct():
+    return max(0.0, 2.0 * (SIGNAL_REVIEW_TAKER_FEE_BPS + SIGNAL_REVIEW_SLIPPAGE_BPS) / 100.0)
+
+
+def price_key(value):
+    return f"{float_or_zero(value):.8g}"
+
+
+def build_signal_key(symbol, advice_name, side, entry, stop, snapshot_ms):
+    bucket = int(snapshot_ms or 0) // (5 * 60 * 1000)
+    raw = "|".join([symbol, advice_name, side, price_key(entry), price_key(stop), str(bucket)])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def invalid_signal_evaluation(reason):
+    return {
+        "invalid": {
+            "status": "done",
+            "failure_reason": reason,
+            "evaluated_at_ms": int(time.time() * 1000),
+        }
+    }
+
+
+def bucket_atr_regime(atr_pct):
+    value = float_or_zero(atr_pct)
+    if value >= 12:
+        return "extreme"
+    if value >= 8:
+        return "high"
+    if value >= 3:
+        return "normal"
+    return "low"
+
+
+def bucket_boll_width_regime(width_pct):
+    value = float_or_zero(width_pct)
+    if value >= 45:
+        return "extreme"
+    if value >= 25:
+        return "wide"
+    if value >= 8:
+        return "normal"
+    return "tight"
+
+
+def bucket_boll_position_regime(position_pct):
+    value = float_or_zero(position_pct)
+    if value >= 90:
+        return "upper_extreme"
+    if value >= 70:
+        return "upper"
+    if value <= 10:
+        return "lower_extreme"
+    if value <= 30:
+        return "lower"
+    return "middle"
+
+
+def build_market_regime(report, advice):
+    if not isinstance(report, dict) or not isinstance(advice, dict):
+        return {}
+    anchor_interval = str(advice.get("anchor_interval") or "").strip()
+    indicators = report.get("indicators") if isinstance(report.get("indicators"), dict) else {}
+    anchor = indicators.get(anchor_interval) if anchor_interval else None
+    if not isinstance(anchor, dict):
+        return {"anchor_interval": anchor_interval} if anchor_interval else {}
+    atr_pct = float_or_zero(anchor.get("atr14_pct"))
+    boll_width = float_or_zero(anchor.get("boll_bandwidth_pct"))
+    boll_position = float_or_zero(anchor.get("boll_position_pct"))
+    return {
+        "anchor_interval": anchor_interval,
+        "trend_regime": str(anchor.get("emt") or "-"),
+        "atr_regime": bucket_atr_regime(atr_pct),
+        "boll_width_regime": bucket_boll_width_regime(boll_width),
+        "boll_position_regime": bucket_boll_position_regime(boll_position),
+        "atr_pct": round(atr_pct, 4),
+        "boll_bandwidth_pct": round(boll_width, 4),
+        "boll_position_pct": round(boll_position, 4),
+    }
+
+
+def build_signal_review_records(payload):
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return []
+    generated_at = payload.get("generated_at") or now_bj()
+    snapshot_ms = parse_snapshot_ms(generated_at)
+    records = []
+    for report in payload.get("data") or []:
+        if not isinstance(report, dict):
+            continue
+        symbol = normalize_symbol(report.get("symbol"))
+        if not symbol:
+            continue
+        snapshot_price = float_or_zero(report.get("last"))
+        for advice in report.get("timeframe_advice") or []:
+            if not isinstance(advice, dict):
+                continue
+            side = side_from_bias_text(advice.get("bias"))
+            if side not in ("long", "short"):
+                continue
+            entry_key = "short_entry" if side == "short" else "long_entry"
+            entry = float_or_zero(advice.get(entry_key))
+            stop = float_or_zero(advice.get("stop_hint"))
+            status = "pending"
+            failure_reason = ""
+            evaluation = {}
+            if entry <= 0:
+                status = "evaluated"
+                failure_reason = "entry_invalid"
+                evaluation = invalid_signal_evaluation(failure_reason)
+            elif stop <= 0:
+                status = "evaluated"
+                failure_reason = "stop_invalid"
+                evaluation = invalid_signal_evaluation(failure_reason)
+            elif side == "long" and stop >= entry:
+                status = "evaluated"
+                failure_reason = "stop_invalid"
+                evaluation = invalid_signal_evaluation("long_stop_not_below_entry")
+            elif side == "short" and stop <= entry:
+                status = "evaluated"
+                failure_reason = "stop_invalid"
+                evaluation = invalid_signal_evaluation("short_stop_not_above_entry")
+            trigger = advice.get("trigger_check") if isinstance(advice.get("trigger_check"), dict) else {}
+            market_regime = build_market_regime(report, advice)
+            signal_key = build_signal_key(symbol, str(advice.get("name") or ""), side, entry, stop, snapshot_ms)
+            records.append(
+                {
+                    "signal_key": signal_key,
+                    "symbol": symbol,
+                    "advice_name": str(advice.get("name") or ""),
+                    "side": side,
+                    "entry_price": entry,
+                    "stop_price": stop,
+                    "snapshot_price": snapshot_price,
+                    "snapshot_at_ms": snapshot_ms,
+                    "snapshot_at": generated_at,
+                    "confidence": int(float_or_zero(advice.get("confidence"))),
+                    "direction_score": int(float_or_zero(advice.get("direction_score"))),
+                    "execution_score": int(float_or_zero(advice.get("execution_score", advice.get("confidence")))),
+                    "risk_gate": str(advice.get("risk_gate") or ""),
+                    "candle_state": str(advice.get("candle_state") or ""),
+                    "trigger_status": str(trigger.get("status") or ""),
+                    "market_regime": market_regime,
+                    "status": status,
+                    "failure_reason": failure_reason,
+                    "evaluation": evaluation,
+                    "payload": {
+                        "generated_at": generated_at,
+                        "report_bias": report.get("bias"),
+                        "pct_24h": report.get("pct_24h"),
+                        "funding_rate": report.get("funding_rate"),
+                        "market_regime": market_regime,
+                        "advice": advice,
+                    },
+                }
+            )
+    return records
+
+
+def request_binance_json(path, params, timeout=20):
+    query = urllib.parse.urlencode(params)
+    url = f"{BINANCE_FAPI_BASE}{path}?{query}"
+    last_error = None
+    for attempt in range(1, 3):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(f"Binance API HTTP {exc.code}: {body[:300]}")
+            if exc.code in (400, 404):
+                break
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+        if attempt < 2:
+            time.sleep(0.5 * attempt)
+    raise RuntimeError(f"Binance review data fetch failed: {last_error}")
+
+
+def fetch_review_klines(symbol, start_ms, end_ms):
+    start_ms = max(0, int(start_ms or 0) + 1)
+    end_ms = max(start_ms + 60_000, int(end_ms or 0))
+    minutes = max(1, int((end_ms - start_ms) / 60_000) + 3)
+    data = request_binance_json(
+        "/fapi/v1/klines",
+        {
+            "symbol": normalize_symbol(symbol),
+            "interval": "1m",
+            "startTime": start_ms,
+            "endTime": end_ms + 60_000,
+            "limit": min(1000, minutes),
+        },
+        timeout=20,
+    )
+    return list(data or [])
+
+
+def evaluate_horizon_from_klines(record, horizon, horizon_ms, candles):
+    side = str(record.get("side") or "")
+    entry = float_or_zero(record.get("entry_price"))
+    stop = float_or_zero(record.get("stop_price"))
+    snapshot_price = float_or_zero(record.get("snapshot_price"))
+    snapshot_ms = int(record.get("snapshot_at_ms") or 0)
+    end_ms = snapshot_ms + int(horizon_ms)
+    usable = []
+    for raw in candles or []:
+        try:
+            open_ms = int(raw[0])
+            if open_ms < snapshot_ms or open_ms > end_ms:
+                continue
+            usable.append(
+                {
+                    "open_ms": open_ms,
+                    "high": float(raw[2]),
+                    "low": float(raw[3]),
+                    "close": float(raw[4]),
+                    "close_ms": int(raw[6]) if len(raw) > 6 else open_ms + 59_999,
+                }
+            )
+        except Exception:
+            continue
+    if side not in ("long", "short") or entry <= 0 or stop <= 0:
+        return {"status": "done", "failure_reason": "invalid_signal", "horizon": horizon}
+    if not usable:
+        return {"status": "done", "failure_reason": "no_market_data", "horizon": horizon, "bars": 0}
+
+    profit_floor = SIGNAL_REVIEW_MIN_PROFIT_PCT.get(horizon, 0.4)
+    entry_reached = (side == "long" and snapshot_price and snapshot_price <= entry) or (
+        side == "short" and snapshot_price and snapshot_price >= entry
+    )
+    entry_time_ms = snapshot_ms if entry_reached else 0
+    max_profit_pct = 0.0
+    max_drawdown_pct = 0.0
+    stopped = False
+    ambiguous = False
+    stop_time_ms = 0
+    stop_distance_pct = abs((entry - stop) / entry * 100.0) if entry else 0.0
+    close_price = usable[-1]["close"]
+    estimated_cost_pct = signal_review_roundtrip_cost_pct()
+
+    def favorable_pct(bar):
+        if side == "long":
+            return (bar["high"] - entry) / entry * 100.0
+        return (entry - bar["low"]) / entry * 100.0
+
+    def adverse_pct(bar):
+        if side == "long":
+            return (bar["low"] - entry) / entry * 100.0
+        return (entry - bar["high"]) / entry * 100.0
+
+    def bar_hits_entry(bar):
+        return bar["low"] <= entry if side == "long" else bar["high"] >= entry
+
+    def bar_hits_stop(bar):
+        return bar["low"] <= stop if side == "long" else bar["high"] >= stop
+
+    if entry_reached and snapshot_price:
+        if (side == "long" and snapshot_price <= stop) or (side == "short" and snapshot_price >= stop):
+            stopped = True
+            stop_time_ms = snapshot_ms
+            ambiguous = True
+
+    for bar in usable:
+        if stopped:
+            break
+        triggered_this_bar = False
+        if not entry_reached and bar_hits_entry(bar):
+            entry_reached = True
+            entry_time_ms = bar["open_ms"]
+            triggered_this_bar = True
+        if not entry_reached:
+            continue
+
+        if bar_hits_stop(bar):
+            stopped = True
+            stop_time_ms = bar["open_ms"]
+            if triggered_this_bar:
+                ambiguous = True
+            break
+        # A 1m OHLC bar cannot reveal whether its high/low occurred before the
+        # entry touch. Do not claim MFE/MAE from the trigger bar.
+        if not triggered_this_bar:
+            max_drawdown_pct = min(max_drawdown_pct, adverse_pct(bar))
+            max_profit_pct = max(max_profit_pct, favorable_pct(bar))
+
+    if not entry_reached:
+        failure_reason = "entry_too_far"
+        if side == "long" and usable[-1]["close"] < snapshot_price:
+            failure_reason = "not_triggered_adverse_move"
+        if side == "short" and usable[-1]["close"] > snapshot_price:
+            failure_reason = "not_triggered_adverse_move"
+        return {
+            "status": "done",
+            "horizon": horizon,
+            "bars": len(usable),
+            "entry_reached": False,
+            "stop_hit": False,
+            "failure_reason": failure_reason,
+            "max_profit_pct": 0.0,
+            "gross_max_profit_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "outcome_pct": 0.0,
+            "gross_outcome_pct": 0.0,
+            "estimated_cost_pct": 0.0,
+            "close_price": close_price,
+            "evaluated_at_ms": int(time.time() * 1000),
+        }
+
+    if stopped:
+        gross_outcome_pct = (stop - entry) / entry * 100.0 if side == "long" else (entry - stop) / entry * 100.0
+        net_outcome_pct = gross_outcome_pct - estimated_cost_pct
+        net_max_profit_pct = max(0.0, max_profit_pct - estimated_cost_pct)
+        if stop_distance_pct <= 0.35:
+            failure_reason = "stop_too_tight"
+        elif ambiguous:
+            failure_reason = "same_bar_stop"
+        elif net_max_profit_pct < profit_floor:
+            failure_reason = "stop_hit_first"
+        else:
+            failure_reason = "stop_after_profit"
+        return {
+            "status": "done",
+            "horizon": horizon,
+            "bars": len(usable),
+            "entry_reached": True,
+            "entry_time_ms": entry_time_ms,
+            "stop_hit": True,
+            "stop_hit_first": net_max_profit_pct < profit_floor,
+            "same_bar_ambiguous": ambiguous,
+            "stop_time_ms": stop_time_ms,
+            "failure_reason": failure_reason,
+            "max_profit_pct": round(net_max_profit_pct, 4),
+            "gross_max_profit_pct": round(max(0.0, max_profit_pct), 4),
+            "max_drawdown_pct": round(max_drawdown_pct, 4),
+            "outcome_pct": round(net_outcome_pct, 4),
+            "gross_outcome_pct": round(gross_outcome_pct, 4),
+            "estimated_cost_pct": round(estimated_cost_pct, 4),
+            "close_price": close_price,
+            "evaluated_at_ms": int(time.time() * 1000),
+        }
+
+    if side == "long":
+        gross_outcome_pct = (close_price - entry) / entry * 100.0
+    else:
+        gross_outcome_pct = (entry - close_price) / entry * 100.0
+    net_outcome_pct = gross_outcome_pct - estimated_cost_pct
+    net_max_profit_pct = max(0.0, max_profit_pct - estimated_cost_pct)
+    if net_outcome_pct < -0.1:
+        failure_reason = "direction_wrong"
+    elif net_max_profit_pct < profit_floor:
+        failure_reason = "no_follow_through"
+    else:
+        failure_reason = "ok"
+    return {
+        "status": "done",
+        "horizon": horizon,
+        "bars": len(usable),
+        "entry_reached": True,
+        "entry_time_ms": entry_time_ms,
+        "stop_hit": False,
+        "stop_hit_first": False,
+        "failure_reason": failure_reason,
+        "max_profit_pct": round(net_max_profit_pct, 4),
+        "gross_max_profit_pct": round(max(0.0, max_profit_pct), 4),
+        "max_drawdown_pct": round(max_drawdown_pct, 4),
+        "outcome_pct": round(net_outcome_pct, 4),
+        "gross_outcome_pct": round(gross_outcome_pct, 4),
+        "estimated_cost_pct": round(estimated_cost_pct, 4),
+        "close_price": close_price,
+        "evaluated_at_ms": int(time.time() * 1000),
+    }
+
+
+def summarize_review_failure(evaluation):
+    if not isinstance(evaluation, dict):
+        return ""
+    invalid = evaluation.get("invalid")
+    if isinstance(invalid, dict) and invalid.get("failure_reason"):
+        return str(invalid.get("failure_reason"))
+    for horizon in ("1h", "15m", "5m"):
+        item = evaluation.get(horizon)
+        if isinstance(item, dict) and item.get("status") == "done":
+            reason = str(item.get("failure_reason") or "")
+            if reason and reason != "ok":
+                return reason
+    for horizon in ("1h", "15m", "5m"):
+        item = evaluation.get(horizon)
+        if isinstance(item, dict) and item.get("status") == "done":
+            return str(item.get("failure_reason") or "ok")
+    return ""
+
+
+def evaluate_signal_review_record(record, now_ms):
+    evaluation = record.get("evaluation") if isinstance(record.get("evaluation"), dict) else {}
+    snapshot_ms = int(record.get("snapshot_at_ms") or 0)
+    if snapshot_ms <= 0:
+        evaluation["invalid"] = {"status": "done", "failure_reason": "missing_snapshot_time"}
+        return "evaluated", "missing_snapshot_time", evaluation, True
+    changed = False
+    for horizon, horizon_ms in SIGNAL_REVIEW_HORIZONS:
+        existing = evaluation.get(horizon)
+        if isinstance(existing, dict) and existing.get("status") == "done":
+            continue
+        if now_ms < snapshot_ms + horizon_ms:
+            continue
+        try:
+            candles = fetch_review_klines(record.get("symbol"), snapshot_ms, snapshot_ms + horizon_ms)
+            evaluation[horizon] = evaluate_horizon_from_klines(record, horizon, horizon_ms, candles)
+            changed = True
+        except Exception as exc:
+            LOG.warning(
+                "signal review horizon evaluation failed; symbol=%s; key=%s; horizon=%s; error=%s",
+                record.get("symbol"),
+                record.get("signal_key"),
+                horizon,
+                exc,
+            )
+            evaluation[horizon] = {
+                "status": "pending",
+                "horizon": horizon,
+                "last_error": str(exc)[:240],
+                "last_error_at_ms": int(time.time() * 1000),
+            }
+            changed = True
+            break
+    complete = all(
+        isinstance(evaluation.get(horizon), dict) and evaluation[horizon].get("status") == "done"
+        for horizon, _ in SIGNAL_REVIEW_HORIZONS
+    ) or (isinstance(evaluation.get("invalid"), dict) and evaluation["invalid"].get("status") == "done")
+    status = "evaluated" if complete else "partial"
+    return status, summarize_review_failure(evaluation), evaluation, changed
+
+
+def evaluate_due_signal_reviews(max_records=40, blocking=False):
+    if storage is None:
+        return {"evaluated": 0, "updated": 0, "skipped": 0}
+    acquired = _signal_review_eval_lock.acquire(blocking)
+    if not acquired:
+        return {"evaluated": 0, "updated": 0, "skipped": 1}
+    try:
+        now_ms = int(time.time() * 1000)
+        due = storage.load_due_signal_reviews(now_ms, max_rows=max_records, all_users=auth_enabled())
+        updated = 0
+        evaluated = 0
+        evaluated_by_key = {}
+        for record in due:
+            signal_key = str(record.get("signal_key") or "")
+            cached_result = evaluated_by_key.get(signal_key)
+            if cached_result is None:
+                status, failure_reason, evaluation, changed = evaluate_signal_review_record(record, now_ms)
+                evaluated_by_key[signal_key] = (
+                    status,
+                    failure_reason,
+                    copy.deepcopy(evaluation),
+                    changed,
+                )
+            else:
+                status, failure_reason, evaluation, changed = cached_result
+                evaluation = copy.deepcopy(evaluation)
+            if not changed:
+                continue
+            if storage.update_signal_review_evaluation(
+                record.get("signal_key"),
+                status,
+                failure_reason,
+                evaluation,
+                user_id=record.get("storage_user_id"),
+            ):
+                updated += 1
+                if status == "evaluated":
+                    evaluated += 1
+        if updated:
+            LOG.info("signal reviews evaluated; updated=%s; evaluated=%s; due=%s", updated, evaluated, len(due))
+        result = {"evaluated": evaluated, "updated": updated, "due": len(due), "skipped": 0}
+        with _signal_review_trigger_lock:
+            _signal_review_eval_state["last_finished_at"] = time.time()
+            _signal_review_eval_state["last_result"] = result
+            _signal_review_eval_state["last_error"] = ""
+        return result
+    finally:
+        _signal_review_eval_lock.release()
+
+
+def signal_review_eval_status(now=None):
+    now = now or time.time()
+    with _signal_review_trigger_lock:
+        state = dict(_signal_review_eval_state)
+    return {
+        "running": _signal_review_eval_lock.locked(),
+        "trigger_min_interval_seconds": SIGNAL_REVIEW_TRIGGER_MIN_INTERVAL_SECONDS,
+        "trigger_count": int(state.get("trigger_count") or 0),
+        "thread_started_count": int(state.get("thread_started_count") or 0),
+        "skipped_recent_count": int(state.get("skipped_recent_count") or 0),
+        "skipped_running_count": int(state.get("skipped_running_count") or 0),
+        "last_trigger_age_seconds": round(max(0.0, now - float(state.get("last_trigger_at") or 0.0)), 3)
+        if state.get("last_trigger_at") else None,
+        "last_started_age_seconds": round(max(0.0, now - float(state.get("last_started_at") or 0.0)), 3)
+        if state.get("last_started_at") else None,
+        "last_finished_age_seconds": round(max(0.0, now - float(state.get("last_finished_at") or 0.0)), 3)
+        if state.get("last_finished_at") else None,
+        "last_result": state.get("last_result") or {},
+        "last_error": state.get("last_error") or "",
+    }
+
+
+def trigger_signal_review_evaluation(force=False):
+    if storage is None:
+        return {"scheduled": False, "reason": "storage_unavailable"}
+    now = time.time()
+    with _signal_review_trigger_lock:
+        _signal_review_eval_state["trigger_count"] = int(_signal_review_eval_state.get("trigger_count") or 0) + 1
+        last_trigger = float(_signal_review_eval_state.get("last_trigger_at") or 0.0)
+        if _signal_review_eval_lock.locked():
+            _signal_review_eval_state["skipped_running_count"] = int(_signal_review_eval_state.get("skipped_running_count") or 0) + 1
+            return {"scheduled": False, "reason": "already_running"}
+        if not force and last_trigger and now - last_trigger < SIGNAL_REVIEW_TRIGGER_MIN_INTERVAL_SECONDS:
+            _signal_review_eval_state["skipped_recent_count"] = int(_signal_review_eval_state.get("skipped_recent_count") or 0) + 1
+            return {"scheduled": False, "reason": "recently_triggered"}
+        _signal_review_eval_state["last_trigger_at"] = now
+        _signal_review_eval_state["thread_started_count"] = int(_signal_review_eval_state.get("thread_started_count") or 0) + 1
+
+    def worker():
+        with _signal_review_trigger_lock:
+            _signal_review_eval_state["last_started_at"] = time.time()
+        try:
+            evaluate_due_signal_reviews(max_records=24, blocking=False)
+        except Exception as exc:
+            with _signal_review_trigger_lock:
+                _signal_review_eval_state["last_finished_at"] = time.time()
+                _signal_review_eval_state["last_error"] = str(exc)[-300:]
+            LOG.exception("signal review evaluation worker failed")
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return {"scheduled": True, "reason": "started"}
+
+
+def normalize_signal_review_result(item):
+    if not isinstance(item, dict):
+        return item
+    out = dict(item)
+    if out.get("status") != "done":
+        return out
+    if out.get("estimated_cost_pct") is not None:
+        return out
+    gross_max_profit = float_or_zero(out.get("max_profit_pct"))
+    gross_outcome = float_or_zero(out.get("outcome_pct"))
+    entry_reached = bool(out.get("entry_reached"))
+    estimated_cost = signal_review_roundtrip_cost_pct() if entry_reached else 0.0
+    out["gross_max_profit_pct"] = round(gross_max_profit, 4)
+    out["gross_outcome_pct"] = round(gross_outcome, 4)
+    out["estimated_cost_pct"] = round(estimated_cost, 4)
+    if entry_reached:
+        out["max_profit_pct"] = round(max(0.0, gross_max_profit - estimated_cost), 4)
+        out["outcome_pct"] = round(gross_outcome - estimated_cost, 4)
+    return out
+
+
+def normalize_signal_review_evaluation(evaluation):
+    if not isinstance(evaluation, dict):
+        return {}
+    normalized = {}
+    for key, value in evaluation.items():
+        normalized[key] = normalize_signal_review_result(value) if isinstance(value, dict) else value
+    return normalized
+
+
+def compact_signal_review_record(item):
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    market_regime = item.get("market_regime") if isinstance(item.get("market_regime"), dict) else payload.get("market_regime")
+    evaluation = normalize_signal_review_evaluation(item.get("evaluation"))
+    return {
+        "signal_key": item.get("signal_key"),
+        "symbol": item.get("symbol"),
+        "advice_name": item.get("advice_name"),
+        "side": item.get("side"),
+        "entry_price": item.get("entry_price"),
+        "stop_price": item.get("stop_price"),
+        "snapshot_price": item.get("snapshot_price"),
+        "snapshot_at_ms": item.get("snapshot_at_ms"),
+        "snapshot_at": item.get("snapshot_at"),
+        "confidence": item.get("confidence"),
+        "direction_score": item.get("direction_score"),
+        "execution_score": item.get("execution_score"),
+        "risk_gate": item.get("risk_gate"),
+        "candle_state": item.get("candle_state"),
+        "trigger_status": item.get("trigger_status"),
+        "market_regime": market_regime if isinstance(market_regime, dict) else {},
+        "status": item.get("status"),
+        "failure_reason": item.get("failure_reason"),
+        "evaluation": evaluation,
+        "created_at_ms": item.get("created_at_ms"),
+    }
+
+
+def build_signal_review_stats(records):
+    min_calibration_samples = 30
+    min_calibration_triggered = 10
+    now_ms = int(time.time() * 1000)
+    due_cutoff_ms = now_ms - 5 * 60 * 1000
+
+    def new_review_bucket():
+        return {
+            "sample_count": 0,
+            "triggered_count": 0,
+            "signal_keys": set(),
+            "triggered_signal_keys": set(),
+            "win_count": 0,
+            "stop_count": 0,
+            "not_triggered_count": 0,
+            "invalid_count": 0,
+            "sum_max_profit_pct": 0.0,
+            "sum_max_drawdown_pct": 0.0,
+            "sum_outcome_pct": 0.0,
+            "failure_reasons": {},
+        }
+
+    def add_review_bucket(bucket, item, signal_key=""):
+        bucket["sample_count"] += 1
+        if signal_key:
+            bucket["signal_keys"].add(str(signal_key))
+        reason = str(item.get("failure_reason") or "unknown")
+        bucket["failure_reasons"][reason] = bucket["failure_reasons"].get(reason, 0) + 1
+        if item.get("entry_reached"):
+            bucket["triggered_count"] += 1
+            if signal_key:
+                bucket["triggered_signal_keys"].add(str(signal_key))
+            if item.get("stop_hit"):
+                bucket["stop_count"] += 1
+            elif str(item.get("failure_reason") or "") == "ok" and float_or_zero(item.get("outcome_pct")) > 0:
+                bucket["win_count"] += 1
+        else:
+            bucket["not_triggered_count"] += 1
+        bucket["sum_max_profit_pct"] += float_or_zero(item.get("max_profit_pct"))
+        bucket["sum_max_drawdown_pct"] += float_or_zero(item.get("max_drawdown_pct"))
+        bucket["sum_outcome_pct"] += float_or_zero(item.get("outcome_pct"))
+        return reason
+
+    def add_invalid_bucket(bucket, item, signal_key=""):
+        bucket["sample_count"] += 1
+        if signal_key:
+            bucket["signal_keys"].add(str(signal_key))
+        bucket["invalid_count"] += 1
+        reason = str(item.get("failure_reason") or "invalid_signal")
+        bucket["failure_reasons"][reason] = bucket["failure_reasons"].get(reason, 0) + 1
+        return reason
+
+    def finalize_review_bucket(bucket):
+        sample = bucket["sample_count"]
+        triggered = bucket["triggered_count"]
+        market_sample = max(0, sample - bucket["invalid_count"])
+        return {
+            "sample_count": sample,
+            "triggered_count": triggered,
+            "unique_signal_count": len(bucket["signal_keys"]),
+            "unique_triggered_count": len(bucket["triggered_signal_keys"]),
+            "invalid_count": bucket["invalid_count"],
+            "hit_rate_pct": round(bucket["win_count"] / triggered * 100.0, 2) if triggered else 0.0,
+            "stop_rate_pct": round(bucket["stop_count"] / triggered * 100.0, 2) if triggered else 0.0,
+            "not_triggered_rate_pct": round(bucket["not_triggered_count"] / market_sample * 100.0, 2) if market_sample else 0.0,
+            "invalid_rate_pct": round(bucket["invalid_count"] / sample * 100.0, 2) if sample else 0.0,
+            "avg_max_profit_pct": round(bucket["sum_max_profit_pct"] / market_sample, 4) if market_sample else 0.0,
+            "avg_max_drawdown_pct": round(bucket["sum_max_drawdown_pct"] / market_sample, 4) if market_sample else 0.0,
+            "avg_outcome_pct": round(bucket["sum_outcome_pct"] / market_sample, 4) if market_sample else 0.0,
+            "failure_reasons": bucket["failure_reasons"],
+        }
+
+    def segment_value(record, field):
+        if field in ("anchor_interval", "trend_regime", "atr_regime", "boll_width_regime", "boll_position_regime"):
+            regime = record.get("market_regime") if isinstance(record.get("market_regime"), dict) else {}
+            value = str(regime.get(field) or "-").strip()
+            return value[:64] or "-"
+        value = str(record.get(field) or "-").strip()
+        return value[:64] or "-"
+
+    stats = {
+        "records": len(records or []),
+        "pending": 0,
+        "evaluated_records": 0,
+        "invalid_records": 0,
+        "due_pending": 0,
+        "per_horizon": {},
+        "top_failures": {},
+        "calibration": {},
+        "calibration_horizon": SIGNAL_REVIEW_CALIBRATION_HORIZON,
+        "segments": {
+            "risk_gate": {},
+            "trigger_status": {},
+            "candle_state": {},
+            "anchor_interval": {},
+            "trend_regime": {},
+            "atr_regime": {},
+            "boll_width_regime": {},
+            "boll_position_regime": {},
+        },
+    }
+    buckets = {
+        horizon: new_review_bucket()
+        for horizon, _ in SIGNAL_REVIEW_HORIZONS
+    }
+    segment_buckets = {name: {} for name in stats["segments"]}
+    calibration_segment_buckets = {name: {} for name in stats["segments"]}
+    for record in records or []:
+        evaluation = normalize_signal_review_evaluation(record.get("evaluation"))
+        done_any = False
+        invalid = evaluation.get("invalid")
+        if isinstance(invalid, dict) and invalid.get("status") == "done":
+            done_any = True
+            stats["invalid_records"] += 1
+            reason = str(invalid.get("failure_reason") or record.get("failure_reason") or "invalid_signal")
+            invalid_item = dict(invalid)
+            invalid_item["failure_reason"] = reason
+            stats["top_failures"][reason] = stats["top_failures"].get(reason, 0) + 1
+            for segment_name in segment_buckets:
+                key = segment_value(record, segment_name)
+                add_invalid_bucket(
+                    segment_buckets[segment_name].setdefault(key, new_review_bucket()),
+                    invalid_item,
+                    record.get("signal_key"),
+                )
+                add_invalid_bucket(
+                    calibration_segment_buckets[segment_name].setdefault(key, new_review_bucket()),
+                    invalid_item,
+                    record.get("signal_key"),
+                )
+        for horizon in buckets:
+            item = evaluation.get(horizon)
+            if not isinstance(item, dict) or item.get("status") != "done":
+                continue
+            done_any = True
+            reason = add_review_bucket(buckets[horizon], item, record.get("signal_key"))
+            stats["top_failures"][reason] = stats["top_failures"].get(reason, 0) + 1
+            for segment_name in segment_buckets:
+                key = segment_value(record, segment_name)
+                add_review_bucket(
+                    segment_buckets[segment_name].setdefault(key, new_review_bucket()),
+                    item,
+                    record.get("signal_key"),
+                )
+                if horizon == SIGNAL_REVIEW_CALIBRATION_HORIZON:
+                    add_review_bucket(
+                        calibration_segment_buckets[segment_name].setdefault(key, new_review_bucket()),
+                        item,
+                        record.get("signal_key"),
+                    )
+        if done_any or record.get("status") == "evaluated":
+            stats["evaluated_records"] += 1
+        else:
+            stats["pending"] += 1
+            if str(record.get("side") or "") in ("long", "short"):
+                if int(record.get("snapshot_at_ms") or 0) <= due_cutoff_ms:
+                    stats["due_pending"] += 1
+    for horizon, bucket in buckets.items():
+        stats["per_horizon"][horizon] = finalize_review_bucket(bucket)
+    for segment_name, values in segment_buckets.items():
+        ordered = sorted(values.items(), key=lambda kv: kv[1]["sample_count"], reverse=True)
+        stats["segments"][segment_name] = {key: finalize_review_bucket(bucket) for key, bucket in ordered}
+    calibration_segments = {}
+    for segment_name, values in calibration_segment_buckets.items():
+        ordered = sorted(values.items(), key=lambda kv: kv[1]["sample_count"], reverse=True)
+        calibration_segments[segment_name] = {key: finalize_review_bucket(bucket) for key, bucket in ordered}
+    stats["calibration"] = build_signal_calibration_summary(
+        calibration_segments,
+        min_calibration_samples,
+        min_calibration_triggered,
+    )
+    stats["calibration"]["horizon"] = SIGNAL_REVIEW_CALIBRATION_HORIZON
+    return stats
+
+
+def build_signal_calibration_summary(segments, min_samples=30, min_triggered=10):
+    watched_segments = (
+        "risk_gate",
+        "trigger_status",
+        "candle_state",
+        "atr_regime",
+        "trend_regime",
+        "boll_width_regime",
+    )
+    candidates = []
+    eligible_count = 0
+    insufficient_count = 0
+    for segment_name in watched_segments:
+        group = segments.get(segment_name) if isinstance(segments, dict) else {}
+        if not isinstance(group, dict):
+            continue
+        for key, metric in group.items():
+            if not isinstance(metric, dict):
+                continue
+            sample = int(metric.get("unique_signal_count") or metric.get("sample_count") or 0)
+            triggered = int(metric.get("unique_triggered_count") or metric.get("triggered_count") or 0)
+            if sample < min_samples or triggered < min_triggered:
+                insufficient_count += 1
+                continue
+            eligible_count += 1
+            hit = float_or_zero(metric.get("hit_rate_pct"))
+            stop = float_or_zero(metric.get("stop_rate_pct"))
+            invalid = float_or_zero(metric.get("invalid_rate_pct"))
+            outcome = float_or_zero(metric.get("avg_outcome_pct"))
+            action = ""
+            reason = ""
+            if invalid >= 20:
+                action = "downgrade"
+                reason = "invalid_rate_high"
+            elif stop >= 45:
+                action = "downgrade"
+                reason = "stop_rate_high"
+            elif hit < 40:
+                action = "downgrade"
+                reason = "hit_rate_low"
+            elif outcome <= -0.20:
+                action = "downgrade"
+                reason = "expectancy_negative"
+            elif hit >= 60 and stop <= 25 and outcome >= 0.15:
+                action = "support"
+                reason = "historically_supported"
+            if action:
+                candidates.append(
+                    {
+                        "segment": segment_name,
+                        "key": key,
+                        "action": action,
+                        "reason": reason,
+                        "sample_count": sample,
+                        "triggered_count": triggered,
+                        "evaluation_count": int(metric.get("sample_count") or 0),
+                        "triggered_evaluation_count": int(metric.get("triggered_count") or 0),
+                        "hit_rate_pct": round(hit, 2),
+                        "stop_rate_pct": round(stop, 2),
+                        "invalid_rate_pct": round(invalid, 2),
+                        "avg_outcome_pct": round(outcome, 4),
+                    }
+                )
+    candidates.sort(
+        key=lambda item: (
+            0 if item["action"] == "downgrade" else 1,
+            -item["sample_count"],
+            item["segment"],
+            str(item["key"]),
+        )
+    )
+    if not eligible_count:
+        status = "insufficient_data"
+    elif candidates:
+        status = "needs_review"
+    else:
+        status = "stable"
+    return {
+        "status": status,
+        "min_sample_count": min_samples,
+        "min_triggered_count": min_triggered,
+        "eligible_segment_count": eligible_count,
+        "insufficient_segment_count": insufficient_count,
+        "candidates": candidates[:12],
+    }
+
+
+def signal_review_diagnostics(check_storage=True, limit=500):
+    base = {
+        "available": storage is not None,
+        "estimated_roundtrip_cost_pct": round(signal_review_roundtrip_cost_pct(), 4),
+        "taker_fee_bps": SIGNAL_REVIEW_TAKER_FEE_BPS,
+        "slippage_bps": SIGNAL_REVIEW_SLIPPAGE_BPS,
+        "sampled_records": 0,
+        "pending": 0,
+        "evaluated_records": 0,
+        "invalid_records": 0,
+        "due_pending": 0,
+        "calibration_status": "unknown",
+        "top_failures": {},
+    }
+    if storage is None:
+        base["calibration_status"] = "storage_unavailable"
+        return base
+    if not check_storage:
+        base["calibration_status"] = "skipped"
+        return base
+    try:
+        records = storage.load_signal_reviews(limit=limit)
+        compact = [compact_signal_review_record(item) for item in records]
+        stats = build_signal_review_stats(compact)
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - 5 * 60 * 1000
+        due_pending = 0
+        for item in compact:
+            if item.get("status") == "evaluated":
+                continue
+            if str(item.get("side") or "") not in ("long", "short"):
+                continue
+            if int(item.get("snapshot_at_ms") or 0) <= cutoff_ms:
+                due_pending += 1
+        base.update(
+            {
+                "sampled_records": len(compact),
+                "pending": stats.get("pending", 0),
+                "evaluated_records": stats.get("evaluated_records", 0),
+                "invalid_records": stats.get("invalid_records", 0),
+                "due_pending": stats.get("due_pending", due_pending),
+                "calibration_status": (stats.get("calibration") or {}).get("status", "unknown"),
+                "top_failures": dict(list((stats.get("top_failures") or {}).items())[:8]),
+                "evaluator": signal_review_eval_status(),
+            }
+        )
+    except Exception as exc:
+        LOG.warning("signal review diagnostics failed: %s", exc)
+        base["error"] = str(exc)[-300:]
+        base["calibration_status"] = "error"
+    return base
+
+
 _auth_bootstrap_done = False
 _auth_bootstrap_lock = threading.RLock()
 _login_failures = {}
@@ -539,6 +1680,143 @@ _login_failures_lock = threading.RLock()
 
 def auth_enabled():
     return AUTH_ENABLED
+
+
+def health_payload(check_storage=True):
+    mysql_configured = bool(storage and getattr(storage, "mysql_configured", False))
+    redis_configured = bool(storage and getattr(storage, "redis_configured", False))
+    mysql_available = bool(storage and storage.mysql_available()) if check_storage else None
+    redis_available = bool(storage and storage.redis_available()) if check_storage else None
+    auth_ready = True
+    auth_info = {
+        "enabled": auth_enabled(),
+        "ready": True,
+        "login_ready": True,
+        "mysql_available": mysql_available,
+        "user_count_known": False,
+        "has_users": None,
+        "first_admin_secret_configured": bool(
+            (os.environ.get("BIAN_AUTH_BOOTSTRAP_USER") or "admin").strip()
+            and os.environ.get("BIAN_AUTH_BOOTSTRAP_PASSWORD", "").strip()
+        ),
+        "can_create_first_admin": False,
+        "issue": "",
+        "cookie_secure": AUTH_COOKIE_SECURE,
+        "trust_proxy_headers": AUTH_TRUST_PROXY_HEADERS,
+        "session_touch_interval_seconds": AUTH_SESSION_TOUCH_INTERVAL_SECONDS,
+        "require_same_origin_post": AUTH_REQUIRE_SAME_ORIGIN_POST,
+    }
+    if auth_enabled():
+        auth_ready = None
+        auth_info["login_ready"] = None
+        auth_info["issue"] = "not_checked"
+        if storage is None:
+            auth_ready = False
+            auth_info.update({"ready": False, "login_ready": False, "issue": "storage_unavailable"})
+        elif check_storage:
+            storage_auth = storage.auth_status()
+            auth_info.update(storage_auth)
+            auth_ready = bool(storage_auth.get("login_ready"))
+        auth_info["ready"] = auth_ready
+    analyzer_ok = os.path.exists(BIAN)
+    web_ok = os.path.isdir(WEB_ROOT)
+    payload = {
+        "ok": bool(analyzer_ok and web_ok and auth_ready is not False),
+        "time": now_bj(),
+        "uptime_seconds": round(max(0.0, time.time() - SERVER_STARTED_AT), 3),
+        "service": "bian-dashboard",
+        "bind": {"host": HOST, "port": PORT},
+        "paths": {
+            "web_root": web_ok,
+            "analyzer": analyzer_ok,
+            "cache_file": CACHE_FILE,
+        },
+        "auth": auth_info,
+        "storage": {
+            "mysql": {"configured": mysql_configured, "available": mysql_available},
+            "redis": {"configured": redis_configured, "available": redis_available},
+        },
+        "runtime": {
+            "cache_ttl_seconds": CACHE_TTL_SECONDS,
+            "backtest_cache_ttl_seconds": BACKTEST_CACHE_TTL_SECONDS,
+            "market_cache_items": len(_last_payloads),
+            "realtime_hubs": len(_realtime_hubs),
+        },
+    }
+    return payload
+
+
+def diagnostics_payload(check_storage=True):
+    now = time.time()
+    with _payload_lock:
+        memory_cache = []
+        for key, entry in sorted(_last_payloads.items()):
+            payload = entry.get("payload") if isinstance(entry, dict) else {}
+            data = payload.get("data") if isinstance(payload, dict) else []
+            memory_cache.append(
+                {
+                    "key": key,
+                    "age_seconds": round(max(0.0, now - float(entry.get("ts", 0.0))), 3),
+                    "generated_at": payload.get("generated_at") if isinstance(payload, dict) else "",
+                    "symbols": payload.get("symbols") if isinstance(payload, dict) else [],
+                    "data_count": len(data) if isinstance(data, list) else 0,
+                    "stale": bool(payload.get("stale")) if isinstance(payload, dict) else False,
+                    "cache_hit": bool(payload.get("cache_hit")) if isinstance(payload, dict) else False,
+                }
+            )
+    with _market_locks_guard:
+        market_lock_keys = sorted(_market_locks.keys())
+    realtime = []
+    with _realtime_hubs_lock:
+        hubs = list(_realtime_hubs.items())
+    for key, hub in hubs:
+        with hub.lock:
+            realtime.append(
+                {
+                    "key": key,
+                    "symbols": list(hub.symbols),
+                    "client_count": hub.client_count,
+                    "direct_connected": hub.direct_connected,
+                    "latest_count": len(hub.latest),
+                    "has_error": bool(hub.error),
+                    "error": str(hub.error)[-300:] if hub.error else "",
+                }
+            )
+    if storage is not None and check_storage:
+        storage_status = storage.status()
+    else:
+        storage_status = {
+            "mysql": {"configured": bool(storage and getattr(storage, "mysql_configured", False))},
+            "redis": {"configured": bool(storage and getattr(storage, "redis_configured", False))},
+        }
+    return {
+        "ok": True,
+        "time": now_bj(),
+        "uptime_seconds": round(max(0.0, now - SERVER_STARTED_AT), 3),
+        "cache": {
+            "ttl_seconds": CACHE_TTL_SECONDS,
+            "memory_items": len(memory_cache),
+            "memory": memory_cache,
+            "market_lock_count": len(market_lock_keys),
+            "market_lock_keys": market_lock_keys[:32],
+        },
+        "analyzer": {
+            "path_exists": os.path.exists(BIAN),
+            "run_timeout_seconds": RUN_TIMEOUT_SECONDS,
+            "max_parallel_runs": 2,
+            "backtest_cache_ttl_seconds": BACKTEST_CACHE_TTL_SECONDS,
+            "expose_error_details": EXPOSE_ERROR_DETAILS,
+        },
+        "realtime": {
+            "hub_count": len(realtime),
+            "idle_seconds": REALTIME_IDLE_SECONDS,
+            "sse_max_seconds": SSE_MAX_SECONDS,
+            "sharing": realtime_sharing_stats(),
+            "hubs": realtime,
+        },
+        "signal_review": signal_review_diagnostics(check_storage=check_storage),
+        "storage": storage_status,
+    }
 
 
 def ensure_auth_ready():
@@ -562,8 +1840,75 @@ def is_public_path(path):
     return False
 
 
+def safe_next_path(next_path):
+    text = str(next_path or "").strip()
+    if not text:
+        return "/binance-futures-dashboard.html"
+    parsed = urlparse(text)
+    if parsed.scheme or parsed.netloc:
+        return "/binance-futures-dashboard.html"
+    if not parsed.path.startswith("/") or parsed.path.startswith("//") or "\\" in parsed.path:
+        return "/binance-futures-dashboard.html"
+    if parsed.path.startswith("/api/") or parsed.path == "/api":
+        return "/binance-futures-dashboard.html"
+    query = ("?" + parsed.query) if parsed.query else ""
+    return parsed.path + query
+
+
+def _format_host_port(host, port):
+    if ":" in host and not host.startswith("["):
+        host = "[" + host + "]"
+    return f"{host}:{port}" if port else host
+
+
+def normalize_host_port(value, scheme=""):
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if "," in text:
+        text = text.split(",", 1)[0].strip()
+    try:
+        parsed = urlparse("//" + text)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except Exception:
+        return ""
+    if not host:
+        return ""
+    default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    if default_port and port == default_port:
+        port = None
+    return _format_host_port(host, port)
+
+
+def request_source_host(source_url):
+    parsed = urlparse(str(source_url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return normalize_host_port(parsed.netloc, parsed.scheme.lower())
+
+
+def same_origin_allowed(source_url, host_header, forwarded_host=""):
+    parsed = urlparse(str(source_url or "").strip())
+    source_host = request_source_host(source_url)
+    if not source_host:
+        return True
+    source_scheme = parsed.scheme.lower()
+    allowed = {
+        normalize_host_port(host_header, source_scheme),
+        normalize_host_port(forwarded_host, source_scheme),
+    }
+    allowed.discard("")
+    return source_host in allowed
+
+
+def same_origin_allowed_for_peer(source_url, host_header, forwarded_host, peer_ip):
+    trusted_forwarded_host = forwarded_host if is_trusted_proxy_peer(peer_ip) else ""
+    return same_origin_allowed(source_url, host_header, trusted_forwarded_host)
+
+
 def login_page(next_path="", error=""):
-    next_url = next_path if str(next_path or "").startswith("/") else "/binance-futures-dashboard.html"
+    next_url = safe_next_path(next_path)
     safe_next = html.escape(next_url, quote=True)
     safe_error = html.escape(error or "", quote=True)
     return f"""<!doctype html>
@@ -630,20 +1975,32 @@ def login_locked(client_ip, username):
         item = _login_failures.get(key)
         if not item:
             return False
-        if item.get("until", 0) <= now:
+        until = float(item.get("until", 0) or 0)
+        if until and until <= now:
             _login_failures.pop(key, None)
             return False
-        return True
+        return until > now
 
 
 def record_login_failure(client_ip, username):
     key = login_failure_key(client_ip, username)
     now = time.time()
     with _login_failures_lock:
-        item = _login_failures.get(key, {"count": 0, "until": 0})
+        retention = max(3600.0, AUTH_LOCKOUT_SECONDS * 2.0)
+        if len(_login_failures) >= 4096:
+            for stale_key, stale_item in list(_login_failures.items()):
+                if now - float(stale_item.get("last_at", 0) or 0) > retention:
+                    _login_failures.pop(stale_key, None)
+            if len(_login_failures) >= 4096:
+                oldest = sorted(_login_failures, key=lambda item_key: _login_failures[item_key].get("last_at", 0))
+                for stale_key in oldest[: len(_login_failures) - 4095]:
+                    _login_failures.pop(stale_key, None)
+        item = _login_failures.get(key, {"count": 0, "until": 0, "last_at": 0})
+        if now - float(item.get("last_at", 0) or 0) > retention:
+            item = {"count": 0, "until": 0, "last_at": 0}
         count = int(item.get("count", 0)) + 1
         until = now + AUTH_LOCKOUT_SECONDS if count >= AUTH_MAX_FAILURES else 0
-        _login_failures[key] = {"count": count, "until": until}
+        _login_failures[key] = {"count": count, "until": until, "last_at": now}
 
 
 def clear_login_failures(client_ip, username):
@@ -659,14 +2016,56 @@ def valid_auth_username(username):
     return all(ch in allowed for ch in text)
 
 
+def is_admin_user(user):
+    return bool(user and user.get("role") == "admin")
+
+
+def storage_for_user(user):
+    if storage is None or not auth_enabled():
+        return storage
+    user_id = str((user or {}).get("id") or "").strip()
+    if not user_id or not hasattr(storage, "for_user"):
+        return None
+    return storage.for_user("auth:" + user_id)
+
+
+def capture_signal_reviews_for_user(user_storage, payload):
+    if user_storage is None or not isinstance(payload, dict):
+        return None
+    records = build_signal_review_records(payload)
+    if not records:
+        return None
+    try:
+        result = user_storage.save_signal_reviews(records)
+        if int((result or {}).get("inserted") or 0) > 0:
+            trigger_signal_review_evaluation()
+        return result
+    except Exception:
+        LOG.exception("signal review capture failed")
+        return None
+
+
+def is_trusted_proxy_peer(peer_ip):
+    if not AUTH_TRUST_PROXY_HEADERS:
+        return False
+    try:
+        addr = ipaddress.ip_address(str(peer_ip or "").split("%", 1)[0])
+        return addr.is_loopback or addr.is_private or addr.is_link_local
+    except ValueError:
+        return False
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
+        self._current_user_loaded = False
+        self._current_user_cache = None
         super().__init__(*a, directory=WEB_ROOT, **kw)
 
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self.send_json(200, {"ok": True})
+            payload = health_payload(check_storage=True)
+            self.send_json(200 if payload.get("ok") else 503, payload)
             return
         if parsed.path == "/login":
             params = parse_qs(parsed.query)
@@ -680,11 +2079,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.serve_realtime_prices(parsed.query)
         elif parsed.path == "/api/preferences":
             self.serve_preferences()
+        elif parsed.path == "/api/signal-reviews":
+            self.serve_signal_reviews(parsed.query)
         elif parsed.path == "/api/auth/me":
             user = self.current_user()
             self.send_json(200, {"authenticated": bool(user), "user": user})
         elif parsed.path == "/api/storage-status":
             self.serve_storage_status()
+        elif parsed.path == "/api/diagnostics":
+            self.serve_diagnostics()
         elif parsed.path in ("", "/", "/index.html"):
             self.path = "/binance-futures-dashboard.html"
             super().do_GET()
@@ -693,6 +2096,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if not self.require_same_origin_post():
+            return
         if parsed.path == "/api/login":
             self.login_api()
         elif not self.require_auth(parsed.path):
@@ -705,6 +2110,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.create_user_api()
         elif parsed.path == "/api/preferences":
             self.save_preferences_api()
+        elif parsed.path == "/api/signal-reviews/evaluate":
+            self.evaluate_signal_reviews_api()
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -715,11 +2122,32 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
+    def require_same_origin_post(self):
+        if not auth_enabled() or not AUTH_REQUIRE_SAME_ORIGIN_POST:
+            return True
+        origin = self.headers.get("Origin", "")
+        referer = self.headers.get("Referer", "")
+        source = origin or referer
+        peer_ip = self.client_address[0] if self.client_address else ""
+        if same_origin_allowed_for_peer(source, self.headers.get("Host", ""), self.headers.get("X-Forwarded-Host", ""), peer_ip):
+            return True
+        LOG.warning(
+            "blocked cross-origin POST; path=%s; origin=%s; referer=%s; host=%s; client_ip=%s",
+            self.path,
+            origin,
+            referer,
+            self.headers.get("Host", ""),
+            self.client_ip(),
+        )
+        self.send_json(403, {"error": "same-origin POST required"})
+        return False
+
     def client_ip(self):
         forwarded = self.headers.get("X-Forwarded-For", "")
-        if forwarded:
+        peer_ip = self.client_address[0] if self.client_address else ""
+        if forwarded and is_trusted_proxy_peer(peer_ip):
             return forwarded.split(",", 1)[0].strip()
-        return self.client_address[0] if self.client_address else ""
+        return peer_ip
 
     def auth_token(self):
         raw = self.headers.get("Cookie", "")
@@ -734,12 +2162,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return item.value if item else ""
 
     def current_user(self):
+        if self._current_user_loaded:
+            return self._current_user_cache
         if not auth_enabled():
-            return {"id": 0, "username": "local", "role": "admin"}
-        if storage is None:
-            return None
-        ensure_auth_ready()
-        return storage.user_for_session(self.auth_token())
+            user = {"id": 0, "username": "local", "role": "admin"}
+        elif storage is None:
+            user = None
+        else:
+            ensure_auth_ready()
+            user = storage.user_for_session(self.auth_token(), AUTH_SESSION_TOUCH_INTERVAL_SECONDS)
+        self._current_user_cache = user
+        self._current_user_loaded = True
+        return user
+
+    def request_storage(self):
+        return storage_for_user(self.current_user())
 
     def require_auth(self, path):
         if is_public_path(path):
@@ -757,9 +2194,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return False
 
     def serve_login(self, next_path="/binance-futures-dashboard.html", error=""):
+        next_path = safe_next_path(next_path)
         if self.current_user():
             self.send_response(302)
-            self.send_header("Location", next_path or "/binance-futures-dashboard.html")
+            self.send_header("Location", next_path)
             self.end_headers()
             return
         body = login_page(next_path, error).encode("utf-8")
@@ -812,9 +2250,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(json.dumps({"authenticated": True, "user": user}, ensure_ascii=False).encode("utf-8"))
+        except BadRequestError as exc:
+            self.send_json(400, {"authenticated": False, "error": str(exc)})
         except Exception as exc:
             LOG.exception("login failed")
-            self.send_json(500, {"authenticated": False, "error": str(exc)})
+            self.send_json(500, {"authenticated": False, "error": INTERNAL_ERROR_MESSAGE})
 
     def logout_api(self):
         token = self.auth_token()
@@ -866,9 +2306,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             storage.delete_other_auth_sessions(user["id"], token)
             LOG.warning("auth password changed; user=%s; client_ip=%s", user.get("username"), self.client_ip())
             self.send_json(200, {"changed": True, "user": {"username": user.get("username"), "role": user.get("role")}})
+        except BadRequestError as exc:
+            self.send_json(400, {"changed": False, "error": str(exc)})
         except Exception as exc:
             LOG.exception("password change failed")
-            self.send_json(500, {"changed": False, "error": str(exc)})
+            self.send_json(500, {"changed": False, "error": INTERNAL_ERROR_MESSAGE})
 
     def create_user_api(self):
         try:
@@ -914,22 +2356,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 self.client_ip(),
             )
             self.send_json(200, {"created": True, "user": user})
+        except BadRequestError as exc:
+            self.send_json(400, {"created": False, "error": str(exc)})
         except Exception as exc:
             LOG.exception("create auth user failed")
-            self.send_json(500, {"created": False, "error": str(exc)})
+            self.send_json(500, {"created": False, "error": INTERNAL_ERROR_MESSAGE})
 
     def serve_api(self, query):
         symbols = parse_symbols(query)
+        user_storage = self.request_storage()
         key = cache_key(symbols)
         now = time.time()
         prune_memory_cache(now)
+        cached = None
         with _payload_lock:
             entry = _last_payloads.get(key)
             if entry and now - entry["ts"] <= CACHE_TTL_SECONDS:
                 cached = dict(entry["payload"])
                 cached["cache_hit"] = True
-                self.send_json(200, cached)
-                return
+        if cached is not None:
+            self.send_cached_payload(cached, user_storage)
+            return
 
         if storage is not None:
             redis_cached = storage.get_market_payload(key)
@@ -939,22 +2386,51 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 cached["redis_hit"] = True
                 with _payload_lock:
                     _last_payloads[key] = {"ts": now, "payload": redis_cached}
-                self.send_json(200, cached)
+                self.send_cached_payload(cached, user_storage)
                 return
 
-        lock = market_lock_for(key)
-        with lock:
-            now = time.time()
+        disk_cached, disk_age = fresh_disk_cache(symbols, now)
+        if disk_cached:
+            cached = dict(disk_cached)
+            cached["cache_hit"] = True
+            cached["disk_hit"] = True
             with _payload_lock:
-                entry = _last_payloads.get(key)
-                if entry and now - entry["ts"] <= CACHE_TTL_SECONDS:
-                    cached = dict(entry["payload"])
-                    cached["cache_hit"] = True
-                    self.send_json(200, cached)
-                    return
-            self.run_api_uncached(symbols, now)
+                _last_payloads[key] = {"ts": now - float(disk_age or 0.0), "payload": disk_cached}
+            self.send_cached_payload(cached, user_storage)
+            return
 
-    def run_api_uncached(self, symbols, now):
+        lock = market_lock_for(key)
+        cached = None
+        try:
+            with lock:
+                now = time.time()
+                with _payload_lock:
+                    entry = _last_payloads.get(key)
+                    if entry and now - entry["ts"] <= CACHE_TTL_SECONDS:
+                        cached = dict(entry["payload"])
+                        cached["cache_hit"] = True
+                if cached is None:
+                    disk_cached, disk_age = fresh_disk_cache(symbols, now)
+                    if disk_cached:
+                        cached = dict(disk_cached)
+                        cached["cache_hit"] = True
+                        cached["disk_hit"] = True
+                        with _payload_lock:
+                            _last_payloads[key] = {"ts": now - float(disk_age or 0.0), "payload": disk_cached}
+                if cached is None:
+                    self.run_api_uncached(symbols, now, user_storage)
+                    return
+        finally:
+            release_market_lock(key, lock)
+        self.send_cached_payload(cached, user_storage)
+
+    def send_cached_payload(self, cached, user_storage):
+        review_result = capture_signal_reviews_for_user(user_storage, cached)
+        if review_result is not None:
+            cached["signal_review"] = review_result
+        self.send_json(200, cached)
+
+    def run_api_uncached(self, symbols, now, user_storage=None):
         try:
             result = run_bian_json(symbols)
             stdout = result.stdout or ""
@@ -993,10 +2469,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             with _payload_lock:
                 _last_payloads[cache_key(symbols)] = {"ts": now, "payload": payload}
             save_cache(symbols, payload)
+            response_payload = dict(payload)
             if storage is not None:
                 storage.set_market_payload(cache_key(symbols), payload, CACHE_TTL_SECONDS)
-                storage.save_strategy_snapshot(symbols, payload)
-            self.send_json(200, payload)
+                if user_storage is not None:
+                    try:
+                        user_storage.save_strategy_snapshot(symbols, payload)
+                    except Exception:
+                        LOG.exception("strategy snapshot save failed; symbols=%s", symbols)
+                try:
+                    review_result = capture_signal_reviews_for_user(user_storage, response_payload)
+                    if review_result is not None:
+                        response_payload["signal_review"] = review_result
+                except Exception:
+                    LOG.exception("signal review capture failed; symbols=%s", symbols)
+            self.send_json(200, response_payload)
         except subprocess.TimeoutExpired:
             LOG.error("market api analyzer timeout; symbols=%s; timeout=%ss", symbols, RUN_TIMEOUT_SECONDS)
             self.send_cached_or_error(f"bian.py timeout ({RUN_TIMEOUT_SECONDS}s)", "", symbols)
@@ -1006,9 +2493,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def serve_realtime_prices(self, query):
         symbols = parse_symbols(query)
-        hub = realtime_hub_for(symbols)
+        hub, ensure_symbols, sharing = realtime_hub_for_request(symbols)
+        record_realtime_sharing(sharing)
         hub.acquire()
-        hub.ensure(symbols)
+        hub.ensure(ensure_symbols)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -1022,6 +2510,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         try:
             while time.time() - started < SSE_MAX_SECONDS:
                 snap = hub.snapshot(symbols)
+                snap["hub_key"] = hub.key
+                snap["sharing"] = sharing
                 payload = json.dumps(snap, ensure_ascii=False, separators=(",", ":"))
                 now = time.time()
                 if payload != last_payload or now - last_emit >= SSE_HEARTBEAT_SECONDS:
@@ -1036,7 +2526,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             hub.release()
 
     def serve_preferences(self):
-        prefs = storage.load_preferences() if storage is not None else {}
+        user_storage = self.request_storage()
+        prefs = user_storage.load_preferences() if user_storage is not None else {}
         self.send_json(200, {
             "preferences": prefs,
             "storage": storage.status() if storage is not None else {"mysql": {"configured": False}, "redis": {"configured": False}},
@@ -1049,26 +2540,91 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if not isinstance(prefs, dict):
                 self.send_json(400, {"saved": False, "error": "preferences must be a JSON object"})
                 return
-            saved = storage.save_preferences(prefs) if storage is not None else False
+            user_storage = self.request_storage()
+            saved = user_storage.save_preferences(prefs) if user_storage is not None else False
             self.send_json(200, {
                 "saved": bool(saved),
                 "storage": storage.status() if storage is not None else {"mysql": {"configured": False}, "redis": {"configured": False}},
             })
+        except BadRequestError as exc:
+            self.send_json(400, {"saved": False, "error": str(exc)})
         except Exception as exc:
             LOG.exception("save preferences failed")
-            self.send_json(500, {"saved": False, "error": str(exc)})
+            self.send_json(500, {"saved": False, "error": INTERNAL_ERROR_MESSAGE})
 
     def serve_storage_status(self):
         self.send_json(200, storage.status() if storage is not None else {"mysql": {"configured": False}, "redis": {"configured": False}})
 
+    def serve_diagnostics(self):
+        user = self.current_user()
+        if auth_enabled() and not is_admin_user(user):
+            self.send_json(403, {"error": "admin role required"})
+            return
+        self.send_json(200, diagnostics_payload(check_storage=True))
+
+    def evaluate_signal_reviews_api(self):
+        try:
+            user = self.current_user()
+            if auth_enabled() and not is_admin_user(user):
+                self.send_json(403, {"error": "admin role required"})
+                return
+            trigger_state = trigger_signal_review_evaluation(force=True)
+            eval_state = {
+                "scheduled": bool(trigger_state.get("scheduled")),
+                "reason": trigger_state.get("reason"),
+                "status": signal_review_eval_status(),
+            }
+            status_code = 202 if eval_state["scheduled"] else 200
+            if trigger_state.get("reason") == "storage_unavailable":
+                status_code = 503
+            self.send_json(status_code, {"evaluation": eval_state})
+        except Exception as exc:
+            LOG.exception("signal review manual evaluation trigger failed")
+            self.send_json(500, {"error": INTERNAL_ERROR_MESSAGE, "evaluation": {"scheduled": False, "reason": "error"}})
+
+    def serve_signal_reviews(self, query):
+        try:
+            symbols = parse_symbol_filter(query)
+            limit = parse_signal_review_limit(query)
+            trigger_state = trigger_signal_review_evaluation()
+            eval_state = {
+                "scheduled": bool(trigger_state.get("scheduled")),
+                "reason": trigger_state.get("reason"),
+                "status": signal_review_eval_status(),
+            }
+            user_storage = self.request_storage()
+            records = user_storage.load_signal_reviews(symbols or None, limit=limit) if user_storage is not None else []
+            compact = [compact_signal_review_record(item) for item in records]
+            self.send_json(200, {
+                "symbols": symbols,
+                "records": compact,
+                "stats": build_signal_review_stats(compact),
+                "evaluation": eval_state,
+                "storage": storage.status() if storage is not None else {"mysql": {"configured": False}, "redis": {"configured": False}},
+            })
+        except BadRequestError as exc:
+            self.send_json(400, {"error": str(exc), "records": [], "stats": build_signal_review_stats([])})
+        except Exception as exc:
+            LOG.exception("signal review api failed")
+            self.send_json(500, {"error": INTERNAL_ERROR_MESSAGE, "records": [], "stats": build_signal_review_stats([])})
+
     def read_json_body(self):
-        length = int(self.headers.get("Content-Length") or "0")
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except (TypeError, ValueError):
+            raise BadRequestError("invalid Content-Length")
         if length <= 0:
             return {}
         if length > 1024 * 1024:
-            raise ValueError("request body too large")
-        raw = self.rfile.read(length).decode("utf-8")
-        return json.loads(raw or "{}")
+            raise BadRequestError("request body too large")
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError:
+            raise BadRequestError("request body must be UTF-8")
+        try:
+            return json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            raise BadRequestError("invalid JSON body")
 
     def send_cached_or_error(self, error, stderr, symbols, extra=None):
         extra = extra or {}
@@ -1091,18 +2647,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             payload["warning"] = user_message
             payload["error_type"] = error_type
             payload.update(extra)
-            if stderr:
+            if EXPOSE_ERROR_DETAILS and stderr:
                 payload["stderr"] = stderr
             self.send_json(200, payload)
             return
         body = {
             "error": user_message,
-            "detail": error,
-            "stderr": stderr,
             "symbols": symbols,
             "stale": False,
             "error_type": error_type,
         }
+        if EXPOSE_ERROR_DETAILS:
+            body["detail"] = error
+            body["stderr"] = stderr
         body.update(extra)
         self.send_json(status, body)
 

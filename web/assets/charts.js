@@ -13,15 +13,36 @@
   var strategyRefreshBusy = false;
   var nextStrategyRefreshAt = 0;
   var lastGuardRenderAt = 0;
-  var MARKET_STATE = { stale: false, warning: '', errorType: '' };
+  var MARKET_STATE = {
+    stale: DATA.length > 0,
+    warning: DATA.length > 0 ? '当前为内置离线快照，等待服务端行情' : '',
+    errorType: DATA.length > 0 ? 'static_fallback' : ''
+  };
   var CURRENT_USER = null;
-  var SIGNAL_HISTORY_KEY = 'bian_dashboard_signal_history';
-  var SYMBOL_HISTORY_KEY = 'bian_dashboard_symbol_history';
-  var POSITION_STATE_KEY = 'bian_dashboard_position_state';
-  var ACCOUNT_RISK_KEY = 'bian_dashboard_account_risk';
-  var TV_KLINE_INTERVAL_KEY = 'bian_dashboard_tv_kline_interval';
+  var SIGNAL_REVIEW_STATE = { key: '', payload: null, loading: false, error: '', lastFetch: 0 };
+  var SIGNAL_REVIEW_REQUEST_SEQ = 0;
+  var STORAGE_KEYS = {
+    signalHistory: 'bian_dashboard_signal_history',
+    symbolHistory: 'bian_dashboard_symbol_history',
+    positionState: 'bian_dashboard_position_state',
+    accountRisk: 'bian_dashboard_account_risk',
+    tvInterval: 'bian_dashboard_tv_kline_interval',
+    signalAlert: 'bian_dashboard_signal_alert_pref',
+    customSymbols: 'bian_dashboard_custom_syms',
+    removedSymbols: 'bian_dashboard_removed_syms'
+  };
+  var SIGNAL_HISTORY_KEY = STORAGE_KEYS.signalHistory;
+  var SYMBOL_HISTORY_KEY = STORAGE_KEYS.symbolHistory;
+  var POSITION_STATE_KEY = STORAGE_KEYS.positionState;
+  var ACCOUNT_RISK_KEY = STORAGE_KEYS.accountRisk;
+  var TV_KLINE_INTERVAL_KEY = STORAGE_KEYS.tvInterval;
+  var SIGNAL_ALERT_PREF_KEY = STORAGE_KEYS.signalAlert;
+  var LS_KEY = STORAGE_KEYS.customSymbols;
+  var REMOVED_KEY = STORAGE_KEYS.removedSymbols;
   var tvKlineInterval = loadTvKlineInterval();
   var tvKlineKey = '';
+  var signalAlertPref = loadSignalAlertPref();
+  var signalAlertState = { lastKey: '', lastAt: 0, audioCtx: null };
   var pendingPreferencePatch = {};
   var preferenceSaveTimer = null;
   var root = getComputedStyle(document.documentElement);
@@ -39,6 +60,33 @@
   var TFS = ['1m', '5m', '15m', '1h', '4h', '8h', '1d'];
   var FONT = "'GeistMono','Microsoft YaHei',sans-serif";
   var charts = [];
+
+  function scopeLocalStorageKeys() {
+    var userId = CURRENT_USER && CURRENT_USER.id != null ? String(CURRENT_USER.id) : 'local';
+    var suffix = ':user:' + userId;
+    function scoped(base) { return base + suffix; }
+    if (userId === '0' || userId === 'local') {
+      Object.keys(STORAGE_KEYS).forEach(function (name) {
+        var base = STORAGE_KEYS[name];
+        var target = scoped(base);
+        try {
+          if (localStorage.getItem(target) == null && localStorage.getItem(base) != null) {
+            localStorage.setItem(target, localStorage.getItem(base));
+          }
+        } catch (e) {}
+      });
+    }
+    SIGNAL_HISTORY_KEY = scoped(STORAGE_KEYS.signalHistory);
+    SYMBOL_HISTORY_KEY = scoped(STORAGE_KEYS.symbolHistory);
+    POSITION_STATE_KEY = scoped(STORAGE_KEYS.positionState);
+    ACCOUNT_RISK_KEY = scoped(STORAGE_KEYS.accountRisk);
+    TV_KLINE_INTERVAL_KEY = scoped(STORAGE_KEYS.tvInterval);
+    SIGNAL_ALERT_PREF_KEY = scoped(STORAGE_KEYS.signalAlert);
+    LS_KEY = scoped(STORAGE_KEYS.customSymbols);
+    REMOVED_KEY = scoped(STORAGE_KEYS.removedSymbols);
+    tvKlineInterval = loadTvKlineInterval();
+    signalAlertPref = loadSignalAlertPref();
+  }
 
   /* ---------- helpers ---------- */
   function fmtPrice(v) {
@@ -59,7 +107,72 @@
       return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch];
     });
   }
+  function loadSignalAlertPref() {
+    try {
+      var raw = localStorage.getItem(SIGNAL_ALERT_PREF_KEY);
+      var pref = raw ? JSON.parse(raw) : {};
+      return { enabled: !!pref.enabled };
+    } catch (e) {
+      return { enabled: false };
+    }
+  }
+  function saveSignalAlertPref() {
+    try { localStorage.setItem(SIGNAL_ALERT_PREF_KEY, JSON.stringify(signalAlertPref)); } catch (e) {}
+  }
+  function alertButtonText() {
+    return signalAlertPref.enabled ? 'ALERT ON' : 'ALERT OFF';
+  }
+  function updateSignalAlertButton() {
+    var btn = document.querySelector('#signal-banner .js-signal-alert-toggle');
+    if (!btn) return;
+    btn.textContent = alertButtonText();
+    btn.className = 'alert-toggle js-signal-alert-toggle' + (signalAlertPref.enabled ? ' active' : '');
+    btn.title = signalAlertPref.enabled ? 'Entry/stop sound alerts are on' : 'Entry/stop sound alerts are off';
+  }
+  function signalAlertKey(r, alert) {
+    if (!r || !alert || !alert.text) return '';
+    return [r.symbol || '', alert.cls || '', alert.text].join('|');
+  }
+  function playSignalBeep(kind) {
+    var AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return;
+    try {
+      var ctx = signalAlertState.audioCtx;
+      if (!ctx) {
+        ctx = new AudioContext();
+        signalAlertState.audioCtx = ctx;
+      }
+      if (ctx.state === 'suspended') {
+        var resumed = ctx.resume();
+        if (resumed && typeof resumed.catch === 'function') resumed.catch(function () {});
+      }
+      var osc = ctx.createOscillator();
+      var gain = ctx.createGain();
+      var now = ctx.currentTime;
+      osc.type = 'sine';
+      osc.frequency.value = kind === 'danger' ? 740 : 520;
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(kind === 'danger' ? 0.09 : 0.055, now + 0.025);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.24);
+    } catch (e) {}
+  }
+  function maybeNotifySignalAlert(r, alert) {
+    if (!signalAlertPref.enabled || !alert || !alert.text) return;
+    if (alert.cls !== 'danger' && alert.cls !== 'watch') return;
+    var key = signalAlertKey(r, alert);
+    var now = Date.now();
+    var cooldown = alert.cls === 'danger' ? 30000 : 60000;
+    if (key && signalAlertState.lastKey === key && now - signalAlertState.lastAt < cooldown) return;
+    signalAlertState.lastKey = key;
+    signalAlertState.lastAt = now;
+    playSignalBeep(alert.cls);
+  }
   function biasClass(b) {
+    if (b.indexOf('观望') >= 0) return 'wait';
     if (b.indexOf('偏多') >= 0) return 'bull';
     if (b.indexOf('偏空') >= 0) return 'bear';
     return 'wait';
@@ -70,7 +183,7 @@
   }
   // P0: translate bias to plain action
   function biasPlain(b) {
-    if (b.indexOf('观望偏空') >= 0) return '别追多，等高位做空';
+    if (b.indexOf('观望') >= 0) return '先观察，不开新仓';
     if (b.indexOf('偏多') >= 0) return '倾向做多（买入）';
     if (b.indexOf('偏空') >= 0) return '倾向做空（卖出）';
     return '先别动，等信号';
@@ -106,7 +219,7 @@
       text: fmtSizePct(pct),
       sizePct: pct,
       color: color,
-      note: sizing.note || (allowed ? '风险预算仓位' : '禁止开仓')
+      note: sizing.note || (allowed ? '风险预算仓位' : '当前不给仓位')
     };
   }
   function emtText(e) { return e === 'bull' ? '多' : e === 'bear' ? '空' : '震'; }
@@ -146,7 +259,15 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ preferences: prefs }),
       cache: 'no-store'
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (payload) {
+        if (!res.ok || payload.saved !== true) throw new Error(payload.error || ('HTTP ' + res.status));
+      });
     }).catch(function (err) {
+      Object.keys(prefs).forEach(function (key) {
+        if (!Object.prototype.hasOwnProperty.call(pendingPreferencePatch, key)) pendingPreferencePatch[key] = prefs[key];
+      });
+      if (!preferenceSaveTimer) preferenceSaveTimer = setTimeout(flushServerPreferences, 5000);
       console.warn('[dashboard] preference sync failed:', err.message);
     });
   }
@@ -256,6 +377,155 @@
         .catch(function () {})
         .then(function () { window.location.href = '/login'; });
     });
+  }
+  function setDiagnosticsMessage(text, cls) {
+    var el = document.getElementById('diagnostics-message');
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = 'password-message' + (cls ? ' ' + cls : '');
+  }
+  function closeDiagnosticsModal() {
+    var modal = document.getElementById('diagnostics-modal');
+    if (modal) {
+      modal.classList.remove('show');
+      modal.setAttribute('aria-hidden', 'true');
+    }
+    setDiagnosticsMessage('', '');
+  }
+  function diagStatus(value) {
+    var cls = value === true ? 'good' : value === false ? 'bad' : 'warn';
+    var text = value === true ? 'OK' : value === false ? 'FAIL' : '--';
+    return '<span class="diag-pill ' + cls + '">' + text + '</span>';
+  }
+  function diagLine(label, value) {
+    return '<div class="diag-line"><span>' + htmlSafe(label) + '</span><b>' + value + '</b></div>';
+  }
+  function diagCard(title, body) {
+    return '<div class="diag-card"><h3>' + htmlSafe(title) + '</h3>' + body + '</div>';
+  }
+  function renderDiagnosticsPayload(payload) {
+    var body = document.getElementById('diagnostics-body');
+    if (!body) return;
+    payload = payload || {};
+    var cache = payload.cache || {};
+    var analyzer = payload.analyzer || {};
+    var realtime = payload.realtime || {};
+    var storage = payload.storage || {};
+    var mysql = storage.mysql || {};
+    var redis = storage.redis || {};
+    var auth = storage.auth || {};
+    var review = payload.signal_review || {};
+    var evaluator = review.evaluator || {};
+    var sharing = realtime.sharing || {};
+    var sharingCounts = sharing.counts || {};
+    var sharingTotal = Number(sharing.total_requests || 0);
+    var sharingReused = Number(sharing.reused_requests || 0);
+    var sharingRate = Number(sharing.reuse_rate_pct || 0);
+    var hubs = Array.isArray(realtime.hubs) ? realtime.hubs : [];
+    var hubHtml = hubs.slice(0, 5).map(function (hub) {
+      return '<div class="diag-line"><span>' + htmlSafe((hub.symbols || []).join(',') || hub.key || '-') + '</span><b>' +
+        diagStatus(!hub.has_error && (hub.direct_connected || hub.latest_count > 0)) + '</b></div>' +
+        (hub.error ? '<div class="diag-code">' + htmlSafe(hub.error) + '</div>' : '');
+    }).join('') || '<div class="diag-line"><span>WebSocket hub</span><b>0</b></div>';
+    body.innerHTML = '<div class="diagnostics-grid">' +
+      diagCard('服务', [
+        diagLine('状态', diagStatus(payload.ok !== false)),
+        diagLine('运行', htmlSafe(String(payload.uptime_seconds || 0)) + 's'),
+        diagLine('时间', htmlSafe(payload.time || '-'))
+      ].join('')) +
+      diagCard('存储', [
+        diagLine('MySQL', diagStatus(mysql.available)),
+        diagLine('Redis', diagStatus(redis.available)),
+        diagLine('Auth', diagStatus(auth.login_ready !== false))
+      ].join('')) +
+      diagCard('缓存', [
+        diagLine('内存快照', htmlSafe(String(cache.memory_items || 0))),
+        diagLine('市场锁', htmlSafe(String(cache.market_lock_count || 0))),
+        diagLine('TTL', htmlSafe(String(cache.ttl_seconds || 0)) + 's')
+      ].join('')) +
+      diagCard('分析器', [
+        diagLine('文件', diagStatus(analyzer.path_exists)),
+        diagLine('并发', htmlSafe(String(analyzer.max_parallel_runs || '-'))),
+        diagLine('超时', htmlSafe(String(analyzer.run_timeout_seconds || '-')) + 's')
+      ].join('')) +
+      diagCard('实时流', [
+        diagLine('Hub', htmlSafe(String(realtime.hub_count || 0))),
+        diagLine('SSE', htmlSafe(String(realtime.sse_max_seconds || 0)) + 's'),
+        diagLine('复用率', htmlSafe(String(sharingReused) + '/' + String(sharingTotal) + ' · ' + sharingRate.toFixed(1) + '%')),
+        diagLine('模式', htmlSafe('exact ' + Number(sharingCounts.exact || 0) + ' / new ' + Number(sharingCounts.new || 0) + ' / superset ' + Number(sharingCounts.superset || 0))),
+        hubHtml
+      ].join('')) +
+      diagCard('实盘复盘', [
+        diagLine('记录', htmlSafe(String(review.sampled_records || 0))),
+        diagLine('待评估', htmlSafe(String(review.pending || 0))),
+        diagLine('到期堆积', htmlSafe(String(review.due_pending || 0))),
+        diagLine('校准', htmlSafe(review.calibration_status || '-')),
+        diagLine('成本', htmlSafe(Number(review.estimated_roundtrip_cost_pct || 0).toFixed(2) + '% · fee ' + Number(review.taker_fee_bps || 0) + 'bps / slip ' + Number(review.slippage_bps || 0) + 'bps')),
+        diagLine('评估器', htmlSafe(evaluator.running ? 'running' : 'idle')),
+        diagLine('触发/启动', htmlSafe(String(evaluator.trigger_count || 0) + '/' + String(evaluator.thread_started_count || 0))),
+        diagLine('跳过', htmlSafe('recent ' + Number(evaluator.skipped_recent_count || 0) + ' / running ' + Number(evaluator.skipped_running_count || 0)))
+      ].join('')) +
+      diagCard('Auth 细节', [
+        diagLine('已有用户', diagStatus(auth.has_users)),
+        diagLine('可初始化', diagStatus(auth.can_create_first_admin || auth.has_users)),
+        diagLine('问题', htmlSafe(auth.issue || '-'))
+      ].join('')) +
+    '</div>';
+  }
+  function loadDiagnostics() {
+    var body = document.getElementById('diagnostics-body');
+    if (body) body.innerHTML = '<div class="diag-card"><div class="diag-line"><span>读取中</span><b>...</b></div></div>';
+    setDiagnosticsMessage('', '');
+    fetch('api/diagnostics', { cache: 'no-store' })
+      .then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function (payload) {
+        renderDiagnosticsPayload(payload);
+      })
+      .catch(function (err) {
+        setDiagnosticsMessage('诊断读取失败：' + err.message, 'err');
+      });
+  }
+  function openDiagnosticsModal() {
+    var modal = document.getElementById('diagnostics-modal');
+    if (!modal) return;
+    modal.classList.add('show');
+    modal.setAttribute('aria-hidden', 'false');
+    loadDiagnostics();
+  }
+  function bindDiagnostics() {
+    var btn = document.getElementById('diagnostics-btn');
+    var raw = document.getElementById('diagnostics-raw');
+    var refresh = document.getElementById('diagnostics-refresh');
+    var close = document.getElementById('diagnostics-close');
+    var modal = document.getElementById('diagnostics-modal');
+    if (btn && !btn._bound) {
+      btn._bound = true;
+      btn.addEventListener('click', openDiagnosticsModal);
+    }
+    if (raw && !raw._bound) {
+      raw._bound = true;
+      raw.addEventListener('click', function () {
+        var win = window.open('api/diagnostics', '_blank', 'noopener');
+        if (win) win.opener = null;
+      });
+    }
+    if (refresh && !refresh._bound) {
+      refresh._bound = true;
+      refresh.addEventListener('click', loadDiagnostics);
+    }
+    if (close && !close._bound) {
+      close._bound = true;
+      close.addEventListener('click', closeDiagnosticsModal);
+    }
+    if (modal && !modal._bound) {
+      modal._bound = true;
+      modal.addEventListener('click', function (e) {
+        if (e.target === modal) closeDiagnosticsModal();
+      });
+    }
   }
   function setPasswordMessage(text, cls) {
     var el = document.getElementById('password-message');
@@ -455,7 +725,7 @@
       else if (!items[i].classList.contains('admin-only')) items[i].classList.add('admin-only');
     }
   }
-  function loadCurrentUser() {
+  function loadCurrentUser(done) {
     fetch('api/auth/me', { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
@@ -465,7 +735,8 @@
       .catch(function () {
         CURRENT_USER = null;
         updateAdminControls();
-      });
+      })
+      .then(function () { if (done) done(); });
   }
   function bindCreateUser() {
     var btn = document.getElementById('create-user-btn');
@@ -568,6 +839,10 @@
     var ce = document.getElementById('clock'); if (ce) ce.textContent = t;
     var de = document.getElementById('clockd'); if (de) de.textContent = dt + ' · 北京时间 UTC+8';
     setGen();
+    var active = cur();
+    if (active && active._price_snapshot_ms && Date.now() - active._price_snapshot_ms > 20000) {
+      updateLiveBadge(false);
+    }
   }
   function setGen() {
     var r = cur();
@@ -598,7 +873,7 @@
     var raw = String(text).trim().replace(/\//g, '-');
     var m = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})$/);
     if (m) {
-      return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime();
+      return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 8, +m[5], +m[6]);
     }
     var ms = Date.parse(raw);
     return isNaN(ms) ? 0 : ms;
@@ -623,7 +898,7 @@
     var stop = w.stop_rate != null ? ' / 止损' + Number(w.stop_rate).toFixed(0) + '%' : '';
     var net = w.net_expectancy_pct != null ? ' / 净期望' + Number(w.net_expectancy_pct).toFixed(2) + '%' : '';
     var filtered = w.filtered_out_count ? ' / 过滤' + w.filtered_out_count : '';
-    return '1H胜率' + Number(w.hit_rate).toFixed(0) + '% / 盈撤比' + Number(w.profit_drawdown_ratio).toFixed(2) + stop + net + filtered + ' / ' + (bt.grade || '-');
+    return '5m代理·后续1H ' + Number(w.hit_rate).toFixed(0) + '% / 盈撤比' + Number(w.profit_drawdown_ratio).toFixed(2) + stop + net + filtered + ' / ' + (bt.grade || '-');
   }
   function compactBacktest(bt) {
     if (!bt || !bt.windows || !bt.windows.length) return '暂无';
@@ -634,6 +909,7 @@
       return w.horizon + ' ' + Number(w.hit_rate).toFixed(0) + '%' + stop + (sampleWarn ? '(' + sampleWarn + ')' : '');
     }).join(' · ');
     var filteredTotal = bt.windows.reduce(function (sum, w) { return sum + (Number(w.filtered_out_count) || 0); }, 0);
+    text = '5m代理（不参与开仓分）· ' + text;
     return filteredTotal ? text + ' · 样本经ATR/量能过滤' : text;
   }
   function triggerLabel(t) {
@@ -867,10 +1143,11 @@
   }
   function isShortBias(b) {
     var s = String(b || '');
-    return s.indexOf('偏空') >= 0 || s.indexOf('观望偏空') >= 0;
+    return s.indexOf('观望') < 0 && s.indexOf('偏空') >= 0;
   }
   function isLongBias(b) {
-    return String(b || '').indexOf('偏多') >= 0;
+    var s = String(b || '');
+    return s.indexOf('观望') < 0 && s.indexOf('偏多') >= 0;
   }
   function adviceSide(advice) {
     var b = String((advice && advice.bias) || '');
@@ -948,6 +1225,23 @@
     var v = item && Number(item.atr14_pct);
     return isFinite(v) ? v : maxAtrPct(r);
   }
+  function signalDistanceModel(r, snap) {
+    var atrPct = selectedAtrPct(r, snap && snap.advice);
+    if (!isFinite(atrPct) || atrPct <= 0) atrPct = maxAtrPct(r);
+    if (!isFinite(atrPct) || atrPct <= 0) atrPct = 1;
+    return {
+      atrPct: atrPct,
+      stopDangerPct: Math.max(0.18, Math.min(1.2, atrPct * 0.25)),
+      entryHotPct: Math.max(0.12, Math.min(1.2, atrPct * 0.30)),
+      entryWatchPct: Math.max(0.35, Math.min(2.5, atrPct * 1.00)),
+      chasePct: Math.max(0.70, Math.min(2.2, atrPct * 0.90)),
+      stalePct: Math.max(0.90, Math.min(4.0, atrPct * 1.50))
+    };
+  }
+  function atrMultipleText(pct, model) {
+    if (pct == null || !model || !model.atrPct) return '';
+    return (pct / model.atrPct).toFixed(1) + 'xATR';
+  }
   function riskLevel(r) {
     var risks = r && r.risks ? r.risks : [];
     var advice = selectedSignalAdvice(r);
@@ -968,7 +1262,8 @@
     if (advice && String(advice.bias || '').indexOf('观望') >= 0 && conf < 60) {
       return { key: 'high', label: '高风险', text: '当前周期方向不够干净，先等触发位或换更短确认。' };
     }
-    if (conf < 40 || dangerCount >= 3 || atr >= 12) return { key: 'block', label: '禁止开仓', text: '信号质量差或波动过大，先别开新仓。' };
+    if (dangerCount >= 4 || atr >= 18) return { key: 'block', label: '禁止开仓', text: '前端兜底风控：波动或异常提示极端，先别开新仓。' };
+    if (conf < 40 || dangerCount >= 3 || atr >= 12) return { key: 'high', label: '等待确认', text: '开仓执行分过低或波动偏大，先等入场触发和完整 K 线确认。' };
     if (conf < 55 || dangerCount >= 2 || risks.length >= 4 || atr >= 8) return { key: 'high', label: '高风险', text: '只能轻仓或等待更干净的位置。' };
     var exposure = correlationExposureForSymbol(r && r.symbol);
     if (exposure) return { key: 'mid', label: '相关性风险', text: exposure.text };
@@ -977,15 +1272,15 @@
   }
   function isRealtimePrejudgeSnap(snap) {
     if (!snap) return false;
-    if (snap.candleState === '实时预判') return true;
+    if (snap.candleState === '实时K线' || snap.candleState === '实时预判') return true;
     var t = snap.trigger || {};
-    return String(t.label || '').indexOf('实时预判') >= 0 || (t.reasons || []).some(function (x) { return String(x).indexOf('未收盘') >= 0 || String(x).indexOf('实时预判') >= 0; });
+    return String(t.label || '').indexOf('实时K线') >= 0 || (t.reasons || []).some(function (x) { return String(x).indexOf('仍在形成') >= 0 || String(x).indexOf('实时K线') >= 0; });
   }
   function riskAdjustedPosition(pos, risk, snap) {
     if (!pos || !risk) return pos;
     if (accountFuseStatus().active) return { stars: '', text: '0%', sizePct: 0, color: C.bear, note: '账户熔断禁止开仓' };
     if (isRealtimePrejudgeSnap(snap) && snap.trigger && /confirmed|watch/.test(String(snap.trigger.status || ''))) {
-      return { stars: '', text: '0%', sizePct: 0, color: C.warn, note: '等待收盘确认' };
+      return { stars: '', text: '0%', sizePct: 0, color: C.warn, note: '等待完整 K 线确认' };
     }
     if (risk.key === 'block') return { stars: '', text: '0%', sizePct: 0, color: C.bear, note: risk.text };
     if (risk.key === 'high' && Number(pos.sizePct || 0) > 10) return { stars: '', text: '10%', sizePct: 10, color: C.warn, note: '高风险前端封顶' };
@@ -1036,7 +1331,8 @@
   function entryDistanceText(r, entry) {
     var d = signedDistancePct(entry, Number(r && r.last));
     if (d == null || !isFinite(d)) return '';
-    return '距现价 ' + (d >= 0 ? '+' : '') + d.toFixed(2) + '%';
+    var model = signalDistanceModel(r, { advice: selectedSignalAdvice(r) });
+    return '距现价 ' + (d >= 0 ? '+' : '') + d.toFixed(2) + '% / ' + atrMultipleText(Math.abs(d), model);
   }
   function signalAlert(r, snap) {
     if (!r) return { cls: '', text: '' };
@@ -1049,9 +1345,12 @@
     var entryDist = distancePct(price, snap.entry);
     var entrySigned = signedDistancePct(snap.entry, price);
     var stopDist = distancePct(price, snap.stop);
+    var model = signalDistanceModel(r, snap);
+    var driftDist = distancePct(price, Number(r._analysis_last || 0));
+    var entryAtrText = entryDist == null ? '' : '，约 ' + atrMultipleText(entryDist, model);
     var state = getPositionState(r.symbol);
-    if (stopDist != null && stopDist <= 0.4) {
-      return { cls: 'danger', text: '接近风控止损，距离约 ' + stopDist.toFixed(2) + '%，优先处理风险。' };
+    if (stopDist != null && stopDist <= model.stopDangerPct) {
+      return { cls: 'danger', text: '接近风控止损，距离约 ' + stopDist.toFixed(2) + '%（' + atrMultipleText(stopDist, model) + '），优先处理风险。' };
     }
     if (state === '多单' && snap.side === 'short') {
       return { cls: 'danger', text: '你标记为多单，但当前信号偏空，优先看止损或减仓。' };
@@ -1060,10 +1359,13 @@
       return { cls: 'danger', text: '你标记为空单，但当前信号偏多，优先看止损或减仓。' };
     }
     if (isRealtimePrejudgeSnap(snap) && snap.trigger && /confirmed|watch/.test(String(snap.trigger.status || ''))) {
-      return { cls: 'warn', text: '当前 K 线未收盘，只能观察；等 1m/对应周期收盘确认后再考虑入场。' };
+      return { cls: 'warn', text: '当前周期 K 线仍在形成；等 1m/对应周期形成完成后再考虑入场。' };
+    }
+    if (driftDist != null && driftDist >= model.stalePct) {
+      return { cls: 'warn', text: '实时价已偏离策略快照 ' + driftDist.toFixed(2) + '%（' + atrMultipleText(driftDist, model) + '），当前信号可能过期，等下一次策略刷新更稳。' };
     }
     if (snap.trigger && snap.trigger.status === 'blocked') {
-      return { cls: 'danger', text: '入场位附近但触发确认不通过：' + (snap.trigger.reasons || []).join('；') };
+      return { cls: 'warn', text: '本次入场触发失败：' + ((snap.trigger.reasons || []).join('；') || triggerLabel(snap.trigger)) + '。等下一次结构确认。' };
     }
     if (snap.trigger && snap.trigger.status === 'confirmed') {
       return { cls: 'watch', text: '入场触发已确认：量能、价差和1m结构通过，仍需按仓位和止损执行。' };
@@ -1071,17 +1373,17 @@
     if (snap.trigger && snap.trigger.status === 'watch') {
       return { cls: 'warn', text: '价格到位但还要等确认：' + (snap.trigger.reasons || []).join('；') };
     }
-    if (entryDist != null && entryDist <= 0.25) {
-      return { cls: 'watch', text: '已接近' + snap.entryLabel + '，距离约 ' + entryDist.toFixed(2) + '%，等待确认再动手。' };
+    if (entryDist != null && entryDist <= model.entryHotPct) {
+      return { cls: 'watch', text: '已接近' + snap.entryLabel + '，距离约 ' + entryDist.toFixed(2) + '%' + entryAtrText + '，等 1m 触发确认再动手。' };
     }
-    if (entryDist != null && entryDist <= 0.7) {
-      return { cls: 'warn', text: '价格在' + snap.entryLabel + '附近，距离约 ' + entryDist.toFixed(2) + '%，别追，等触发。' };
+    if (entryDist != null && entryDist <= model.entryWatchPct) {
+      return { cls: 'warn', text: '价格在' + snap.entryLabel + '附近，距离约 ' + entryDist.toFixed(2) + '%' + entryAtrText + '，别追，等触发。' };
     }
-    if (snap.side === 'short' && entrySigned != null && entrySigned > 1) {
-      return { cls: 'warn', text: '现价低于反弹空点 ' + entrySigned.toFixed(2) + '%，这里不是追空位置，等反弹触发或看更短周期。' };
+    if (snap.side === 'short' && entrySigned != null && entrySigned > model.chasePct) {
+      return { cls: 'warn', text: '现价低于反弹空点 ' + entrySigned.toFixed(2) + '%（' + atrMultipleText(entrySigned, model) + '），这里不是追空位置，等反弹触发或看更短周期。' };
     }
-    if (snap.side === 'long' && entrySigned != null && entrySigned < -1) {
-      return { cls: 'warn', text: '现价高于回踩多点 ' + Math.abs(entrySigned).toFixed(2) + '%，这里不是追多位置，等回踩确认。' };
+    if (snap.side === 'long' && entrySigned != null && Math.abs(entrySigned) > model.chasePct) {
+      return { cls: 'warn', text: '现价高于回踩多点 ' + Math.abs(entrySigned).toFixed(2) + '%（' + atrMultipleText(Math.abs(entrySigned), model) + '），这里不是追多位置，等回踩确认。' };
     }
     return { cls: '', text: '' };
   }
@@ -1111,7 +1413,7 @@
       return { cls: 'warn', text: exposure.text };
     }
     if (isRealtimePrejudgeSnap(snap)) {
-      return { cls: 'warn', text: '当前信号来自未收盘 K 线，仅作实时预判，等待收盘确认。' };
+      return { cls: 'warn', text: '当前信号来自仍在形成的 K 线，仅作实时判断，等待完整 K 线确认。' };
     }
     return null;
   }
@@ -1165,11 +1467,16 @@
       if (!isFinite(Number(snap.stop)) || Number(snap.stop) <= 0) {
         add('block', '风控止损无效，禁止开仓。');
       }
+      var guardModel = signalDistanceModel(r, snap);
+      var guardDrift = distancePct(Number(r.last), Number(r._analysis_last || 0));
+      if (guardDrift != null && guardDrift >= guardModel.stalePct) {
+        add('warn', '实时价已偏离策略快照 ' + guardDrift.toFixed(2) + '%（' + atrMultipleText(guardDrift, guardModel) + '），等待下一次策略刷新更稳。');
+      }
       if (isRealtimePrejudgeSnap(snap)) {
-        add('warn', '当前 K 线未收盘，这是实时预判，等收盘确认更稳。');
+        add('warn', '当前周期 K 线仍在形成，等完整 K 线确认更稳。');
       }
       if (trigger.status === 'blocked') {
-        add('block', '入场触发不通过：' + ((trigger.reasons || []).join('；') || triggerLabel(trigger)));
+        add('warn', '本次入场触发失败：' + ((trigger.reasons || []).join('；') || triggerLabel(trigger)) + '。等下一次结构确认。');
       } else if (trigger.status === 'watch') {
         add('warn', '价格接近但还没确认：' + ((trigger.reasons || []).join('；') || triggerLabel(trigger)));
       } else if (trigger.status !== 'confirmed') {
@@ -1190,7 +1497,7 @@
       ? '触发与风控通过，可按风险预算执行'
       : key === 'block'
         ? '禁止新开仓，先处理风险'
-        : '先别动，等触发确认或收盘确认';
+        : '先别动，等触发确认或完整 K 线确认';
     if (!reasons.length) {
       reasons.push({ type: '', text: '风控、触发、止损和实时价当前未发现硬性阻断。' });
     }
@@ -1235,6 +1542,19 @@
         updateRealtimeSignal();
       });
     }
+  }
+  function bindSignalAlertToggle(host) {
+    var btn = host.querySelector('.js-signal-alert-toggle');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+      signalAlertPref.enabled = !signalAlertPref.enabled;
+      saveSignalAlertPref();
+      signalAlertState.lastKey = '';
+      signalAlertState.lastAt = 0;
+      updateSignalAlertButton();
+      if (signalAlertPref.enabled) playSignalBeep('watch');
+    });
+    updateSignalAlertButton();
   }
   function loadSignalHistory() {
     try {
@@ -1324,6 +1644,427 @@
       '</div>';
     }).join('');
   }
+  function reviewSideText(side) {
+    return side === 'long' ? '做多' : side === 'short' ? '做空' : '观望';
+  }
+  function reviewReasonText(reason) {
+    var map = {
+      ok: '有效',
+      entry_too_far: '入场太远',
+      not_triggered_adverse_move: '未触发且反向',
+      stop_too_tight: '止损过窄',
+      same_bar_stop: '同K止损',
+      stop_hit_first: '先打止损',
+      stop_after_profit: '盈利后回撤止损',
+      direction_wrong: '方向错误',
+      no_follow_through: '突破无延续',
+      no_market_data: '行情不足',
+      invalid_signal: '信号无效',
+      entry_invalid: '入场无效',
+      stop_invalid: '止损无效',
+      long_stop_not_below_entry: '多单止损不合法',
+      short_stop_not_above_entry: '空单止损不合法'
+    };
+    return map[reason] || reason || '-';
+  }
+  function reviewReasonClass(reason) {
+    if (reason === 'ok' || reason === 'stop_after_profit') return 'good';
+    if (/stop|wrong|invalid|adverse/.test(String(reason || ''))) return 'bad';
+    return 'warn';
+  }
+  function reviewPct(v) {
+    var n = Number(v);
+    if (!isFinite(n)) return '--';
+    return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+  }
+  function reviewHorizonLabel(h) {
+    return h === '5m' ? '5分钟' : h === '15m' ? '15分钟' : h === '1h' ? '1小时' : h;
+  }
+  function reviewSampleQualityByCount(count) {
+    var n = Number(count) || 0;
+    if (n <= 0) return { cls: 'low', label: '无样本', text: '等待真实信号到期后评估。' };
+    if (n < 20) return { cls: 'low', label: '样本不足', text: '只能当案例看，不能当胜率。' };
+    if (n < 60) return { cls: 'mid', label: '样本积累中', text: '可以参考，但仍要看失败原因。' };
+    return { cls: 'good', label: '样本可参考', text: '样本量较足，可用于校准信心。' };
+  }
+  function reviewOverallQuality(per) {
+    var counts = ['5m', '15m', '1h'].map(function (h) {
+      return Number((per[h] && per[h].sample_count) || 0);
+    });
+    var maxCount = Math.max.apply(Math, counts);
+    var zeroCount = counts.filter(function (x) { return x <= 0; }).length;
+    var positive = counts.filter(function (x) { return x > 0; }).sort(function (a, b) { return a - b; });
+    var minPositive = positive[0] || 0;
+    var q = reviewSampleQualityByCount(maxCount);
+    if (maxCount > 0 && zeroCount) {
+      return { cls: 'low', label: '周期样本不全', text: '有些周期还没有到期样本，不能只看已有周期的命中率。' };
+    }
+    if (maxCount > 0 && minPositive < 20) {
+      q = { cls: 'low', label: '样本不足', text: '部分周期样本还少，先看失败原因，不要只看命中率。' };
+    }
+    return q;
+  }
+  function reviewEvaluationText(evaluation) {
+    var ev = evaluation || {};
+    var status = ev.status || {};
+    var result = status.last_result || {};
+    var reason = ev.reason || '';
+    var text = '';
+    if (ev.scheduled) text = '评估器已启动';
+    else if (reason === 'recently_triggered') text = '刚触发过，等待冷却';
+    else if (reason === 'already_running' || status.running) text = '评估器正在运行';
+    else if (reason === 'storage_unavailable') text = '复盘存储不可用';
+    else if (reason) text = reason;
+    else text = '空闲';
+    if (result && result.due != null) {
+      text += '；上次到期 ' + Number(result.due || 0) + '，更新 ' + Number(result.updated || 0);
+    }
+    return ' 评估器：' + text + '。';
+  }
+  function reviewSegmentTitle(name) {
+    if (name === 'risk_gate') return '风控';
+    if (name === 'trigger_status') return '触发';
+    if (name === 'candle_state') return 'K线';
+    if (name === 'anchor_interval') return '锚定';
+    if (name === 'trend_regime') return '趋势';
+    if (name === 'atr_regime') return 'ATR';
+    if (name === 'boll_width_regime') return 'BOLL宽度';
+    if (name === 'boll_position_regime') return 'BOLL位置';
+    return name || '分桶';
+  }
+  function renderReviewSegments(segments) {
+    if (!segments || typeof segments !== 'object') return '';
+    var names = ['trigger_status', 'risk_gate', 'candle_state', 'atr_regime', 'trend_regime', 'boll_width_regime'];
+    var html = [];
+    names.forEach(function (name) {
+      var group = segments[name] || {};
+      var keys = Object.keys(group).filter(function (key) {
+        return group[key] && Number(group[key].sample_count || 0) > 0;
+      }).sort(function (a, b) {
+        return Number(group[b].sample_count || 0) - Number(group[a].sample_count || 0);
+      }).slice(0, 3);
+      keys.forEach(function (key) {
+        var s = group[key] || {};
+        var sampleCount = Number(s.sample_count || 0);
+        var triggeredCount = Number(s.triggered_count || 0);
+        var quality = reviewSampleQualityByCount(sampleCount);
+        var title = reviewSegmentTitle(name) + ' · ' + (name === 'risk_gate' ? gateText(key) : key);
+        html.push('<div class="review-seg ' + quality.cls + '">' +
+          '<b>' + htmlSafe(title) + '</b>' +
+          '<span>样本 ' + sampleCount + ' / 触发 ' + triggeredCount +
+          ' / 命中 ' + Number(s.hit_rate_pct || 0).toFixed(0) + '%' +
+          (Number(s.invalid_count || 0) ? ' / 无效 ' + Number(s.invalid_rate_pct || 0).toFixed(0) + '%' : '') +
+          ' / 结果 ' + reviewPct(s.avg_outcome_pct || 0) + '</span>' +
+        '</div>');
+      });
+    });
+    return html.length ? '<div class="review-segments">' + html.join('') + '</div>' : '';
+  }
+  function reviewCalibrationReason(reason) {
+    var map = {
+      invalid_rate_high: '无效信号偏多',
+      stop_rate_high: '止损率偏高',
+      hit_rate_low: '命中率偏低',
+      expectancy_negative: '期望为负',
+      historically_supported: '历史表现支持'
+    };
+    return map[reason] || reason || '-';
+  }
+  function renderReviewCalibration(calibration) {
+    if (!calibration || typeof calibration !== 'object') return '';
+    var status = calibration.status || 'insufficient_data';
+    var minSample = Number(calibration.min_sample_count || 0);
+    var minTriggered = Number(calibration.min_triggered_count || 0);
+    var calibrationHorizon = calibration.horizon || '1h';
+    var candidates = Array.isArray(calibration.candidates) ? calibration.candidates : [];
+    var cls = status === 'needs_review' ? 'warn' : status === 'stable' ? 'good' : 'low';
+    var title = status === 'needs_review' ? '校准候选' : status === 'stable' ? '暂无明显弱分桶' : '校准样本不足';
+    var note = status === 'insufficient_data'
+      ? '分桶至少需要 ' + minSample + ' 个样本且触发 ' + minTriggered + ' 次，当前只展示案例，不建议据此调阈值。'
+      : status === 'stable'
+        ? '已有足够样本的分桶暂未出现明显弱点，继续收集。'
+        : '以下分桶样本已够，适合人工复盘后再决定是否降级或提高信心。';
+    var body = candidates.slice(0, 6).map(function (item) {
+      var actionCls = item.action === 'downgrade' ? 'bad' : 'good';
+      var actionText = item.action === 'downgrade' ? '建议降级观察' : '可支持信心';
+      return '<div class="review-cal-item ' + actionCls + '">' +
+        '<b>' + htmlSafe(reviewSegmentTitle(item.segment) + ' · ' + item.key) + '</b>' +
+        '<span>' + actionText + ' · ' + reviewCalibrationReason(item.reason) +
+        ' · 独立样本 ' + Number(item.sample_count || 0) + ' / 独立触发 ' + Number(item.triggered_count || 0) +
+        ' / 命中 ' + Number(item.hit_rate_pct || 0).toFixed(0) + '%' +
+        ' / 止损 ' + Number(item.stop_rate_pct || 0).toFixed(0) + '%' +
+        ' / 结果 ' + reviewPct(item.avg_outcome_pct || 0) + '</span>' +
+      '</div>';
+    }).join('');
+    return '<div class="review-calibration ' + cls + '">' +
+      '<div class="review-cal-head"><b>' + title + ' [' + htmlSafe(calibrationHorizon) + ']</b><span>' + note + '</span></div>' +
+      (body ? '<div class="review-cal-list">' + body + '</div>' : '') +
+    '</div>';
+  }
+  function latestDoneReview(record) {
+    var ev = record && record.evaluation && typeof record.evaluation === 'object' ? record.evaluation : {};
+    var order = ['1h', '15m', '5m'];
+    for (var i = 0; i < order.length; i++) {
+      var item = ev[order[i]];
+      if (item && item.status === 'done') {
+        item._horizon = order[i];
+        return item;
+      }
+    }
+    if (ev.invalid) {
+      ev.invalid._horizon = 'invalid';
+      return ev.invalid;
+    }
+    return null;
+  }
+  function csvCell(value) {
+    if (value == null) return '';
+    var text = String(value);
+    if (/[",\r\n]/.test(text)) return '"' + text.replace(/"/g, '""') + '"';
+    return text;
+  }
+  function reviewExportValue(record, horizon, field) {
+    var ev = record && record.evaluation && typeof record.evaluation === 'object' ? record.evaluation : {};
+    var item = ev[horizon] || {};
+    return item[field] == null ? '' : item[field];
+  }
+  function exportSignalReviewCsv() {
+    var r = cur();
+    var key = r && r.symbol;
+    var payload = SIGNAL_REVIEW_STATE.key === key ? SIGNAL_REVIEW_STATE.payload : null;
+    if (!key) return;
+    if (!payload || !Array.isArray(payload.records)) {
+      alert('复盘数据还没加载完成，稍后再导出。');
+      loadSignalReviews(true);
+      return;
+    }
+    var records = payload.records.filter(function (item) { return item.symbol === key; });
+    if (!records.length) {
+      alert('当前币种暂无可导出的复盘记录。');
+      return;
+    }
+    var headers = [
+      'snapshot_at', 'symbol', 'advice_name', 'side', 'entry_price', 'stop_price', 'snapshot_price',
+      'confidence', 'direction_score', 'execution_score', 'risk_gate', 'candle_state', 'trigger_status',
+      'anchor_interval', 'trend_regime', 'atr_regime', 'boll_width_regime', 'boll_position_regime',
+      'invalid_reason',
+      '5m_reason', '5m_entry_reached', '5m_stop_hit', '5m_max_profit_pct', '5m_gross_max_profit_pct', '5m_max_drawdown_pct', '5m_outcome_pct', '5m_gross_outcome_pct', '5m_estimated_cost_pct',
+      '15m_reason', '15m_entry_reached', '15m_stop_hit', '15m_max_profit_pct', '15m_gross_max_profit_pct', '15m_max_drawdown_pct', '15m_outcome_pct', '15m_gross_outcome_pct', '15m_estimated_cost_pct',
+      '1h_reason', '1h_entry_reached', '1h_stop_hit', '1h_max_profit_pct', '1h_gross_max_profit_pct', '1h_max_drawdown_pct', '1h_outcome_pct', '1h_gross_outcome_pct', '1h_estimated_cost_pct'
+    ];
+    var rows = records.map(function (item) {
+      var regime = item.market_regime || {};
+      var invalid = item.evaluation && item.evaluation.invalid ? item.evaluation.invalid : {};
+      return [
+        item.snapshot_at || '',
+        item.symbol || '',
+        item.advice_name || '',
+        item.side || '',
+        item.entry_price || '',
+        item.stop_price || '',
+        item.snapshot_price || '',
+        item.confidence || '',
+        item.direction_score || '',
+        item.execution_score || '',
+        item.risk_gate || '',
+        item.candle_state || '',
+        item.trigger_status || '',
+        regime.anchor_interval || '',
+        regime.trend_regime || '',
+        regime.atr_regime || '',
+        regime.boll_width_regime || '',
+        regime.boll_position_regime || '',
+        invalid.failure_reason || item.failure_reason || '',
+        reviewExportValue(item, '5m', 'failure_reason'),
+        reviewExportValue(item, '5m', 'entry_reached'),
+        reviewExportValue(item, '5m', 'stop_hit'),
+        reviewExportValue(item, '5m', 'max_profit_pct'),
+        reviewExportValue(item, '5m', 'gross_max_profit_pct'),
+        reviewExportValue(item, '5m', 'max_drawdown_pct'),
+        reviewExportValue(item, '5m', 'outcome_pct'),
+        reviewExportValue(item, '5m', 'gross_outcome_pct'),
+        reviewExportValue(item, '5m', 'estimated_cost_pct'),
+        reviewExportValue(item, '15m', 'failure_reason'),
+        reviewExportValue(item, '15m', 'entry_reached'),
+        reviewExportValue(item, '15m', 'stop_hit'),
+        reviewExportValue(item, '15m', 'max_profit_pct'),
+        reviewExportValue(item, '15m', 'gross_max_profit_pct'),
+        reviewExportValue(item, '15m', 'max_drawdown_pct'),
+        reviewExportValue(item, '15m', 'outcome_pct'),
+        reviewExportValue(item, '15m', 'gross_outcome_pct'),
+        reviewExportValue(item, '15m', 'estimated_cost_pct'),
+        reviewExportValue(item, '1h', 'failure_reason'),
+        reviewExportValue(item, '1h', 'entry_reached'),
+        reviewExportValue(item, '1h', 'stop_hit'),
+        reviewExportValue(item, '1h', 'max_profit_pct'),
+        reviewExportValue(item, '1h', 'gross_max_profit_pct'),
+        reviewExportValue(item, '1h', 'max_drawdown_pct'),
+        reviewExportValue(item, '1h', 'outcome_pct'),
+        reviewExportValue(item, '1h', 'gross_outcome_pct'),
+        reviewExportValue(item, '1h', 'estimated_cost_pct')
+      ].map(csvCell).join(',');
+    });
+    var csv = '\ufeff' + headers.map(csvCell).join(',') + '\r\n' + rows.join('\r\n');
+    var blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'signal-review-' + key + '-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+  function setSignalReviewEvaluateButton(loading) {
+    var btn = document.getElementById('signal-review-evaluate');
+    if (!btn) return;
+    btn.disabled = !!loading;
+    btn.textContent = loading ? '评估中...' : '评估';
+  }
+  function forceEvaluateSignalReviews() {
+    setSignalReviewEvaluateButton(true);
+    fetch('api/signal-reviews/evaluate', { method: 'POST', cache: 'no-store' })
+      .then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (payload) {
+          if (!res.ok) throw new Error(payload.error || (payload.evaluation && payload.evaluation.reason) || ('HTTP ' + res.status));
+          return payload;
+        });
+      })
+      .then(function () {
+        loadSignalReviews(true);
+      })
+      .catch(function (err) {
+        alert('复盘评估触发失败：' + err.message);
+      })
+      .then(function () {
+        setSignalReviewEvaluateButton(false);
+      });
+  }
+  function bindSignalReviewEvaluate() {
+    var btn = document.getElementById('signal-review-evaluate');
+    if (!btn || btn._bound) return;
+    btn._bound = true;
+    btn.addEventListener('click', forceEvaluateSignalReviews);
+  }
+  function bindSignalReviewExport() {
+    var btn = document.getElementById('signal-review-export');
+    if (!btn || btn._bound) return;
+    btn._bound = true;
+    btn.addEventListener('click', exportSignalReviewCsv);
+  }
+  function renderSignalReview() {
+    var host = document.getElementById('signal-review');
+    if (!host) return;
+    var r = cur();
+    if (!r) {
+      host.innerHTML = '<div class="review-empty">暂无币种，无法复盘。</div>';
+      return;
+    }
+    var key = r.symbol;
+    if (SIGNAL_REVIEW_STATE.loading && SIGNAL_REVIEW_STATE.key === key && !SIGNAL_REVIEW_STATE.payload) {
+      host.innerHTML = '<div class="review-empty">正在读取实盘复盘样本...</div>';
+      return;
+    }
+    if (SIGNAL_REVIEW_STATE.error && SIGNAL_REVIEW_STATE.key === key && !SIGNAL_REVIEW_STATE.payload) {
+      host.innerHTML = '<div class="review-empty">复盘数据读取失败：' + htmlSafe(SIGNAL_REVIEW_STATE.error) + '</div>';
+      return;
+    }
+    var payload = SIGNAL_REVIEW_STATE.key === key ? SIGNAL_REVIEW_STATE.payload : null;
+    if (!payload) {
+      host.innerHTML = '<div class="review-empty">暂无实盘复盘样本。新策略刷新后会自动记录，5分钟后开始出现第一批结果。</div>';
+      return;
+    }
+    var stats = payload.stats || {};
+    var per = stats.per_horizon || {};
+    var overallQuality = reviewOverallQuality(per);
+    var duePending = Number(stats.due_pending || 0);
+    var qualityText = overallQuality.text +
+      (Number(stats.invalid_records || 0) ? ' 无效信号 ' + Number(stats.invalid_records || 0) + ' 条，优先检查入场/止损合法性。' : '') +
+      (duePending ? ' 有 ' + duePending + ' 条信号已到期但尚未完成评估，等待后台复盘刷新。' : '');
+    qualityText += reviewEvaluationText(payload.evaluation);
+    var summary = ['5m', '15m', '1h'].map(function (h) {
+      var s = per[h] || {};
+      var sampleCount = Number(s.sample_count || 0);
+      var triggeredCount = Number(s.triggered_count || 0);
+      var quality = reviewSampleQualityByCount(sampleCount);
+      var hitCls = sampleCount >= 20 && triggeredCount >= 10 && Number(s.hit_rate_pct || 0) >= 55 ? 'good' : Number(s.hit_rate_pct || 0) ? 'warn' : '';
+      var stopCls = Number(s.stop_rate_pct || 0) >= 35 ? 'bad' : Number(s.stop_rate_pct || 0) ? 'warn' : '';
+      return '<div class="review-stat">' +
+        '<div class="rs-head"><span class="rs-h">' + reviewHorizonLabel(h) + '</span><span class="rs-n">样本 ' + sampleCount + ' / 触发 ' + triggeredCount + '</span></div>' +
+        '<div class="rs-main">' +
+          '<div><div class="rs-k">命中</div><div class="rs-v ' + hitCls + '">' + Number(s.hit_rate_pct || 0).toFixed(0) + '%</div></div>' +
+          '<div><div class="rs-k">止损</div><div class="rs-v ' + stopCls + '">' + Number(s.stop_rate_pct || 0).toFixed(0) + '%</div></div>' +
+          '<div><div class="rs-k">未触发</div><div class="rs-v warn">' + Number(s.not_triggered_rate_pct || 0).toFixed(0) + '%</div></div>' +
+          '<div><div class="rs-k">净最大利</div><div class="rs-v good">' + reviewPct(s.avg_max_profit_pct || 0) + '</div></div>' +
+          '<div><div class="rs-k">最大撤</div><div class="rs-v bad">' + reviewPct(s.avg_max_drawdown_pct || 0) + '</div></div>' +
+          '<div><div class="rs-k">净结果</div><div class="rs-v">' + reviewPct(s.avg_outcome_pct || 0) + '</div></div>' +
+        '</div>' +
+        '<div class="review-quality ' + quality.cls + '">' + quality.label + ' · ' + quality.text + '</div>' +
+      '</div>';
+    }).join('');
+    var segmentsHtml = renderReviewSegments(stats.segments);
+    var calibrationHtml = renderReviewCalibration(stats.calibration);
+    var records = (payload.records || []).filter(function (x) { return x.symbol === key; }).slice(0, 18);
+    var list = records.map(function (x) {
+      var done = latestDoneReview(x);
+      var reason = done ? (done.failure_reason || x.failure_reason || '') : (x.failure_reason || 'pending');
+      var reasonCls = done ? reviewReasonClass(reason) : 'warn';
+      var statusText = done ? reviewReasonText(reason) : '等待到期';
+      var horizon = done ? reviewHorizonLabel(done._horizon) : '待评估';
+      var triggerText = done
+        ? (done.entry_reached ? '已触发' : '未触发')
+        : '未到评估时间';
+      var stopText = done && done.stop_hit ? '触及止损' : '未止损';
+      var priceText = '入场 <b>' + fmtPrice(Number(x.entry_price || 0)) + '</b> / 止损 <b>' + fmtPrice(Number(x.stop_price || 0)) + '</b>';
+      var resultText = done
+        ? '净最大盈利 <b>' + reviewPct(done.max_profit_pct || 0) + '</b>，最大回撤 <b>' + reviewPct(done.max_drawdown_pct || 0) + '</b>，净结果 <b>' + reviewPct(done.outcome_pct || 0) + '</b>'
+        : '等待 5m/15m/1h 到期后后台自动评估';
+      return '<div class="review-row">' +
+        '<div class="review-time">' + (x.snapshot_at_ms ? relativeSnapshot(Number(x.snapshot_at_ms)) : '--') + '<br>' + htmlSafe(x.advice_name || '') + '</div>' +
+        '<div class="review-side ' + htmlSafe(x.side || '') + '">' + reviewSideText(x.side) + '<br><span style="color:var(--muted-strong)">分 ' + (x.execution_score || x.confidence || 0) + '</span></div>' +
+        '<div class="review-body">' + priceText + '<br>' + resultText +
+          '<div class="review-tags">' +
+            '<span class="review-tag ' + reasonCls + '">' + htmlSafe(horizon + ' ' + statusText) + '</span>' +
+            '<span class="review-tag">' + htmlSafe(triggerText) + '</span>' +
+            '<span class="review-tag ' + (done && done.stop_hit ? 'bad' : '') + '">' + htmlSafe(stopText) + '</span>' +
+            '<span class="review-tag">' + htmlSafe(x.risk_gate || '风控-') + '</span>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+    host.innerHTML = '<div class="review-note ' + overallQuality.cls + '"><b>' + overallQuality.label + '</b><span>' + qualityText + '</span></div>' +
+      '<div class="review-summary">' + summary + '</div>' +
+      segmentsHtml +
+      calibrationHtml +
+      (records.length ? '<div class="review-list">' + list + '</div>' : '<div class="review-empty">暂无当前币种复盘记录。等待下一次策略刷新写入样本。</div>');
+  }
+  function loadSignalReviews(force) {
+    var r = cur();
+    if (!r || !r.symbol) return;
+    var key = r.symbol;
+    if (SIGNAL_REVIEW_STATE.loading && SIGNAL_REVIEW_STATE.key === key) return;
+    if (!force && SIGNAL_REVIEW_STATE.key === key && Date.now() - SIGNAL_REVIEW_STATE.lastFetch < 30000) return;
+    if (SIGNAL_REVIEW_STATE.key !== key) SIGNAL_REVIEW_STATE.payload = null;
+    SIGNAL_REVIEW_STATE.key = key;
+    SIGNAL_REVIEW_STATE.loading = true;
+    SIGNAL_REVIEW_STATE.error = '';
+    var requestSeq = ++SIGNAL_REVIEW_REQUEST_SEQ;
+    renderSignalReview();
+    fetch('api/signal-reviews?symbols=' + encodeURIComponent(key) + '&limit=240', { cache: 'no-store' })
+      .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+      .then(function (payload) {
+        if (requestSeq !== SIGNAL_REVIEW_REQUEST_SEQ || !cur() || cur().symbol !== key) return;
+        SIGNAL_REVIEW_STATE = { key: key, payload: payload, loading: false, error: '', lastFetch: Date.now() };
+        renderSignalReview();
+      })
+      .catch(function (err) {
+        if (requestSeq !== SIGNAL_REVIEW_REQUEST_SEQ || !cur() || cur().symbol !== key) return;
+        SIGNAL_REVIEW_STATE.loading = false;
+        SIGNAL_REVIEW_STATE.error = err.message;
+        SIGNAL_REVIEW_STATE.lastFetch = Date.now();
+        renderSignalReview();
+      });
+  }
   function updateRealtimeSignal() {
     var r = cur();
     var snap = signalSnapshot(r);
@@ -1345,7 +2086,7 @@
     var depthSizeEl = document.querySelector('#signal-banner .js-signal-depth-size');
     var sbEl = document.querySelector('#signal-banner .sb');
     if (sbEl) {
-      sbEl.className = 'sb risk-' + risk.key + (bestAdvice && bestAdvice.candle_state === '实时预判' ? ' realtime-prejudge' : '');
+      sbEl.className = 'sb risk-' + risk.key + (bestAdvice && bestAdvice.candle_state === '实时K线' ? ' realtime-prejudge' : '');
     }
     if (livePriceEl) livePriceEl.textContent = realtimePriceText(r);
     if (entryLabelEl) entryLabelEl.textContent = snap.entryLabel;
@@ -1372,7 +2113,9 @@
       var alert = signalAlert(r, snap);
       alertEl.className = 'sb-alert js-signal-alert' + (alert.text ? ' show ' + alert.cls : '');
       alertEl.textContent = alert.text;
+      maybeNotifySignalAlert(r, alert);
     }
+    updateSignalAlertButton();
     if (topLineEl) {
       var topLine = signalTopline(risk, bestAdvice, snap, state);
       topLineEl.className = 'sb-topline js-signal-topline' + (topLine ? ' show ' + topLine.cls : '');
@@ -1400,7 +2143,7 @@
       } catch (e) {}
     };
     realtimeSource.onerror = function () {
-      // EventSource reconnects automatically; keep the last full-analysis state visible.
+      updateLiveBadge(false);
     };
   }
   function applyRealtimePrice(item) {
@@ -1482,9 +2225,6 @@
     return DATA[0];
   }
   var DEFAULT_SYMS = (window.MARKET_DATA || []).map(function (r) { return r.symbol; });
-  var LS_KEY = 'bian_dashboard_custom_syms';
-  var REMOVED_KEY = 'bian_dashboard_removed_syms';
-
   // localStorage: save / load / remove custom symbols
   function saveCustomSyms() {
     var custom = [];
@@ -1604,7 +2344,7 @@
   function removeSymbol(sym) {
     rememberSymbols([sym], true);
     var removed = loadRemovedSyms();
-    if (DEFAULT_SYMS.indexOf(sym) >= 0 && removed.indexOf(sym) < 0) {
+    if (removed.indexOf(sym) < 0) {
       removed.push(sym);
       saveRemovedSyms(removed);
     }
@@ -1709,7 +2449,7 @@
     var lightClass = bc === 'bull' ? 'green' : bc === 'bear' ? 'red' : 'yellow';
     var risk = riskLevel(r);
     if (risk.key === 'block') lightClass = 'red';
-    else if (bestAdvice && bestAdvice.candle_state === '实时预判') lightClass = 'yellow';
+    else if (bestAdvice && bestAdvice.candle_state === '实时K线') lightClass = 'yellow';
     var pos = riskAdjustedPosition(snap.position, risk, snap);
     var alert = signalAlert(r, snap);
     var state = getPositionState(r.symbol);
@@ -1725,7 +2465,7 @@
       majorHtml += '<div class="sb-act major">触发<b style="color:' + (bestAdvice.trigger_check && bestAdvice.trigger_check.status === 'confirmed' ? C.accent2 : C.warn) + '">' + triggerLabel(bestAdvice.trigger_check) + '</b></div>';
       majorHtml += '<div class="sb-act major">建议仓位<b class="js-signal-position" title="' + (pos.note || '') + '" style="color:' + pos.color + '">' + pos.text + '</b></div>';
       // 次行辅助:K线/风控/回测/盘口/入场/止损/周期
-      var minorHtml = '<div class="sb-act minor">K线<b style="color:' + (bestAdvice.candle_state === '收盘确认' ? C.accent2 : C.warn) + '">' + (bestAdvice.candle_state || '-') + '</b></div>';
+      var minorHtml = '<div class="sb-act minor">K线<b style="color:' + (bestAdvice.candle_state === '已完成K线' ? C.accent2 : C.warn) + '">' + (bestAdvice.candle_state || '-') + '</b></div>';
       minorHtml += '<div class="sb-act minor">风控<b style="color:' + (bestAdvice.risk_gate === '正常' ? C.accent2 : C.warn) + '">' + gateText(bestAdvice.risk_gate) + '</b></div>';
       minorHtml += '<div class="sb-act minor">回测<b style="color:' + C.accent + '">' + backtestSummary(bestAdvice.backtest) + '</b></div>';
       var depthImbalance = r._depth_imbalance != null ? r._depth_imbalance : r.signal_quality && r.signal_quality.depth_imbalance;
@@ -1744,7 +2484,7 @@
     var stateHtml = '<div class="pos-state" data-symbol="' + r.symbol + '"><span class="ps-label">当前状态</span>' +
       states.map(function (s) { return '<button class="pos-btn ' + (state === s ? 'active' : '') + '" data-state="' + s + '">' + s + '</button>'; }).join('') +
       '</div>';
-    var sbClass = 'sb risk-' + risk.key + (bestAdvice && bestAdvice.candle_state === '实时预判' ? ' realtime-prejudge' : '');
+    var sbClass = 'sb risk-' + risk.key + (bestAdvice && bestAdvice.candle_state === '实时K线' ? ' realtime-prejudge' : '');
     host.innerHTML =
       '<div class="' + sbClass + '">' +
         '<div class="light ' + lightClass + '"></div>' +
@@ -1754,11 +2494,13 @@
           '<div class="sb-reason">' + reason + '</div>' +
           '<div class="sb-actions">' + majorHtml + '</div>' +
           (minorHtml ? '<div class="sb-actions-minor">' + minorHtml + '</div>' : '') +
-          '<div class="sb-meta"><span class="risk-pill js-risk-level ' + risk.key + '" title="' + risk.text + '">' + risk.label + '</span>' + stateHtml + '</div>' +
+          '<div class="sb-meta"><span class="risk-pill js-risk-level ' + risk.key + '" title="' + risk.text + '">' + risk.label + '</span>' + stateHtml + '<button type="button" class="alert-toggle js-signal-alert-toggle">' + alertButtonText() + '</button></div>' +
           '<div class="sb-alert js-signal-alert' + (alert.text ? ' show ' + alert.cls : '') + '">' + alert.text + '</div>' +
         '</div>' +
       '</div>';
     bindPositionStateButtons(host);
+    bindSignalAlertToggle(host);
+    maybeNotifySignalAlert(r, alert);
   }
 
   /* ---------- P1: indicator traffic lights ---------- */
@@ -2346,7 +3088,7 @@
   /* ---------- render all panels (uses current DATA/GEN, single symbol view) ---------- */
   function renderEmptyState() {
     var msg = '<div class="empty">暂无币种，请在上方添加一个合约币种。</div>';
-    ['signal-banner', 'kpi-main', 'indicator-lights', 'advice-grid', 'risk-grid', 'signal-history', 'account-risk', 'depth-dom'].forEach(function (id) {
+    ['signal-banner', 'kpi-main', 'indicator-lights', 'advice-grid', 'risk-grid', 'signal-history', 'signal-review', 'account-risk', 'depth-dom'].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) el.innerHTML = msg;
     });
@@ -2401,6 +3143,8 @@
     renderRisks();
     renderAccountRisk();
     renderSignalHistory();
+    renderSignalReview();
+    loadSignalReviews(false);
     startRealtimePrices();
   }
 
@@ -2466,15 +3210,20 @@
   function boot() {
     tick();
     bindLogout();
+    bindDiagnostics();
     bindPasswordChange();
     bindCreateUser();
-    loadCurrentUser();
+    bindSignalReviewEvaluate();
+    bindSignalReviewExport();
     if (!clockTimer) clockTimer = setInterval(tick, 1000);
     window.addEventListener('resize', onResize);
     window.addEventListener('beforeunload', cleanup);
     DATA = stampReports(DATA, GEN);
     showLoading('正在调用 bian.py 获取实时行情…');
-    loadServerPreferences(startMarketBoot);
+    loadCurrentUser(function () {
+      scopeLocalStorageKeys();
+      loadServerPreferences(startMarketBoot);
+    });
 
     function startMarketBoot() {
       seedSymbolHistoryFromLocal();
@@ -2507,7 +3256,6 @@
       render();
       hideLoading();
       startStrategyRefreshTimer();
-      console.log('[dashboard] live data + custom symbols loaded @', GEN);
     }
   }
 

@@ -15,8 +15,8 @@ This pass tightens the P0 trust issues from `docs/improvement-suggestions.md`: h
 - Historical full copy moved to `archive/`.
 - Startup and verification scripts added to `scripts/`.
 - Analyzer adds 5m/15m/1h historical signal backtest metrics for long and short signals.
-- Confidence is calibrated by historical quality and risk-gate penalties.
-- Advice marks unclosed candles as `实时预判` and closed candles as `收盘确认`.
+- Execution confidence uses rule direction, trigger state, and effective risk-gate penalties. The 5m proxy backtest is displayed for context but does not calibrate the live opening score.
+- Advice uses the latest completed interval candle (`已完成K线`) for direction while realtime prices and the forming 1m candle remain available for monitoring. This is interval completion in a 24/7 market, not a market close.
 - Extreme ATR/BOLL conditions can downgrade to `禁止半仓` or `禁止开仓`.
 - Entry trigger confirmation checks 1m volume, 1m structure, book spread, and distance to entry.
 - Stops are rounded with tick size and recent high/low/ATR guards to avoid invalid 0 stop hints.
@@ -26,7 +26,7 @@ This pass tightens the P0 trust issues from `docs/improvement-suggestions.md`: h
 - Entry trigger confirmation now uses an ATR-based near-entry threshold and 1m retest/touch check.
 - Backtest windows now model stop-first trade paths, estimated taker fees/slippage, stop-out count/rate, average loss, and net expectancy.
 - `build_trigger_check` now uses an ATR-adaptive spread threshold plus depth top5 USD and depth imbalance checks.
-- Unclosed 1m trigger candles are forced to `watch` instead of `confirmed`.
+- Trigger confirmation uses the latest completed 1m candle plus the current futures book price, so the always-forming live candle does not make confirmation permanently unreachable.
 - Funding-rate crowding now downgrades risk gates.
 - Dashboard top banner now shows stronger `禁止开仓`, `禁止半仓`, realtime-prejudge, and position-conflict warnings.
 - Historical backtest side selection now shares the same threshold as online scoring.
@@ -55,5 +55,5 @@ This pass tightens the P0 trust issues from `docs/improvement-suggestions.md`: h
 
 ## Human Review Notes
 
-- Historical quality is a more conservative signal-quality score, but still not a full execution-grade backtest with funding windows, liquidation, partial fills, account equity, queue position, or portfolio exposure.
+- Historical quality is a non-overlapping 5m proxy using next-bar-open fills. It is not a full execution-grade or live-isomorphic backtest and does not change the opening score.
 - Human review should check `src/bian_dashboard/analyzer.py`, `web/assets/charts.js`, and the updated docs before staging.

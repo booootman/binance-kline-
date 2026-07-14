@@ -6,7 +6,7 @@
 - Running-server risk: a server started before this restructure must be restarted to use the new `web/` and `src/` paths.
 - Historical-backtest risk: the current backtest is still a rolling signal-quality estimate; it now shares the same side threshold as online scoring, models stop-first path plus estimated fee/slippage, but does not model funding over the holding window, liquidation, partial fills, or account margin.
 - Backtest-sample risk: historical samples are filtered by ATR and volume before being counted; displayed win rate only represents signals that pass those filters.
-- Realtime-candle risk: `实时预判` candles can change before close; backend trigger confirmation must not emit `confirmed` from an unclosed 1m candle.
+- Forming-candle risk: `实时K线` values can change until that interval ends; trigger confirmation uses the latest `已完成K线` plus current price/book data. Crypto trades 24/7, so this refers to interval completion, not market close.
 - Funding-risk: abnormal funding now participates in the risk gate; `abs(funding_rate) >= 0.1%` should downgrade at least to `禁止半仓`, and `>= 0.2%` should force `禁止开仓`.
 - Small-coin risk: when ATR/BOLL expands extremely, the analyzer should downgrade to `禁止半仓` or `禁止开仓`; do not override this for illiquid contracts without manual review.
 - Trigger risk: entry levels are not executable instructions until 1m volume, structure, spread, distance, and order-book depth/imbalance checks confirm.

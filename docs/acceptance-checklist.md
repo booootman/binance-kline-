@@ -7,8 +7,8 @@
 - [x] Static resources resolve from `web/assets/` and `web/_shared/`.
 - [x] Runtime cache path is isolated under `runtime/market_cache.json`.
 - [x] Analyzer JSON includes historical 5m/15m/1h backtest windows for directional signals.
-- [x] `confidence` is calibrated with historical quality and risk-gate penalties instead of only rule score.
-- [x] Timeframe advice marks candles as `实时预判` or `收盘确认`.
+- [x] `confidence` applies trigger and risk-gate penalties; the non-isomorphic 5m proxy backtest is explicitly informational and does not inflate the live opening score.
+- [x] Timeframe advice uses `已完成K线` for interval confirmation while realtime prices continue updating in the 24/7 market.
 - [x] Extreme ATR/BOLL conditions can downgrade advice to `禁止半仓` or `禁止开仓`.
 - [x] Entry trigger confirmation reports 1m volume, structure, book spread, and distance to entry.
 - [x] Stop hints and grid stops are rounded to tick size and do not fall to 0 in TLM smoke tests.
@@ -19,7 +19,7 @@
 - [x] Backtest metrics include stop-first path accounting, estimated cost, stop rate, average loss, and net expectancy.
 - [x] Funding rate can downgrade the risk gate when funding becomes crowded.
 - [x] Trigger confirmation uses adaptive spread threshold, top5 depth, and depth imbalance.
-- [x] Unclosed 1m trigger candles cannot return `confirmed`.
+- [x] Trigger confirmation combines the latest completed 1m candle with current price/book data instead of waiting for the 24/7 market to close.
 - [x] Dashboard top signal banner gives strong warnings for no-open gates, half-position bans, realtime-prejudge, and position conflicts.
 - [x] Historical backtest side threshold is shared with online scoring.
 - [x] Backtest exposes gross expectancy, net expectancy, filtered sample count, and price-path drawdown.
