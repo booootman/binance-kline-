@@ -1455,3 +1455,41 @@
 - Passed `node --check web\assets\charts.js` and parsed `feature_list.json`.
 - Live Binance DOGE/TLM validation returned verified tick sizes, positive stops, four `已完成K线` advice states, and conservative TLM gates.
 - Real MySQL/Redis integration and authenticated browser rendering still require deployment-environment verification; no service was started during this review.
+
+## 2026-07-14 Realtime freshness and review-timing fixes
+
+- Replaced stale depth-price retention with a fresh depth20 midpoint and separate price/depth event timestamps.
+- Changed market cache TTL, strategy `generated_at`, and live-review `snapshot_at_ms` to start at analyzer completion/publication; added observable analysis start/completion/duration fields.
+- Added a conservative frontend realtime trigger overlay using executable bid/ask, live spread, depth freshness, top5 depth, and imbalance. It never upgrades an old unconfirmed 1m structure and expires confirmations after 90 seconds.
+- Added strategy-age risk gates: warn after 7 minutes and prohibit new entries after 12 minutes, even when realtime prices remain connected.
+- Added Binance `markPrice`, `indexPrice`, and `nextFundingTime`; the funding countdown now follows the exchange timestamp and updates every second.
+- Added bounded preference-sync retry behavior and fixed the mobile header/status overflow found during browser verification.
+- Added offline regressions for depth/price timestamps, executable short bid distance, and analysis-completion publication timing.
+
+## Realtime Freshness Verification
+
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok` and `verify ok`.
+- Passed `git diff --check`; only existing LF-to-CRLF conversion warnings remain.
+- Browser verification passed at 1280x720 and 390x844 with no key-panel or page-level horizontal overflow after the mobile fix.
+- Static fallback correctly showed an expired-strategy hard block and a live funding countdown without JavaScript errors.
+- Live Binance DOGE/TLM validation was attempted twice but the current machine timed out reaching Binance; deployment-network validation remains required.
+
+## Next Review
+
+- Validate the full `/api/market` plus SSE flow against Binance when network access recovers, including `published_at_ms`, price/depth ages, and `next_funding_time_ms`.
+- Consider a shared realtime 1m kline stream if trigger confirmations need to upgrade between five-minute strategy snapshots; do not infer fresh 1m volume/structure from order-book data alone.
+
+## 2026-07-14 Realtime connection-state stabilization
+
+- Identified a deterministic LIVE-badge flap: while Binance WebSocket was disconnected, the SSE heartbeat still carried the last cached prices; the frontend briefly marked each stale heartbeat online before the 20-second freshness timer marked it offline again.
+- Split browser realtime state into SSE transport, Binance upstream connection, and active-symbol price freshness. LIVE now requires all three conditions; fresh data during a transport reconnect is shown as `重连`, and stale data remains `离线`.
+- Strategy REST success/failure no longer changes the realtime-price badge, so a successful cached `/api/market` response cannot impersonate a healthy WebSocket.
+- Added `X-Accel-Buffering: no`, a one-second EventSource retry hint, and configurable `BIAN_SSE_MAX_SECONDS` with a six-hour default instead of an intentional reconnect every 30 minutes.
+- Added per-hub connect/disconnect counters and last connected/disconnected/message/price/depth timestamps to admin diagnostics, plus explicit WebSocket connect/disconnect logs.
+- Browser fallback verification held `data-state=offline` continuously across EventSource retries instead of toggling green.
+
+## Realtime Stabilization Verification
+
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok` and `verify ok`.
+- Passed `node --check web\assets\charts.js` and `git diff --check` apart from existing LF-to-CRLF warnings.
+- SSH and public-browser access to `159.223.91.36` timed out from the current environment, so deployed-container logs could not be inspected and the rebuilt server still needs deployment verification.

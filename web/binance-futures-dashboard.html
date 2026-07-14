@@ -93,6 +93,20 @@
   .auth-btn:hover{border-color:rgba(0,229,255,.5);color:var(--accent);background:rgba(0,229,255,.08)}
   .auth-btn.danger:hover{border-color:rgba(255,59,92,.45);color:var(--bear);background:rgba(255,59,92,.08)}
   .admin-only{display:none}
+  @media(max-width:900px){
+    header.bar{flex-wrap:wrap;align-items:flex-start;padding:13px 15px}
+    header.bar .brand{flex:1 1 100%;min-width:0}
+    header.bar .brand h1{min-width:0;overflow-wrap:anywhere}
+    header.bar .clock{text-align:left}
+    header.bar .status{flex:1 1 100%;min-width:0;justify-content:space-between;gap:10px;flex-wrap:wrap}
+    header.bar .gen{text-align:left}
+    header.bar .gen .gen-row{justify-content:flex-start}
+    header.bar .auth-actions{margin-left:auto;justify-content:flex-end;flex-wrap:wrap}
+  }
+  @media(max-width:520px){
+    .wrap{padding:12px 12px 30px}
+    header.bar .status{align-items:flex-start}
+  }
   @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
 
   /* password modal */

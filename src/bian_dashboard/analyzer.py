@@ -181,6 +181,9 @@ class SymbolReport:
     low_24h: float
     quote_volume_24h: float
     funding_rate: float
+    mark_price: float
+    index_price: float
+    next_funding_time_ms: int
     indicators: Dict[str, CandleIndicators]
     bias: str
     confidence: int
@@ -1211,7 +1214,12 @@ def build_trigger_check(
     one_min = (confirmed_ind or ind)["1m"]
     bid = float(book.get("bid", 0.0) or 0.0)
     ask = float(book.get("ask", 0.0) or 0.0)
-    price = (bid + ask) / 2.0 if bid and ask else live_one_min.close
+    if side == "long" and ask:
+        price = ask
+    elif side == "short" and bid:
+        price = bid
+    else:
+        price = (bid + ask) / 2.0 if bid and ask else live_one_min.close
     spread_pct = float(book.get("spread_pct", 0.0) or 0.0)
     spread_threshold = max(0.08, one_min.atr14_pct * 0.15)
     depth_imbalance = float(book.get("depth_imbalance", 0.0) or 0.0)
@@ -1558,6 +1566,9 @@ def analyze_symbol(symbol: str) -> SymbolReport:
         low_24h=float(ticker["lowPrice"]),
         quote_volume_24h=float(ticker["quoteVolume"]),
         funding_rate=funding_rate,
+        mark_price=float(premium.get("markPrice") or last),
+        index_price=float(premium.get("indexPrice") or last),
+        next_funding_time_ms=int(premium.get("nextFundingTime") or 0),
         indicators=indicators,
         bias=bias,
         confidence=confidence,

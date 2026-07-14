@@ -1,6 +1,6 @@
 {
   "project": "binance-futures-dashboard",
-  "updated_at": "2026-07-08",
+  "updated_at": "2026-07-14",
   "features": [
     {
       "id": "project-structure",
@@ -83,6 +83,14 @@
         "Same-side altcoin correlation exposure warning across loaded symbols",
         "Frontend stale/warning/error_type handling for delayed cached snapshots",
         "Realtime depth fields are preserved across bookTicker-only updates and strategy refreshes",
+        "Realtime depth20 snapshots refresh the displayed book midpoint and carry separate price/depth event timestamps so an old price cannot be kept artificially fresh",
+        "LIVE badge requires an open SSE transport, Binance upstream connected=true, and an active-symbol price newer than 20 seconds; stale heartbeat prices cannot toggle it green",
+        "Realtime reconnect state is shown separately from offline, with a one-second EventSource retry hint and configurable six-hour SSE response lifetime",
+        "Admin diagnostics expose realtime connect/disconnect counts and last connection, message, price, and depth timestamps for each shared hub",
+        "Realtime trigger overlay rechecks executable bid/ask distance, spread, depth freshness, top5 size, and imbalance without upgrading an old unconfirmed 1m structure",
+        "Confirmed realtime triggers expire after 90 seconds; strategy snapshots warn after 7 minutes and block new entries after 12 minutes",
+        "Market cache TTL and live-review evaluation start at analysis completion/publication instead of before the analyzer subprocess runs",
+        "Funding countdown uses Binance nextFundingTime with mark/index price fields retained in the strategy report",
         "Realtime entry, stop, chase, and strategy-snapshot drift warnings use ATR-adaptive thresholds instead of fixed percentages",
         "Optional browser-local ALERT toggle plays cooldown-limited sound cues for visible near-entry and near-stop signal warnings"
       ],
@@ -100,6 +108,7 @@
       "limitations": [
         "Historical backtest is still a lightweight rolling signal-quality check; it now estimates fees/slippage and stop-first path, but does not model funding windows, liquidation, partial fills, queue position, account equity, or portfolio exposure.",
         "Backtest samples are filtered by ATR/volume and should not be interpreted as all-market win rate.",
+        "The lightweight realtime trigger overlay can downgrade stale or weak live conditions, but new completed 1m volume/structure indicators are recalculated only on the next strategy snapshot.",
         "Signals are suitable for assisted monitoring, not autonomous high-confidence trade execution."
       ]
     },

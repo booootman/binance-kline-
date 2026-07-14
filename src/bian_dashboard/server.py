@@ -89,7 +89,7 @@ SIGNAL_REVIEW_MIN_PROFIT_PCT = {"5m": 0.25, "15m": 0.45, "1h": 0.75}
 SIGNAL_REVIEW_TRIGGER_MIN_INTERVAL_SECONDS = float(os.environ.get("BIAN_SIGNAL_REVIEW_TRIGGER_MIN_INTERVAL_SECONDS", "20"))
 SIGNAL_REVIEW_TAKER_FEE_BPS = float(os.environ.get("BIAN_SIGNAL_REVIEW_TAKER_FEE_BPS", "5"))
 SIGNAL_REVIEW_SLIPPAGE_BPS = float(os.environ.get("BIAN_SIGNAL_REVIEW_SLIPPAGE_BPS", "2"))
-SSE_MAX_SECONDS = 30 * 60
+SSE_MAX_SECONDS = max(60, int(os.environ.get("BIAN_SSE_MAX_SECONDS", str(6 * 60 * 60))))
 SSE_HEARTBEAT_SECONDS = 15
 REALTIME_IDLE_SECONDS = 30
 MEMORY_CACHE_MAX_ITEMS = 64
@@ -137,6 +137,13 @@ class RealtimePriceHub:
         self.direct_stop = None
         self.direct_thread = None
         self.direct_connected = False
+        self.connect_count = 0
+        self.disconnect_count = 0
+        self.last_connected_ms = 0
+        self.last_disconnected_ms = 0
+        self.last_message_ms = 0
+        self.last_price_event_ms = 0
+        self.last_depth_event_ms = 0
         self.client_count = 0
         self.idle_timer = None
 
@@ -271,6 +278,9 @@ class RealtimePriceHub:
                     with self.lock:
                         self.error = None
                         self.direct_connected = True
+                        self.connect_count += 1
+                        self.last_connected_ms = int(time.time() * 1000)
+                    LOG.info("realtime websocket connected; symbols=%s; connect_count=%s", symbols, self.connect_count)
                     while not stop_event.is_set():
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=1)
@@ -278,15 +288,19 @@ class RealtimePriceHub:
                             continue
                         self.handle_message(json.loads(raw))
             except Exception as exc:
+                error_text = f"{type(exc).__name__}: {exc}".strip()
                 with self.lock:
-                    self.error = str(exc)
+                    self.error = error_text
                     self.direct_connected = False
+                    self.disconnect_count += 1
+                    self.last_disconnected_ms = int(time.time() * 1000)
                 if stop_event.is_set():
                     break
                 LOG.error(
-                    "realtime websocket disconnected; reconnect_in=3s; symbols=%s; error=%s",
+                    "realtime websocket disconnected; reconnect_in=3s; symbols=%s; disconnect_count=%s; error=%s",
                     symbols,
-                    exc,
+                    self.disconnect_count,
+                    error_text,
                     exc_info=True,
                 )
                 await asyncio.sleep(3)
@@ -299,6 +313,8 @@ class RealtimePriceHub:
                 return
             event_ms = int(data.get("T") or data.get("E") or int(time.time() * 1000))
             received_ms = int(time.time() * 1000)
+            with self.lock:
+                self.last_message_ms = received_ms
             bids_raw = data.get("b")
             asks_raw = data.get("a")
             is_depth = isinstance(bids_raw, list) or data.get("e") == "depthUpdate"
@@ -321,6 +337,8 @@ class RealtimePriceHub:
                     "ask": ask,
                     "event_ms": event_ms,
                     "received_ms": received_ms,
+                    "depth_event_ms": event_ms,
+                    "depth_received_ms": received_ms,
                     "depth_ok": bool(bid_top5 and ask_top5),
                     "depth_imbalance": (bid_top20 - ask_top20) / total if total else 0.0,
                     "bid_depth_top5_usd": bid_top5,
@@ -335,10 +353,18 @@ class RealtimePriceHub:
                 }
                 with self.lock:
                     item = dict(self.latest.get(symbol, {}))
+                    has_book_ticker = "bookTicker" in str(item.get("source") or "")
                     item.update(depth_update)
-                    item.setdefault("price", mid)
-                    item["source"] = "futures_bookTicker+depth20" if item.get("price") else "futures_depth20"
+                    # depth20 is a fresh partial-book snapshot, so its top of
+                    # book is also a fresh midpoint price rather than a reason
+                    # to keep an older bookTicker midpoint alive.
+                    item["price"] = mid
+                    item["price_event_ms"] = event_ms
+                    item["price_received_ms"] = received_ms
+                    item["price_kind"] = "book_mid"
+                    item["source"] = "futures_bookTicker+depth20" if has_book_ticker else "futures_depth20"
                     self.latest[symbol] = item
+                    self.last_depth_event_ms = event_ms
                     self.error = None
                 persist_realtime_later(symbol, item)
                 return
@@ -356,6 +382,9 @@ class RealtimePriceHub:
                 "ask": float(ask) if ask is not None else None,
                 "event_ms": event_ms,
                 "received_ms": received_ms,
+                "price_event_ms": event_ms,
+                "price_received_ms": received_ms,
+                "price_kind": "book_mid",
                 "source": "futures_bookTicker",
             }
             with self.lock:
@@ -364,6 +393,7 @@ class RealtimePriceHub:
                 if old.get("depth_ok"):
                     old["source"] = "futures_bookTicker+depth20"
                 self.latest[symbol] = old
+                self.last_price_event_ms = event_ms
                 self.error = None
             persist_realtime_later(symbol, old)
         except Exception as exc:
@@ -393,8 +423,9 @@ class BadRequestError(ValueError):
     pass
 
 
-def now_bj() -> str:
-    return datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
+def now_bj(timestamp=None) -> str:
+    current = datetime.fromtimestamp(timestamp, BJ_TZ) if timestamp is not None else datetime.now(BJ_TZ)
+    return current.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def normalize_symbol(raw):
@@ -845,8 +876,13 @@ def build_market_regime(report, advice):
 def build_signal_review_records(payload):
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         return []
-    generated_at = payload.get("generated_at") or now_bj()
-    snapshot_ms = parse_snapshot_ms(generated_at)
+    generated_at = payload.get("analysis_completed_at") or payload.get("generated_at") or now_bj()
+    try:
+        snapshot_ms = int(payload.get("published_at_ms") or 0)
+    except (TypeError, ValueError):
+        snapshot_ms = 0
+    if snapshot_ms <= 0:
+        snapshot_ms = parse_snapshot_ms(generated_at)
     records = []
     for report in payload.get("data") or []:
         if not isinstance(report, dict):
@@ -1776,8 +1812,16 @@ def diagnostics_payload(check_storage=True):
                     "key": key,
                     "symbols": list(hub.symbols),
                     "client_count": hub.client_count,
+                    "connected": bool((hub.twm and hub.socket_key) or hub.direct_connected),
                     "direct_connected": hub.direct_connected,
                     "latest_count": len(hub.latest),
+                    "connect_count": hub.connect_count,
+                    "disconnect_count": hub.disconnect_count,
+                    "last_connected_ms": hub.last_connected_ms,
+                    "last_disconnected_ms": hub.last_disconnected_ms,
+                    "last_message_ms": hub.last_message_ms,
+                    "last_price_event_ms": hub.last_price_event_ms,
+                    "last_depth_event_ms": hub.last_depth_event_ms,
                     "has_error": bool(hub.error),
                     "error": str(hub.error)[-300:] if hub.error else "",
                 }
@@ -2380,12 +2424,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
         if storage is not None:
             redis_cached = storage.get_market_payload(key)
-            if redis_cached and payload_matches(redis_cached, symbols):
+            redis_age = payload_age_seconds(redis_cached, now)
+            if redis_cached and payload_matches(redis_cached, symbols) and redis_age is not None and redis_age <= CACHE_TTL_SECONDS:
                 cached = dict(redis_cached)
                 cached["cache_hit"] = True
                 cached["redis_hit"] = True
                 with _payload_lock:
-                    _last_payloads[key] = {"ts": now, "payload": redis_cached}
+                    _last_payloads[key] = {"ts": now - redis_age, "payload": redis_cached}
                 self.send_cached_payload(cached, user_storage)
                 return
 
@@ -2432,6 +2477,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def run_api_uncached(self, symbols, now, user_storage=None):
         try:
+            analysis_started_at = time.time()
             result = run_bian_json(symbols)
             stdout = result.stdout or ""
             stderr = result.stderr or ""
@@ -2458,8 +2504,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     },
                 )
                 return
+            analysis_completed_at = time.time()
+            generated_at = now_bj(analysis_completed_at)
             payload = {
-                "generated_at": now_bj(),
+                "generated_at": generated_at,
+                "published_at_ms": int(analysis_completed_at * 1000),
+                "analysis_started_at": now_bj(analysis_started_at),
+                "analysis_completed_at": generated_at,
+                "analysis_duration_ms": max(0, round((analysis_completed_at - analysis_started_at) * 1000)),
                 "symbols": symbols,
                 "data": data,
                 "stale": False,
@@ -2467,7 +2519,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "warning": None,
             }
             with _payload_lock:
-                _last_payloads[cache_key(symbols)] = {"ts": now, "payload": payload}
+                _last_payloads[cache_key(symbols)] = {"ts": analysis_completed_at, "payload": payload}
             save_cache(symbols, payload)
             response_payload = dict(payload)
             if storage is not None:
@@ -2501,6 +2553,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
@@ -2508,6 +2561,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         last_emit = 0
         started = time.time()
         try:
+            self.wfile.write(b"retry: 1000\n\n")
+            self.wfile.flush()
             while time.time() - started < SSE_MAX_SECONDS:
                 snap = hub.snapshot(symbols)
                 snap["hub_key"] = hub.key

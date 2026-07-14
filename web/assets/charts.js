@@ -7,7 +7,16 @@
   var currentSymbol = '';                 // active symbol for single-symbol view
   var realtimeSource = null;
   var realtimeKey = '';
+  var REALTIME_STATE = {
+    transportOpen: false,
+    upstreamConnected: false,
+    lastPayloadAt: 0,
+    error: ''
+  };
   var AUTO_STRATEGY_REFRESH_MS = 5 * 60 * 1000;
+  var LIVE_TRIGGER_CONFIRM_MAX_AGE_MS = 90 * 1000;
+  var STRATEGY_WARN_AGE_MS = 7 * 60 * 1000;
+  var STRATEGY_BLOCK_AGE_MS = 12 * 60 * 1000;
   var clockTimer = null;
   var strategyRefreshTimer = null;
   var strategyRefreshBusy = false;
@@ -45,6 +54,7 @@
   var signalAlertState = { lastKey: '', lastAt: 0, audioCtx: null };
   var pendingPreferencePatch = {};
   var preferenceSaveTimer = null;
+  var preferenceRetryDelayMs = 5000;
   var root = getComputedStyle(document.documentElement);
   var C = {
     ink: root.getPropertyValue('--ink').trim(),
@@ -261,13 +271,23 @@
       cache: 'no-store'
     }).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (payload) {
-        if (!res.ok || payload.saved !== true) throw new Error(payload.error || ('HTTP ' + res.status));
+        if (!res.ok || payload.saved !== true) {
+          var error = new Error(payload.error || ('HTTP ' + res.status));
+          error.status = res.status;
+          throw error;
+        }
+        preferenceRetryDelayMs = 5000;
       });
     }).catch(function (err) {
       Object.keys(prefs).forEach(function (key) {
         if (!Object.prototype.hasOwnProperty.call(pendingPreferencePatch, key)) pendingPreferencePatch[key] = prefs[key];
       });
-      if (!preferenceSaveTimer) preferenceSaveTimer = setTimeout(flushServerPreferences, 5000);
+      var status = Number(err && err.status) || 0;
+      var retryable = !status || status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+      if (retryable && !preferenceSaveTimer) {
+        preferenceSaveTimer = setTimeout(flushServerPreferences, preferenceRetryDelayMs);
+        preferenceRetryDelayMs = Math.min(60000, preferenceRetryDelayMs * 2);
+      }
       console.warn('[dashboard] preference sync failed:', err.message);
     });
   }
@@ -403,6 +423,13 @@
   function diagCard(title, body) {
     return '<div class="diag-card"><h3>' + htmlSafe(title) + '</h3>' + body + '</div>';
   }
+  function diagAge(timestampMs) {
+    var value = Number(timestampMs) || 0;
+    if (!value) return '-';
+    var seconds = Math.max(0, Math.floor((Date.now() - value) / 1000));
+    if (seconds < 60) return seconds + 's前';
+    return Math.floor(seconds / 60) + 'm前';
+  }
   function renderDiagnosticsPayload(payload) {
     var body = document.getElementById('diagnostics-body');
     if (!body) return;
@@ -424,7 +451,9 @@
     var hubs = Array.isArray(realtime.hubs) ? realtime.hubs : [];
     var hubHtml = hubs.slice(0, 5).map(function (hub) {
       return '<div class="diag-line"><span>' + htmlSafe((hub.symbols || []).join(',') || hub.key || '-') + '</span><b>' +
-        diagStatus(!hub.has_error && (hub.direct_connected || hub.latest_count > 0)) + '</b></div>' +
+        diagStatus(hub.connected === true && !hub.has_error) + '</b></div>' +
+        '<div class="diag-line"><span>连接 / 断开</span><b>' + htmlSafe(String(hub.connect_count || 0) + ' / ' + String(hub.disconnect_count || 0)) + '</b></div>' +
+        '<div class="diag-line"><span>最后消息</span><b>' + htmlSafe(diagAge(hub.last_message_ms)) + '</b></div>' +
         (hub.error ? '<div class="diag-code">' + htmlSafe(hub.error) + '</div>' : '');
     }).join('') || '<div class="diag-line"><span>WebSocket hub</span><b>0</b></div>';
     body.innerHTML = '<div class="diagnostics-grid">' +
@@ -840,8 +869,12 @@
     var de = document.getElementById('clockd'); if (de) de.textContent = dt + ' · 北京时间 UTC+8';
     setGen();
     var active = cur();
-    if (active && active._price_snapshot_ms && Date.now() - active._price_snapshot_ms > 20000) {
-      updateLiveBadge(false);
+    var fundingEl = document.getElementById('funding-countdown');
+    if (fundingEl && active) fundingEl.textContent = formatHMS(fundingCountdownMs(active));
+    refreshLiveBadge();
+    if (active && Date.now() - lastGuardRenderAt > 5000) {
+      updateRealtimeSignal();
+      refreshOpeningGuardSoon();
     }
   }
   function setGen() {
@@ -858,7 +891,7 @@
     }
     if (priceEl) {
       priceEl.textContent = priceMs ? '' : '等待实时价';
-      priceEl.title = priceMs ? 'WebSocket 实时价格' : '';
+      priceEl.title = priceMs ? ((r && r._price_kind === 'book_mid') ? 'WebSocket 盘口中间价' : 'WebSocket 实时价格') : '';
     }
     if (countdownEl) {
       countdownEl.textContent = formatCountdown(nextStrategyRefreshAt);
@@ -1011,7 +1044,7 @@
       if (!r || typeof r !== 'object') return r;
       var old = oldBySymbol[r.symbol];
       if (old) {
-        ['_price_snapshot_ms', '_price_bid', '_price_ask', '_depth_imbalance', '_bid_depth_top5_usd', '_ask_depth_top5_usd', '_depth_ladder'].forEach(function (key) {
+        ['_price_snapshot_ms', '_depth_snapshot_ms', '_price_bid', '_price_ask', '_price_source', '_price_kind', '_depth_imbalance', '_bid_depth_top5_usd', '_ask_depth_top5_usd', '_depth_ladder'].forEach(function (key) {
           if (old[key] != null && r[key] == null) r[key] = old[key];
         });
       }
@@ -1177,7 +1210,104 @@
     if (!analysisLast || !isFinite(base)) return base;
     var movePct = Math.abs((liveLast - analysisLast) / analysisLast) * 100;
     var penalty = movePct >= 3 ? 35 : movePct >= 2 ? 25 : movePct >= 1 ? 15 : movePct >= 0.5 ? 8 : 0;
+    var freshness = strategyFreshness(r);
+    if (freshness.state === 'block') penalty += 35;
+    else if (freshness.state === 'warn') penalty += 15;
     return Math.max(0, Math.min(100, Math.round(base - penalty)));
+  }
+  function realtimeTriggerCheck(r, advice, side, entry) {
+    var base = advice && advice.trigger_check ? advice.trigger_check : {};
+    var result = {};
+    Object.keys(base).forEach(function (key) { result[key] = base[key]; });
+    result.base_status = base.status || 'waiting';
+    result.source = 'realtime_gate';
+    if (!r || side === 'wait' || !entry) return result;
+
+    var now = Date.now();
+    var priceAge = r._price_snapshot_ms ? Math.max(0, now - r._price_snapshot_ms) : Infinity;
+    var depthAge = r._depth_snapshot_ms ? Math.max(0, now - r._depth_snapshot_ms) : Infinity;
+    var bid = Number(r._price_bid);
+    var ask = Number(r._price_ask);
+    var executablePrice = side === 'long' ? ask : bid;
+    if (!isFinite(executablePrice) || executablePrice <= 0) executablePrice = Number(r.last);
+    var oneMin = r.indicators && r.indicators['1m'] ? r.indicators['1m'] : {};
+    var atrPct = Number(oneMin.atr14_pct) || 0;
+    var nearThreshold = Math.min(0.7, Math.max(0.25, atrPct * 2));
+    var distance = executablePrice > 0 ? Math.abs(entry - executablePrice) / executablePrice * 100 : 999;
+    var spread = bid > 0 && ask > 0 ? (ask - bid) / ((ask + bid) / 2) * 100 : 999;
+    var spreadThreshold = Number(base.spread_threshold_pct);
+    if (!isFinite(spreadThreshold) || spreadThreshold <= 0) spreadThreshold = Math.max(0.08, atrPct * 0.15);
+    var imbalance = Number(r._depth_imbalance);
+    var bidDepth = Number(r._bid_depth_top5_usd) || 0;
+    var askDepth = Number(r._ask_depth_top5_usd) || 0;
+    var minDepth = Math.min(5000, Math.max(500, executablePrice * 50000));
+    var depthReady = depthAge <= 5000 && bidDepth > 0 && askDepth > 0 && isFinite(imbalance);
+    var depthSizeOk = depthReady && Math.min(bidDepth, askDepth) >= minDepth;
+    var imbalanceOk = depthSizeOk && (side === 'long' ? imbalance >= 0.15 : imbalance <= -0.15);
+    var spreadOk = priceAge <= 20000 && bid > 0 && ask > 0 && spread <= spreadThreshold;
+    var near = priceAge <= 20000 && distance <= nearThreshold;
+
+    result.near_entry = near;
+    result.distance_pct = distance;
+    result.spread_pct = spread;
+    result.spread_threshold_pct = spreadThreshold;
+    result.depth_imbalance = isFinite(imbalance) ? imbalance : 0;
+    result.bid_depth_top5_usd = bidDepth;
+    result.ask_depth_top5_usd = askDepth;
+    result.depth_ok = depthSizeOk && imbalanceOk;
+
+    if (priceAge > 20000) {
+      result.status = 'waiting';
+      result.label = '等待实时价格恢复';
+      result.reasons = ['实时价格超过20秒未更新'];
+      return result;
+    }
+    if (!near) {
+      result.status = 'waiting';
+      result.label = '等待价格接近入场位';
+      result.reasons = ['按最新可执行价距离入场约' + distance.toFixed(2) + '%，超过' + nearThreshold.toFixed(2) + '%触发阈值'];
+      return result;
+    }
+
+    var liveFailures = [];
+    if (!spreadOk) liveFailures.push('实时盘口价差' + spread.toFixed(3) + '%未通过');
+    if (!depthReady) liveFailures.push('实时盘口深度超过5秒未更新');
+    else if (!depthSizeOk) liveFailures.push('实时top5深度不足');
+    else if (!imbalanceOk) liveFailures.push('实时盘口失衡度未支持方向');
+    if (liveFailures.length) {
+      result.status = 'blocked';
+      result.label = '实时盘口未通过';
+      result.reasons = liveFailures;
+      return result;
+    }
+
+    var freshness = strategyFreshness(r);
+    var strategyAge = freshness.ageMs == null ? Infinity : freshness.ageMs;
+    var baseReasons = (base.reasons || []).filter(function (reason) {
+      return !/盘口|depth|top5|距离入场/.test(String(reason));
+    });
+    if (freshness.state !== 'fresh' || strategyAge > LIVE_TRIGGER_CONFIRM_MAX_AGE_MS) {
+      result.status = 'watch';
+      result.label = '盘口到位，等待1m结构刷新';
+      result.reasons = ['实时价差和深度已通过，但1m量能/结构快照已超过90秒'];
+      return result;
+    }
+    if (base.status === 'confirmed') {
+      result.status = 'confirmed';
+      result.label = '入场触发仍有效';
+      result.reasons = ['1m结构快照仍有效，实时价差和深度继续通过'];
+      return result;
+    }
+    if (base.status === 'blocked') {
+      result.status = 'blocked';
+      result.label = '1m结构确认未通过';
+      result.reasons = baseReasons.length ? baseReasons : ['等待下一次1m量能和结构刷新'];
+      return result;
+    }
+    result.status = 'watch';
+    result.label = '盘口到位，等待1m结构确认';
+    result.reasons = baseReasons.length ? baseReasons : ['实时盘口已通过，但不能仅凭盘口升级为确认'];
+    return result;
   }
   function signalSnapshot(r) {
     var advice = selectedSignalAdvice(r);
@@ -1187,6 +1317,10 @@
     var directionScore = directionScoreOf(advice, r);
     var entry = advice ? adviceValue(advice, entryKey) : null;
     var sizing = sizingOf(advice, r);
+    var trigger = advice ? realtimeTriggerCheck(r, advice, side, entry) : null;
+    if (trigger && trigger.status === 'blocked') confidence = Math.min(confidence, 45);
+    else if (trigger && trigger.status === 'waiting') confidence = Math.min(confidence, 55);
+    else if (trigger && trigger.status === 'watch') confidence = Math.min(confidence, 64);
     return {
       advice: advice,
       side: side,
@@ -1200,7 +1334,7 @@
       candleState: advice ? advice.candle_state : '',
       riskGate: advice ? advice.risk_gate : '',
       backtest: advice ? advice.backtest : null,
-      trigger: advice ? advice.trigger_check : null,
+      trigger: trigger,
       sizing: sizing,
       position: positionFromSizing(sizing, confidence)
     };
@@ -1242,6 +1376,21 @@
     if (pct == null || !model || !model.atrPct) return '';
     return (pct / model.atrPct).toFixed(1) + 'xATR';
   }
+  function strategyFreshness(r) {
+    var snapshotMs = r && r._strategy_snapshot_ms ? Number(r._strategy_snapshot_ms) : 0;
+    if (!snapshotMs) {
+      return { state: 'block', ageMs: null, text: '缺少策略快照时间，禁止新开仓' };
+    }
+    var ageMs = Math.max(0, Date.now() - snapshotMs);
+    var minutes = Math.floor(ageMs / 60000);
+    if (ageMs > STRATEGY_BLOCK_AGE_MS) {
+      return { state: 'block', ageMs: ageMs, text: '策略快照已超过' + minutes + '分钟，禁止使用旧策略开仓' };
+    }
+    if (ageMs > STRATEGY_WARN_AGE_MS) {
+      return { state: 'warn', ageMs: ageMs, text: '策略快照已超过' + minutes + '分钟，等待刷新后再确认' };
+    }
+    return { state: 'fresh', ageMs: ageMs, text: '策略快照有效' };
+  }
   function riskLevel(r) {
     var risks = r && r.risks ? r.risks : [];
     var advice = selectedSignalAdvice(r);
@@ -1250,11 +1399,18 @@
     if (fuse.active) {
       return { key: 'block', label: '账户熔断', text: fuse.text };
     }
+    var freshness = strategyFreshness(r);
+    if (freshness.state === 'block') {
+      return { key: 'block', label: '策略过期', text: freshness.text };
+    }
     if (gate === '禁止开仓') {
       return { key: 'block', label: '禁止开仓', text: '后端风控阀门已触发：极端波动或信号质量不足，先不要开新仓。' };
     }
     if (gate === '禁止半仓') {
       return { key: 'high', label: '高风险', text: '后端风控阀门已触发：禁止半仓，最多轻仓观察。' };
+    }
+    if (freshness.state === 'warn') {
+      return { key: 'high', label: '策略延迟', text: freshness.text };
     }
     var dangerCount = risks.filter(function (x) { return /过热|很高|很大|容易快速|过高|极端|追|扫掉|穿越/.test(x); }).length;
     var atr = selectedAtrPct(r, advice);
@@ -1279,6 +1435,9 @@
   function riskAdjustedPosition(pos, risk, snap) {
     if (!pos || !risk) return pos;
     if (accountFuseStatus().active) return { stars: '', text: '0%', sizePct: 0, color: C.bear, note: '账户熔断禁止开仓' };
+    if (snap && snap.trigger && snap.trigger.status === 'blocked') {
+      return { stars: '', text: '0%', sizePct: 0, color: C.bear, note: '实时入场触发未通过' };
+    }
     if (isRealtimePrejudgeSnap(snap) && snap.trigger && /confirmed|watch/.test(String(snap.trigger.status || ''))) {
       return { stars: '', text: '0%', sizePct: 0, color: C.warn, note: '等待完整 K 线确认' };
     }
@@ -1358,6 +1517,9 @@
     if (state === '空单' && snap.side === 'long') {
       return { cls: 'danger', text: '你标记为空单，但当前信号偏多，优先看止损或减仓。' };
     }
+    var freshness = strategyFreshness(r);
+    if (freshness.state === 'block') return { cls: 'danger', text: freshness.text + '。' };
+    if (freshness.state === 'warn') return { cls: 'warn', text: freshness.text + '。' };
     if (isRealtimePrejudgeSnap(snap) && snap.trigger && /confirmed|watch/.test(String(snap.trigger.status || ''))) {
       return { cls: 'warn', text: '当前周期 K 线仍在形成；等 1m/对应周期形成完成后再考虑入场。' };
     }
@@ -1396,6 +1558,13 @@
     if (staleText) {
       return { cls: 'warn', text: '数据可能延迟：' + staleText };
     }
+    var freshness = strategyFreshness(cur());
+    if (freshness.state === 'block') {
+      return { cls: 'danger', text: freshness.text };
+    }
+    if (freshness.state === 'warn') {
+      return { cls: 'warn', text: freshness.text };
+    }
     if (state === '多单' && snap && snap.side === 'short') {
       return { cls: 'danger', text: '持仓冲突：你当前标记为多单，但系统偏空，先处理已有仓位风险。' };
     }
@@ -1403,7 +1572,7 @@
       return { cls: 'danger', text: '持仓冲突：你当前标记为空单，但系统偏多，先处理已有仓位风险。' };
     }
     if (risk && risk.key === 'block') {
-      return { cls: 'danger', text: '后端风控已触发：禁止新开仓。' };
+      return { cls: 'danger', text: risk.text || '当前风控已触发：禁止新开仓。' };
     }
     if (bestAdvice && bestAdvice.risk_gate === '禁止半仓') {
       return { cls: 'warn', text: '后端风控已触发：禁止半仓，最多轻仓观察。' };
@@ -1448,6 +1617,10 @@
     var staleText = marketWarningText();
     if (staleText) add('warn', '策略数据可能延迟：' + staleText);
 
+    var freshness = strategyFreshness(r);
+    if (freshness.state === 'block') add('block', freshness.text + '。');
+    else if (freshness.state === 'warn') add('warn', freshness.text + '。');
+
     var priceAge = r._price_snapshot_ms ? Math.max(0, Math.floor((Date.now() - r._price_snapshot_ms) / 1000)) : null;
     if (priceAge == null) add('warn', '实时价还没连上，不能用旧价格做触发判断。');
     else if (priceAge > 20) add('warn', '实时价 ' + priceAge + ' 秒未更新，先等 WebSocket 恢复。');
@@ -1455,8 +1628,8 @@
     if (!snap || !snap.advice) {
       add('warn', '没有可执行周期建议，只能观察。');
     } else {
-      if (!fuse.active && risk.key === 'block') add('block', risk.text || '当前风险等级为禁止开仓。');
-      else if (!fuse.active && risk.key === 'high') add('warn', risk.text || '当前属于高风险，只能观察或轻仓等待。');
+      if (!fuse.active && freshness.state !== 'block' && risk.key === 'block') add('block', risk.text || '当前风险等级为禁止开仓。');
+      else if (!fuse.active && freshness.state === 'fresh' && risk.key === 'high') add('warn', risk.text || '当前属于高风险，只能观察或轻仓等待。');
 
       if (snap.side !== 'long' && snap.side !== 'short') {
         add('warn', '方向不是明确多/空，当前不适合开新仓。');
@@ -2080,6 +2253,8 @@
     var stopEl = document.querySelector('#signal-banner .js-signal-stop');
     var posEl = document.querySelector('#signal-banner .js-signal-position');
     var riskEl = document.querySelector('#signal-banner .js-risk-level');
+    var triggerEl = document.querySelector('#signal-banner .js-signal-trigger');
+    var executionEl = document.querySelector('#signal-banner .js-signal-execution-score');
     var alertEl = document.querySelector('#signal-banner .js-signal-alert');
     var topLineEl = document.querySelector('#signal-banner .js-signal-topline');
     var depthEl = document.querySelector('#signal-banner .js-signal-depth');
@@ -2109,6 +2284,15 @@
       riskEl.textContent = risk.label;
       riskEl.title = risk.text;
     }
+    if (triggerEl) {
+      triggerEl.textContent = triggerLabel(snap.trigger);
+      triggerEl.style.color = snap.trigger && snap.trigger.status === 'confirmed' ? C.accent2 : C.warn;
+      triggerEl.title = snap.trigger && snap.trigger.reasons ? snap.trigger.reasons.join('；') : '';
+    }
+    if (executionEl) {
+      executionEl.textContent = Math.round(Number(snap.executionScore || 0));
+      executionEl.style.color = snap.executionScore >= 60 ? C.accent2 : C.warn;
+    }
     if (alertEl) {
       var alert = signalAlert(r, snap);
       alertEl.className = 'sb-alert js-signal-alert' + (alert.text ? ' show ' + alert.cls : '');
@@ -2126,7 +2310,11 @@
     return DATA.map(function (r) { return r.symbol; }).sort().join(',');
   }
   function startRealtimePrices() {
-    if (!window.EventSource) return;
+    if (!window.EventSource) {
+      REALTIME_STATE.error = '当前浏览器不支持 EventSource';
+      updateLiveBadge('offline');
+      return;
+    }
     var key = currentSymbolsKey();
     if (key === realtimeKey) return;
     if (realtimeSource) {
@@ -2135,26 +2323,47 @@
     }
     realtimeKey = key;
     if (!key) return;
+    REALTIME_STATE.transportOpen = false;
+    REALTIME_STATE.upstreamConnected = false;
+    REALTIME_STATE.lastPayloadAt = 0;
+    REALTIME_STATE.error = '';
+    updateLiveBadge('connecting');
     realtimeSource = new EventSource('api/realtime-prices?symbols=' + encodeURIComponent(key));
+    realtimeSource.onopen = function () {
+      REALTIME_STATE.transportOpen = true;
+      refreshLiveBadge();
+    };
     realtimeSource.onmessage = function (ev) {
       try {
         var payload = JSON.parse(ev.data || '{}');
+        REALTIME_STATE.transportOpen = true;
+        REALTIME_STATE.upstreamConnected = payload.connected === true;
+        REALTIME_STATE.lastPayloadAt = Date.now();
+        REALTIME_STATE.error = payload.error || '';
         (payload.prices || []).forEach(applyRealtimePrice);
+        refreshLiveBadge();
       } catch (e) {}
     };
     realtimeSource.onerror = function () {
-      updateLiveBadge(false);
+      REALTIME_STATE.transportOpen = false;
+      REALTIME_STATE.upstreamConnected = false;
+      REALTIME_STATE.error = REALTIME_STATE.error || 'SSE 连接中断，正在重连';
+      refreshLiveBadge();
     };
   }
   function applyRealtimePrice(item) {
     if (!item || !item.symbol || item.price == null) return;
     var price = Number(item.price);
     if (!isFinite(price)) return;
-    var ms = Number(item.event_ms || item.received_ms || Date.now());
+    var ms = Number(item.price_event_ms || item.event_ms || item.price_received_ms || item.received_ms || Date.now());
+    var depthMs = Number(item.depth_event_ms || item.depth_received_ms || 0);
     DATA.forEach(function (r) {
       if (r.symbol !== item.symbol) return;
       r.last = price;
       r._price_snapshot_ms = ms;
+      if (depthMs > 0) r._depth_snapshot_ms = depthMs;
+      if (item.source) r._price_source = item.source;
+      if (item.price_kind) r._price_kind = item.price_kind;
       if (item.bid != null) r._price_bid = item.bid;
       if (item.ask != null) r._price_ask = item.ask;
       if (item.depth_imbalance != null) r._depth_imbalance = item.depth_imbalance;
@@ -2166,13 +2375,12 @@
       var el = document.querySelector('#kpi-main .price');
       if (el) {
         el.textContent = fmtPrice(price);
-        el.title = '实时价格';
+        el.title = item.price_kind === 'book_mid' ? 'Binance 合约盘口中间价' : 'Binance 合约实时价格';
       }
       updateRealtimeSignal();
       refreshOpeningGuardSoon();
       renderDepthDom();
       setGen();
-      updateLiveBadge(true);
     }
   }
   function refreshStrategyAnalysis() {
@@ -2196,7 +2404,7 @@
           currentSymbol = DATA.length ? DATA[0].symbol : '';
         }
         LIVE = true;
-        updateLiveBadge(true, payload);
+        refreshLiveBadge();
         recordSignalHistory('自动刷新');
         render();
       })
@@ -2282,7 +2490,7 @@
         // replace existing report for this symbol
         DATA = DATA.map(function (r) { return r.symbol === sym ? arr[0] : r; });
         GEN = payload.generated_at || GEN;
-        updateLiveBadge(true, payload);
+        refreshLiveBadge();
         recordSignalHistory('手动刷新');
         render();
         if (onDone) onDone(null);
@@ -2418,7 +2626,7 @@
           if (!DATA.some(function (r) { return r.symbol === item.symbol; })) DATA.push(item);
         });
         GEN = payload.generated_at || GEN;
-        updateLiveBadge(true, payload);
+        refreshLiveBadge();
         forgetRemovedSym(arr[0].symbol);
         rememberSymbols([arr[0].symbol], true);
         currentSymbol = arr[0].symbol;
@@ -2461,8 +2669,8 @@
     if (bestAdvice) {
       var entryColor = snap.side === 'short' ? C.bear : snap.side === 'long' ? C.bull : C.accent;
       majorHtml += '<div class="sb-act major">方向分<b style="color:' + C.accent + '">' + Math.round(snap.directionScore || 0) + '</b></div>';
-      majorHtml += '<div class="sb-act major">开仓分<b style="color:' + (snap.executionScore >= 60 ? C.accent2 : C.warn) + '">' + Math.round(snap.executionScore || 0) + '</b></div>';
-      majorHtml += '<div class="sb-act major">触发<b style="color:' + (bestAdvice.trigger_check && bestAdvice.trigger_check.status === 'confirmed' ? C.accent2 : C.warn) + '">' + triggerLabel(bestAdvice.trigger_check) + '</b></div>';
+      majorHtml += '<div class="sb-act major">开仓分<b class="js-signal-execution-score" style="color:' + (snap.executionScore >= 60 ? C.accent2 : C.warn) + '">' + Math.round(snap.executionScore || 0) + '</b></div>';
+      majorHtml += '<div class="sb-act major">触发<b class="js-signal-trigger" style="color:' + (snap.trigger && snap.trigger.status === 'confirmed' ? C.accent2 : C.warn) + '" title="' + htmlSafe((snap.trigger && snap.trigger.reasons || []).join('；')) + '">' + triggerLabel(snap.trigger) + '</b></div>';
       majorHtml += '<div class="sb-act major">建议仓位<b class="js-signal-position" title="' + (pos.note || '') + '" style="color:' + pos.color + '">' + pos.text + '</b></div>';
       // 次行辅助:K线/风控/回测/盘口/入场/止损/周期
       var minorHtml = '<div class="sb-act minor">K线<b style="color:' + (bestAdvice.candle_state === '已完成K线' ? C.accent2 : C.warn) + '">' + (bestAdvice.candle_state || '-') + '</b></div>';
@@ -2581,13 +2789,13 @@
         '<span class="chg-v" style="color:' + col + '">' + fmtPct(c.val) + '</span>' +
       '</div>';
     }).join('');
-    // 资金费率大显示 + 倒计时(Binance USD-M 每8h结算:00/08/16 UTC)
+    // 资金费率大显示 + Binance 返回的真实下次结算时间
     var fr = r.funding_rate * 100;
     var frAbs = Math.abs(fr);
     var frCls = frAbs >= 0.1 ? 'danger' : frAbs >= 0.05 ? 'warn' : '';
     var frColor = frAbs >= 0.1 ? C.bear : frAbs >= 0.05 ? C.warn : C.accent2;
     var frPlain = fr > 0.05 ? '多头拥挤，多头付钱给空头' : fr < -0.05 ? '空头拥挤，空头付钱给多头' : '多空均衡，费率正常';
-    var cdMs = fundingCountdownMs();
+    var cdMs = fundingCountdownMs(r);
     var cdText = formatHMS(cdMs);
     host.innerHTML =
       '<div class="kpi-top">' +
@@ -2612,7 +2820,7 @@
         '</div>' +
         '<div class="funding-countdown">' +
           '<div class="fc-next">下次结算</div>' +
-          '<div class="fc-time">' + cdText + '</div>' +
+          '<div class="fc-time" id="funding-countdown">' + cdText + '</div>' +
         '</div>' +
       '</div>' +
       '<div class="conf-wrap">' +
@@ -2639,14 +2847,19 @@
         }]
       });
   }
-  function fundingCountdownMs() {
-    // Binance USD-M 每8h结算:00:00 / 08:00 / 16:00 UTC
+  function fundingCountdownMs(report) {
+    var nowMs = Date.now();
+    var reported = Number(report && report.next_funding_time_ms);
+    if (isFinite(reported) && reported > nowMs && reported - nowMs <= 24 * 60 * 60 * 1000) {
+      return reported - nowMs;
+    }
+    // 兼容旧缓存；新快照应始终使用 Binance nextFundingTime。
     var now = new Date();
     var utcH = now.getUTCHours();
     var nextH = utcH < 8 ? 8 : utcH < 16 ? 16 : 24;
     var target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), nextH, 0, 0));
     if (nextH === 24) target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0));
-    return Math.max(0, target.getTime() - now.getTime());
+    return Math.max(0, target.getTime() - nowMs);
   }
   function formatHMS(ms) {
     var s = Math.floor(ms / 1000);
@@ -3146,6 +3359,7 @@
     renderSignalReview();
     loadSignalReviews(false);
     startRealtimePrices();
+    refreshLiveBadge();
   }
 
   function onResize() { charts.forEach(function (c) { c.resize(); }); }
@@ -3201,7 +3415,7 @@
           if (!DATA.some(function (r) { return r.symbol === item.symbol; })) DATA.push(item);
         });
         GEN = payload.generated_at || GEN;
-        updateLiveBadge(true, payload);
+        refreshLiveBadge();
       })
       .catch(function () { /* keep defaults when custom restore fails */ })
       .then(done);
@@ -3236,12 +3450,12 @@
         applyRemovedSyms();
         GEN = payload.generated_at || GEN;
         LIVE = true;
-        updateLiveBadge(true, payload);
+        refreshLiveBadge();
         // 2. load saved custom symbols from localStorage in one batch
         restoreCustomSymbols(restoreDone);
       })
       .catch(function (err) {
-        updateLiveBadge(false);
+        refreshLiveBadge();
         console.warn('[dashboard] live fetch failed, using static data.js:', err.message);
         applyRemovedSyms();
         restoreCustomSymbols(restoreDone);
@@ -3259,22 +3473,46 @@
     }
   }
 
-  function updateLiveBadge(ok, payload) {
+  function realtimePriceIsFresh(report) {
+    if (!report || !report._price_snapshot_ms) return false;
+    return Math.max(0, Date.now() - Number(report._price_snapshot_ms)) <= 20000;
+  }
+
+  function refreshLiveBadge() {
+    var fresh = realtimePriceIsFresh(cur());
+    if (REALTIME_STATE.transportOpen && REALTIME_STATE.upstreamConnected && fresh) {
+      updateLiveBadge('live');
+    } else if (fresh && REALTIME_STATE.lastPayloadAt) {
+      updateLiveBadge('reconnecting');
+    } else if (REALTIME_STATE.transportOpen) {
+      updateLiveBadge('connecting');
+    } else {
+      updateLiveBadge('offline');
+    }
+  }
+
+  function updateLiveBadge(mode) {
     var dot = document.querySelector('.live .dot');
     var live = document.querySelector('.live');
-    var stale = !!(payload && payload.stale) || MARKET_STATE.stale;
-    if (ok && stale) {
-      if (dot) dot.style.background = 'var(--warn)';
-      if (dot) dot.style.boxShadow = '0 0 12px var(--warn)';
-      if (live) live.lastChild.textContent = ' 延迟';
-    } else if (ok) {
+    if (mode === 'live') {
       if (dot) dot.style.background = 'var(--accent2)';
       if (dot) dot.style.boxShadow = '0 0 12px var(--accent2)';
+      if (dot) dot.style.animation = 'blink 1.4s infinite';
       if (live) live.lastChild.textContent = ' LIVE';
-    } else {
+    } else if (mode === 'reconnecting' || mode === 'connecting') {
       if (dot) dot.style.background = 'var(--warn)';
       if (dot) dot.style.boxShadow = '0 0 12px var(--warn)';
+      if (dot) dot.style.animation = 'blink 1.4s infinite';
+      if (live) live.lastChild.textContent = mode === 'reconnecting' ? ' 重连' : ' 连接中';
+    } else {
+      if (dot) dot.style.background = 'var(--bear)';
+      if (dot) dot.style.boxShadow = '0 0 12px var(--bear)';
+      if (dot) dot.style.animation = 'none';
       if (live) live.lastChild.textContent = ' 离线';
+    }
+    if (live) {
+      live.setAttribute('data-state', mode);
+      live.title = REALTIME_STATE.error || (mode === 'live' ? 'Binance WebSocket 行情正常' : '等待 Binance WebSocket 行情');
     }
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();

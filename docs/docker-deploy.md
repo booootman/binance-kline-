@@ -64,6 +64,7 @@ verify market data after logging in.
 - `BIAN_AUTH_SESSION_TOUCH_INTERVAL_SECONDS`: minimum interval for updating session `last_seen_at`, default `60`, to avoid writing MySQL on every protected request.
 - `BIAN_AUTH_REQUIRE_SAME_ORIGIN_POST`: default `1`; dashboard POST APIs, including login, reject browser requests whose `Origin`/`Referer` host does not match `Host` or a trusted `X-Forwarded-Host`. `X-Forwarded-Host` is trusted only when `BIAN_AUTH_TRUST_PROXY_HEADERS=1` and the peer is a local/private reverse proxy.
 - `BIAN_EXPOSE_ERROR_DETAILS`: default `0`; keep disabled on public deployments so `/api/market` returns only classified user-facing errors instead of analyzer `detail`/`stderr`. Temporarily set to `1` only while debugging server logs and upstream failures.
+- `BIAN_SSE_MAX_SECONDS`: maximum lifetime of one browser SSE response, default `21600` (6 hours). EventSource reconnects automatically; reverse proxies must disable response buffering and allow long-lived reads.
 - `BIAN_SIGNAL_REVIEW_TAKER_FEE_BPS` / `BIAN_SIGNAL_REVIEW_SLIPPAGE_BPS`: one-way fee/slippage assumptions used when live-review outcomes are shown net of estimated round-trip cost; defaults are `5` and `2`.
 - `BIAN_MYSQL_USER`, `BIAN_MYSQL_PASSWORD`, `BIAN_MYSQL_ROOT_PASSWORD`, `BIAN_MYSQL_DATABASE`.
 
