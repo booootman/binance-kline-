@@ -25,10 +25,17 @@ request shape with a positive monotonic revision. Missing or invalid revisions
 return HTTP 400. The server locks the per-user revision row in the same
 transaction as the value updates, so an old client, late request, or
 page-unload beacon cannot bypass the ordering guard and overwrite newer state.
-The browser treats `applied: false` as a revision conflict, advances to the
-server revision, and retries the preserved patch. A temporary HTTP 200 response
-with `saved: false` is also retried with backoff instead of leaving the patch
-queued indefinitely.
+When page unload has both an in-flight patch and a newer pending patch, the
+browser sends one `{ "patches": [...] }` request with strictly increasing
+revisions. The server processes that ordered list under the same revision lock
+and transaction, skips entries already committed by the original request, and
+continues with later entries. A partial batch failure rolls back every entry.
+
+The browser treats `applied: false` as a revision conflict and reconciles the
+rejected patch against current server state. Failed reconciliation reads are
+persisted in user-scoped localStorage and resume after reload. Temporary storage
+failures retry with backoff; non-retryable HTTP errors remain pending without
+creating a zero-delay request loop.
 
 ## Redis
 

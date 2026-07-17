@@ -28,7 +28,7 @@
         "Git ignore rules exclude local tool share packages, Python tool caches, and runtime lock/cache artifacts from accidental review",
         "Restored scripts/smoke.py, scripts/deploy.py, .env.example, and docs/storage.md so verification and deployment documentation reference real files",
         "Frontend offline smoke tests execute the production preference, timestamp, realtime freshness, bias, and symbol-limit functions in a sandboxed browser context",
-        "Frontend smoke coverage includes stale-revision retry, temporary storage retry, upstream-error badge state, and eight-custom-symbol restore after removing defaults"
+        "Frontend smoke coverage includes persisted conflict recovery, non-retryable preference failures, ordered unload batches, temporary storage retry, upstream-error badge state, and eight-custom-symbol restore after removing defaults"
       ],
       "delivery_assets": [
         "docs/architecture.md",
@@ -165,8 +165,8 @@
         "Fresh runtime disk market snapshots are reused within the normal cache TTL after server restart before spawning a new analyzer subprocess",
         "New GET/POST /api/preferences endpoints for browser-to-server preference sync",
         "Preference POSTs require a positive per-user monotonic revision locked in the same MySQL transaction, and late requests with lower revisions are rejected before values are changed",
-        "Browser preference writes are serialized, reconcile rejected patches against current server state, retain and retry failed reconciliation reads, retry only fields unchanged since the request snapshot, and retry temporary saved=false storage responses",
-        "Pagehide replay sends in-flight and pending preference patches separately so the original patch keeps its revision and old fields cannot inherit the pending patch's newer revision",
+        "Browser preference writes are serialized, reconcile rejected patches against current server state, persist failed reconciliation reads across reload, retry only fields unchanged since the request snapshot, back off temporary failures, and stop automatic retries for non-retryable responses",
+        "Pagehide replay sends in-flight and pending preference patches as one ordered batch that is applied under one server revision lock and transaction",
         "Configured MySQL preference outages return HTTP 503, while explicitly unconfigured MySQL disables server sync and remains on browser localStorage without recurring POST retries",
         "Redis read failures become cache misses with a 30-second cooldown, allowing memory, disk, or fresh analysis fallback",
         "MySQL and Redis connection/read/write waits are bounded by documented environment settings, and availability health caches expire after five seconds",
@@ -177,7 +177,7 @@
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py",
         "node --check web/assets/charts.js",
         "powershell -ExecutionPolicy Bypass -File scripts/verify.ps1",
-        "offline fake-connection coverage for preference revision ordering, Redis read degradation, MySQL timeout wiring, and health-cache expiry"
+        "offline fake-connection coverage for preference revision ordering, ordered batch skip/rollback behavior, Redis read degradation, MySQL timeout wiring, and health-cache expiry"
       ],
       "limitations": [
         "MySQL and Redis require optional Python drivers and external services to be installed/configured.",
@@ -299,7 +299,7 @@
         "Dashboard header shows an admin-only diagnostics button with a readable diagnostics modal, realtime sharing counters, signal-review queue/evaluator counters, live-review cost assumptions, and a raw JSON fallback",
         "Login and logout endpoints plus dashboard logout button",
         "Authenticated password change endpoint and dashboard modal",
-        "Password changes verify the current password and atomically commit a fresh PBKDF2-SHA256 hash with invalidation of other sessions for the same user",
+        "Password changes lock the user row before verifying the current password and atomically commit a fresh PBKDF2-SHA256 hash with invalidation of other sessions for the same user",
         "Admin-only user registration endpoint and dashboard modal for creating user or admin accounts",
         "Bootstrap admin creation only when the users table is empty",
         "Basic per-IP login failure lockout",

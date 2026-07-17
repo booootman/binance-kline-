@@ -365,6 +365,65 @@ def test_preference_revision_guard():
     check(fresh == {"saved": True, "applied": True, "revision": 6}, "newer preference revision must apply")
     check(fresh_conn.cursor_obj.executemany_rows, "accepted preference write must upsert values")
 
+    batch_conn = FakePreferenceConnection(5)
+    store._mysql_connect = lambda: batch_conn
+    batch = store.save_preference_batch([
+        {"preferences": {"custom_symbols": ["OLDUSDT"]}, "revision": 4},
+        {"preferences": {"account_risk": {"daily_loss_pct": 2}}, "revision": 6},
+    ])
+    check(batch == {"saved": True, "applied": True, "revision": 6, "applied_count": 1}, "batch must skip stale entries and apply later revisions")
+    batch_keys = [row[1] for row in batch_conn.cursor_obj.executemany_rows]
+    check(batch_keys == ["account_risk"], "stale batch fields must not overwrite storage")
+    check(batch_conn.commits == 1, "ordered preference batch must use one commit")
+
+    fresh_batch_conn = FakePreferenceConnection(0)
+    store._mysql_connect = lambda: fresh_batch_conn
+    fresh_batch = store.save_preference_batch([
+        {"preferences": {"custom_symbols": ["TLMUSDT"]}, "revision": 10},
+        {"preferences": {"account_risk": {"daily_loss_pct": 3}}, "revision": 11},
+    ])
+    check(fresh_batch == {"saved": True, "applied": True, "revision": 11, "applied_count": 2}, "fresh batch must apply every ordered patch")
+    check([row[1] for row in fresh_batch_conn.cursor_obj.executemany_rows] == ["custom_symbols", "account_risk"], "fresh batch must preserve patch order")
+
+    class FailingBatchCursor(FakePreferenceCursor):
+        def __init__(self, revision):
+            super().__init__(revision)
+            self.write_count = 0
+
+        def executemany(self, sql, rows):
+            self.write_count += 1
+            if self.write_count == 2:
+                raise TimeoutError("second batch write failed")
+            super().executemany(sql, rows)
+
+    class FailingBatchConnection(FakePreferenceConnection):
+        def __init__(self, revision):
+            super().__init__(revision)
+            self.cursor_obj = FailingBatchCursor(revision)
+
+    failed_batch_conn = FailingBatchConnection(5)
+    store._mysql_connect = lambda: failed_batch_conn
+    try:
+        store.save_preference_batch([
+            {"preferences": {"custom_symbols": ["TLMUSDT"]}, "revision": 6},
+            {"preferences": {"account_risk": {"daily_loss_pct": 3}}, "revision": 7},
+        ])
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("preference batch failure must abort the transaction")
+    check(failed_batch_conn.commits == 0 and failed_batch_conn.rollbacks == 1, "partial preference batch failure must roll back every patch")
+
+    try:
+        store.save_preference_batch([
+            {"preferences": {"custom_symbols": ["TLMUSDT"]}, "revision": 7},
+            {"preferences": {"account_risk": {"daily_loss_pct": 3}}, "revision": 7},
+        ])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("preference batch must reject non-increasing revisions")
+
     for invalid_revision in (None, 0, -1, True, 1.5):
         try:
             store.save_preferences({"custom_symbols": ["OLDUSDT"]}, revision=invalid_revision)
@@ -384,6 +443,38 @@ def test_preference_revision_guard():
     handler.read_json_body = lambda: {"preferences": {"custom_symbols": ["OLDUSDT"]}, "revision": True}
     handler.save_preferences_api()
     check(response.get("status") == 400, "preference API must reject boolean revisions")
+
+    class BatchPreferenceStorage:
+        def __init__(self):
+            self.patches = None
+
+        def save_preference_batch(self, patches):
+            self.patches = patches
+            return {"saved": True, "applied": True, "revision": patches[-1]["revision"]}
+
+        def status(self):
+            return {"mysql": {"configured": True, "available": True}, "redis": {"configured": False, "available": False}}
+
+    batch_storage = BatchPreferenceStorage()
+    handler.request_storage = lambda: batch_storage
+    handler.read_json_body = lambda: {
+        "patches": [
+            {"preferences": {"account_risk": {"daily_loss_pct": 2}}, "revision": 10},
+            {"preferences": {"tv_kline_interval": "60"}, "revision": 11},
+        ]
+    }
+    handler.save_preferences_api()
+    check(response.get("status") == 200 and response.get("payload", {}).get("revision") == 11, "preference API must accept an ordered unload batch")
+    check(batch_storage.patches and len(batch_storage.patches) == 2, "preference API must preserve the ordered batch")
+
+    handler.read_json_body = lambda: {
+        "patches": [
+            {"preferences": {"account_risk": {"daily_loss_pct": 2}}, "revision": 11},
+            {"preferences": {"tv_kline_interval": "60"}, "revision": 10},
+        ]
+    }
+    handler.save_preferences_api()
+    check(response.get("status") == 400, "preference API must reject decreasing batch revisions")
 
     class UnavailablePreferenceStorage:
         mysql_configured = True
@@ -451,6 +542,7 @@ def test_password_change_revokes_sessions_atomically():
     changed = store.change_auth_password(7, "old-password", "new-password", keep_token="current-token")
     check(changed == (True, ""), "password change and session revoke must succeed together")
     sql = [statement for statement, _params in success_conn.cursor_obj.statements]
+    check(any(statement.startswith("SELECT password_hash") and "FOR UPDATE" in statement for statement in sql), "password verification must lock the user row")
     check(any(statement.startswith("UPDATE bian_auth_users") for statement in sql), "password hash must be updated")
     check(any(statement.startswith("DELETE FROM bian_auth_sessions") for statement in sql), "other sessions must be revoked")
     check(success_conn.commits == 1, "password and session changes must share one commit")

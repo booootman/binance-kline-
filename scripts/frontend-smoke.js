@@ -23,6 +23,8 @@ source = source.slice(0, close) + `
     flushServerPreferences: flushServerPreferences,
     flushPreferencesOnUnload: flushPreferencesOnUnload,
     loadServerPreferences: loadServerPreferences,
+    clearConflictRecoveryMemory: function () { preferenceConflictRecovery = null; },
+    reloadConflictRecoveryMemory: function () { preferenceConflictRecovery = loadPreferenceConflictRecovery(); },
     setData: function (items) { DATA = items || []; },
     getData: function () { return DATA; },
     setCurrentSymbol: function (value) { currentSymbol = value || ''; },
@@ -251,6 +253,14 @@ async function main() {
   fetchResolvers[8].reject(new Error('reconciliation offline'));
   await settle();
   assert(api.preferenceState().conflictRecovery, 'failed reconciliation must retain the rejected patch');
+  const persistedRecovery = Array.from(values.entries()).find(([key]) => key.includes('preference_recovery'));
+  assert(persistedRecovery, 'failed reconciliation must persist recovery state outside runtime memory');
+  api.clearConflictRecoveryMemory();
+  assert.strictEqual(api.preferenceState().conflictRecovery, null, 'test must simulate losing runtime memory');
+  api.reloadConflictRecoveryMemory();
+  assert(api.preferenceState().conflictRecovery, 'persisted recovery state must load after runtime memory is lost');
+  api.flushPreferencesOnUnload();
+  assert.strictEqual(beacons.length, 0, 'unresolved recovery must remain persisted instead of posting a stale patch');
   runTimers();
   assert.strictEqual(fetchCalls.length, 10, 'failed reconciliation must retry with another GET');
   assert.strictEqual(fetchCalls[9].options.method, undefined, 'reconciliation retry must not promote the stale patch');
@@ -266,6 +276,11 @@ async function main() {
   assert.deepStrictEqual(recoveredPatch.preferences.signal_history, [{ symbol: 'DOGEUSDT', bias: 'bull' }], 'recovered conflict must preserve the rejected field');
   fetchResolvers[10].resolve(successfulResponse(fetchCalls[10]));
   await settle();
+  assert.strictEqual(
+    Array.from(values.keys()).some((key) => key.includes('preference_recovery')),
+    false,
+    'successful conflict recovery must clear persisted recovery state'
+  );
 
   api.saveServerPreferences({ position_state: { DOGEUSDT: 'long' } });
   api.flushServerPreferences();
@@ -304,9 +319,11 @@ async function main() {
   const unloadRequest = JSON.parse(fetchCalls[14].options.body);
   api.saveServerPreferences({ tv_kline_interval: '240' });
   api.flushPreferencesOnUnload();
-  assert.strictEqual(beacons.length, 2, 'mixed unload work must use separate beacons');
-  const inFlightBeacon = JSON.parse(await beacons[0].body.text());
-  const pendingBeacon = JSON.parse(await beacons[1].body.text());
+  assert.strictEqual(beacons.length, 1, 'mixed unload work must use one ordered batch beacon');
+  const unloadBatch = JSON.parse(await beacons[0].body.text());
+  assert.strictEqual(unloadBatch.patches.length, 2, 'mixed unload batch must preserve both ordered patches');
+  const inFlightBeacon = unloadBatch.patches[0];
+  const pendingBeacon = unloadBatch.patches[1];
   assert.deepStrictEqual(inFlightBeacon.preferences.account_risk, { daily_loss_pct: 3 }, 'first beacon must carry only the in-flight patch');
   assert.strictEqual(inFlightBeacon.preferences.tv_kline_interval, undefined, 'in-flight beacon must not absorb newer pending fields');
   assert.strictEqual(inFlightBeacon.revision, unloadRequest.revision, 'in-flight unload replay must keep its original revision');
@@ -316,10 +333,24 @@ async function main() {
   fetchResolvers[14].resolve(successfulResponse(fetchCalls[14]));
   await settle();
 
+  api.saveServerPreferences({ position_state: { DOGEUSDT: 'short' } });
+  api.flushServerPreferences();
+  assert.strictEqual(fetchCalls.length, 16, 'non-retryable failure test must start one preference request');
+  fetchResolvers[15].resolve({
+    ok: false,
+    status: 401,
+    json: () => Promise.resolve({ error: 'login required' })
+  });
+  await settle();
+  runTimers();
+  runTimers();
+  assert.strictEqual(fetchCalls.length, 16, 'HTTP 401 must not create zero-delay preference retries');
+  assert.deepStrictEqual(api.preferenceState().pending.position_state, { DOGEUSDT: 'short' }, 'non-retryable failure must retain the local pending patch');
+
   let localFallbackDone = false;
   api.loadServerPreferences(() => { localFallbackDone = true; });
-  assert.strictEqual(fetchCalls.length, 16, 'local fallback test must read storage configuration');
-  fetchResolvers[15].resolve(responsePayload({
+  assert.strictEqual(fetchCalls.length, 17, 'local fallback test must read storage configuration');
+  fetchResolvers[16].resolve(responsePayload({
     preferences: {},
     revision: 0,
     storage: { mysql: { configured: false, available: false } }
@@ -330,7 +361,7 @@ async function main() {
   api.saveServerPreferences({ position_state: { DOGEUSDT: 'short' } });
   api.flushServerPreferences();
   runTimers();
-  assert.strictEqual(fetchCalls.length, 16, 'localStorage fallback must not retry preference POSTs');
+  assert.strictEqual(fetchCalls.length, 17, 'localStorage fallback must not retry preference POSTs');
 
   console.log('frontend smoke ok');
 }

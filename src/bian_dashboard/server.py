@@ -2759,30 +2759,66 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def save_preferences_api(self):
         try:
             body = self.read_json_body()
-            prefs = body.get("preferences") if isinstance(body, dict) else None
-            if not isinstance(prefs, dict):
-                self.send_json(400, {"saved": False, "error": "preferences must be a JSON object"})
+            if not isinstance(body, dict):
+                self.send_json(400, {"saved": False, "error": "request body must be a JSON object"})
                 return
-            revision = body.get("revision") if isinstance(body, dict) else None
-            try:
-                raw_revision = revision
-                if isinstance(raw_revision, bool):
-                    raise ValueError
-                revision = int(revision)
-                if revision <= 0 or (isinstance(raw_revision, float) and raw_revision != revision):
-                    raise ValueError
-            except (TypeError, ValueError):
-                self.send_json(400, {"saved": False, "error": "revision must be a positive integer"})
-                return
-            user_storage = self.request_storage()
-            result = user_storage.save_preferences(prefs, revision=revision) if user_storage is not None else False
+            if "patches" in body:
+                raw_patches = body.get("patches")
+                if not isinstance(raw_patches, list) or not raw_patches or len(raw_patches) > 8:
+                    self.send_json(400, {"saved": False, "error": "patches must contain between 1 and 8 items"})
+                    return
+                patches = []
+                previous_revision = 0
+                for entry in raw_patches:
+                    prefs = entry.get("preferences") if isinstance(entry, dict) else None
+                    raw_revision = entry.get("revision") if isinstance(entry, dict) else None
+                    if not isinstance(prefs, dict) or not prefs:
+                        self.send_json(400, {"saved": False, "error": "each patch must contain preferences"})
+                        return
+                    try:
+                        if isinstance(raw_revision, bool):
+                            raise ValueError
+                        revision = int(raw_revision)
+                        if revision <= 0 or (isinstance(raw_revision, float) and raw_revision != revision):
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        self.send_json(400, {"saved": False, "error": "revision must be a positive integer"})
+                        return
+                    if revision <= previous_revision:
+                        self.send_json(400, {"saved": False, "error": "batch revisions must be strictly increasing"})
+                        return
+                    patches.append({"preferences": prefs, "revision": revision})
+                    previous_revision = revision
+                user_storage = self.request_storage()
+                result = user_storage.save_preference_batch(patches) if user_storage is not None else False
+                response_revision = previous_revision
+            else:
+                prefs = body.get("preferences")
+                if not isinstance(prefs, dict):
+                    self.send_json(400, {"saved": False, "error": "preferences must be a JSON object"})
+                    return
+                raw_revision = body.get("revision")
+                try:
+                    if isinstance(raw_revision, bool):
+                        raise ValueError
+                    revision = int(raw_revision)
+                    if revision <= 0 or (isinstance(raw_revision, float) and raw_revision != revision):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    self.send_json(400, {"saved": False, "error": "revision must be a positive integer"})
+                    return
+                user_storage = self.request_storage()
+                result = user_storage.save_preferences(prefs, revision=revision) if user_storage is not None else False
+                response_revision = revision
             saved = bool(result.get("saved")) if isinstance(result, dict) else bool(result)
             self.send_json(200, {
                 "saved": saved,
                 "applied": bool(result.get("applied", saved)) if isinstance(result, dict) else saved,
-                "revision": int(result.get("revision") or revision or 0) if isinstance(result, dict) else int(revision or 0),
-                "storage": storage.status() if storage is not None else {"mysql": {"configured": False}, "redis": {"configured": False}},
+                "revision": int(result.get("revision") or response_revision or 0) if isinstance(result, dict) else int(response_revision or 0),
+                "storage": user_storage.status() if user_storage is not None else {"mysql": {"configured": False}, "redis": {"configured": False}},
             })
+        except ValueError as exc:
+            self.send_json(400, {"saved": False, "error": str(exc)})
         except BadRequestError as exc:
             self.send_json(400, {"saved": False, "error": str(exc)})
         except Exception as exc:

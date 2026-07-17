@@ -40,7 +40,8 @@
     signalAlert: 'bian_dashboard_signal_alert_pref',
     customSymbols: 'bian_dashboard_custom_syms',
     removedSymbols: 'bian_dashboard_removed_syms',
-    preferenceRevision: 'bian_dashboard_preference_revision'
+    preferenceRevision: 'bian_dashboard_preference_revision',
+    preferenceRecovery: 'bian_dashboard_preference_recovery'
   };
   var SIGNAL_HISTORY_KEY = STORAGE_KEYS.signalHistory;
   var SYMBOL_HISTORY_KEY = STORAGE_KEYS.symbolHistory;
@@ -51,6 +52,7 @@
   var LS_KEY = STORAGE_KEYS.customSymbols;
   var REMOVED_KEY = STORAGE_KEYS.removedSymbols;
   var PREFERENCE_REVISION_KEY = STORAGE_KEYS.preferenceRevision;
+  var PREFERENCE_RECOVERY_KEY = STORAGE_KEYS.preferenceRecovery;
   var tvKlineInterval = loadTvKlineInterval();
   var tvKlineKey = '';
   var signalAlertPref = loadSignalAlertPref();
@@ -106,6 +108,8 @@
     LS_KEY = scoped(STORAGE_KEYS.customSymbols);
     REMOVED_KEY = scoped(STORAGE_KEYS.removedSymbols);
     PREFERENCE_REVISION_KEY = scoped(STORAGE_KEYS.preferenceRevision);
+    PREFERENCE_RECOVERY_KEY = scoped(STORAGE_KEYS.preferenceRecovery);
+    preferenceConflictRecovery = loadPreferenceConflictRecovery();
     tvKlineInterval = loadTvKlineInterval();
     signalAlertPref = loadSignalAlertPref();
   }
@@ -286,6 +290,28 @@
   function clonePreferencePatch(patch) {
     try { return JSON.parse(JSON.stringify(patch || {})); } catch (e) { return {}; }
   }
+  function normalizePreferenceConflictRecovery(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    var patch = clonePreferencePatch(value.patch);
+    if (!Object.keys(patch).length) return null;
+    return { patch: patch, baseSnapshot: clonePreferencePatch(value.baseSnapshot) };
+  }
+  function loadPreferenceConflictRecovery() {
+    try {
+      return normalizePreferenceConflictRecovery(JSON.parse(localStorage.getItem(PREFERENCE_RECOVERY_KEY) || 'null'));
+    } catch (e) {
+      return null;
+    }
+  }
+  function rememberPreferenceConflictRecovery(value) {
+    var normalized = normalizePreferenceConflictRecovery(value);
+    preferenceConflictRecovery = normalized;
+    try {
+      if (normalized) localStorage.setItem(PREFERENCE_RECOVERY_KEY, JSON.stringify(normalized));
+      else localStorage.removeItem(PREFERENCE_RECOVERY_KEY);
+    } catch (e) {}
+    return normalized;
+  }
   function preferenceValueEqual(leftExists, left, rightExists, right) {
     if (leftExists !== rightExists) return false;
     if (!leftExists) return true;
@@ -335,17 +361,17 @@
         mergePreferencePatch(pendingPreferencePatch, retryPatch, false);
       });
   }
-  function completePreferenceSave(retryableFailure) {
+  function completePreferenceSave(saveFailed, retryableFailure) {
     preferenceSaveInFlight = false;
     preferenceInFlightPatch = {};
     preferenceInFlightRevision = 0;
     if (!preferenceServerSyncEnabled) {
       pendingPreferencePatch = {};
-      preferenceConflictRecovery = null;
+      rememberPreferenceConflictRecovery(null);
       return;
     }
     var hasPendingWork = !!preferenceConflictRecovery || Object.keys(pendingPreferencePatch).length > 0;
-    if (hasPendingWork && !preferenceSaveTimer) {
+    if (hasPendingWork && !preferenceSaveTimer && (!saveFailed || retryableFailure)) {
       preferenceSaveTimer = setTimeout(flushServerPreferences, retryableFailure ? preferenceRetryDelayMs : 0);
       if (retryableFailure) preferenceRetryDelayMs = Math.min(60000, preferenceRetryDelayMs * 2);
     }
@@ -357,12 +383,12 @@
     preferenceInFlightPatch = {};
     preferenceInFlightRevision = 0;
     reconcilePreferenceConflict(recovery.patch, recovery.baseSnapshot).then(function () {
-      preferenceConflictRecovery = null;
+      rememberPreferenceConflictRecovery(null);
       preferenceRetryDelayMs = 5000;
-      completePreferenceSave(false);
+      completePreferenceSave(false, false);
     }).catch(function (err) {
       console.warn('[dashboard] preference conflict reconciliation failed:', err.message);
-      completePreferenceSave(true);
+      completePreferenceSave(true, true);
     });
     return true;
   }
@@ -378,7 +404,7 @@
     preferenceSaveTimer = null;
     if (!preferenceServerSyncEnabled) {
       pendingPreferencePatch = {};
-      preferenceConflictRecovery = null;
+      rememberPreferenceConflictRecovery(null);
       return;
     }
     if (preferenceSaveInFlight) return;
@@ -428,10 +454,10 @@
           saveFailed = false;
           preferenceRetryDelayMs = 5000;
         }).catch(function (reconcileError) {
-          preferenceConflictRecovery = {
+          rememberPreferenceConflictRecovery({
             patch: clonePreferencePatch(prefs),
             baseSnapshot: clonePreferencePatch(baseSnapshot)
-          };
+          });
           retryableFailure = true;
           console.warn('[dashboard] preference conflict reconciliation failed:', reconcileError.message);
         });
@@ -441,12 +467,15 @@
       retryableFailure = !status || status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
       console.warn('[dashboard] preference sync failed:', err.message);
     }).then(function () {
-      completePreferenceSave(retryableFailure && saveFailed);
+      completePreferenceSave(saveFailed, retryableFailure);
     });
   }
-  function sendPreferencePatchOnUnload(prefs, revision) {
-    if (!prefs || !Object.keys(prefs).length || !revision) return;
-    var body = JSON.stringify({ preferences: prefs, revision: revision });
+  function sendPreferencePatchesOnUnload(patches) {
+    patches = (patches || []).filter(function (entry) {
+      return entry && entry.preferences && Object.keys(entry.preferences).length && entry.revision;
+    });
+    if (!patches.length) return;
+    var body = JSON.stringify(patches.length === 1 ? patches[0] : { patches: patches });
     var sent = false;
     if (navigator.sendBeacon && typeof Blob !== 'undefined') {
       sent = navigator.sendBeacon('api/preferences', new Blob([body], { type: 'application/json' }));
@@ -464,10 +493,14 @@
   function flushPreferencesOnUnload() {
     if (preferencesUnloadFlushed || !preferenceServerSyncEnabled) return;
     preferencesUnloadFlushed = true;
-    sendPreferencePatchOnUnload(preferenceInFlightPatch, preferenceInFlightRevision);
-    if (Object.keys(pendingPreferencePatch).length) {
-      sendPreferencePatchOnUnload(pendingPreferencePatch, nextPreferenceRevision());
+    var patches = [];
+    if (Object.keys(preferenceInFlightPatch).length && preferenceInFlightRevision) {
+      patches.push({ preferences: clonePreferencePatch(preferenceInFlightPatch), revision: preferenceInFlightRevision });
     }
+    if (Object.keys(pendingPreferencePatch).length) {
+      patches.push({ preferences: clonePreferencePatch(pendingPreferencePatch), revision: nextPreferenceRevision() });
+    }
+    sendPreferencePatchesOnUnload(patches);
   }
   function normalizeServerSymbolPreferences(prefs) {
     prefs = prefs && typeof prefs === 'object' ? prefs : {};
@@ -523,18 +556,28 @@
       .then(function (payload) {
         if (!preferenceStorageConfigured(payload)) {
           preferenceServerSyncEnabled = false;
+          rememberPreferenceConflictRecovery(null);
           return;
         }
         if (!preferenceStorageReady(payload)) throw new Error('preference storage is unavailable');
         var serverRevision = Math.max(0, Number(payload.revision) || 0);
         var serverPrefs = payload.preferences || {};
+        var applyPatch = clonePreferencePatch(serverPrefs);
+        if (preferenceConflictRecovery) {
+          Object.keys(preferenceConflictRecovery.patch).forEach(function (key) { delete applyPatch[key]; });
+        }
         updatePreferenceServerState(serverPrefs, serverRevision, true);
-        applyServerPreferences(serverPrefs);
+        applyServerPreferences(applyPatch);
       })
       .catch(function (err) {
         console.warn('[dashboard] preference load failed, using browser localStorage:', err.message);
       })
-      .then(done);
+      .then(function () {
+        if (preferenceConflictRecovery && preferenceServerSyncEnabled && !preferenceSaveTimer) {
+          preferenceSaveTimer = setTimeout(flushServerPreferences, 0);
+        }
+        if (typeof done === 'function') done();
+      });
   }
   function tvIntervalLabel(v) {
     return v === '60' ? '1h' : v === '240' ? '4h' : v === 'D' ? '1D' : v + 'm';

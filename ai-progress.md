@@ -1594,3 +1594,20 @@
 - Passed Python compilation, frontend syntax, `feature_list.json` parsing, and `git diff --check` apart from existing LF-to-CRLF warnings.
 - GitNexus detected 57 changed symbols and 11 affected processes for this patch, with `high` overall impact because preference readiness participates in boot and conflict flows.
 - Real MySQL transaction failure injection, two-session browser ordering, and pagehide network delivery remain deployment-environment checks.
+
+## 2026-07-17 Review findings remediation
+
+- Stopped automatic preference retries after non-retryable HTTP failures while retaining the pending local patch for a later explicit change or session recovery.
+- Persisted conflict-recovery patches and base snapshots in user-scoped localStorage, restored them during boot, and prevented unresolved server fields from overwriting those local values before reconciliation.
+- Replaced separate mixed pagehide beacons with one ordered preference batch. The API validates strictly increasing revisions and MySQL skips stale entries while applying later entries under one revision lock and transaction.
+- Added `FOR UPDATE` to password verification so concurrent password changes serialize before accepting the old password.
+
+## Review findings remediation verification
+
+- Passed `python -B scripts\smoke.py`, including ordered batch skip, batch rollback, API validation, and password row-lock assertions.
+- Passed `node scripts\frontend-smoke.js`, including persisted recovery reload, one-beacon unload batching, and repeated-timer checks after HTTP 401.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok`, `frontend smoke ok`, and `verify ok`.
+- Passed frontend syntax, Python compilation, `feature_list.json` parsing, and `git diff --check` apart from line-ending warnings.
+- GitNexus classified the uncommitted impact as `critical` across 41 execution flows because shared preference save behavior participates in dashboard boot and multiple controls.
+- Restarted one local development backend on `127.0.0.1:8876` with authentication disabled for the unconfigured-MySQL fallback; health and dashboard assets returned HTTP 200 with the new batch and recovery code.
+- Real MySQL concurrency, browser pagehide delivery, and deployed multi-session ordering remain release-environment checks.

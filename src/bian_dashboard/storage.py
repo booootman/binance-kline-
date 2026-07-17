@@ -313,6 +313,98 @@ class DashboardStorage:
         finally:
             conn.close()
 
+    def save_preference_batch(self, patches):
+        if not isinstance(patches, list) or not patches:
+            raise ValueError("preference patches must be a non-empty list")
+        normalized = []
+        previous_revision = 0
+        for entry in patches:
+            prefs = entry.get("preferences") if isinstance(entry, dict) else None
+            raw_revision = entry.get("revision") if isinstance(entry, dict) else None
+            if not isinstance(prefs, dict) or not prefs:
+                raise ValueError("each preference patch must contain preferences")
+            try:
+                if isinstance(raw_revision, bool):
+                    raise ValueError
+                revision = int(raw_revision)
+                if revision <= 0 or (isinstance(raw_revision, float) and raw_revision != revision):
+                    raise ValueError
+            except (TypeError, ValueError) as exc:
+                raise ValueError("preference revision must be a positive integer") from exc
+            if revision <= previous_revision:
+                raise ValueError("preference batch revisions must be strictly increasing")
+            rows = [
+                (self.user_id, str(key), json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+                for key, value in prefs.items()
+                if str(key) != PREFERENCE_REVISION_KEY
+            ]
+            if not rows:
+                raise ValueError("each preference patch must contain writable preferences")
+            normalized.append((revision, rows))
+            previous_revision = revision
+        if not self.mysql_available():
+            return False
+        conn = self._mysql_connect()
+        try:
+            self._ensure_mysql_schema(conn)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT IGNORE INTO bian_dashboard_kv (user_id, item_key, value_json)
+                VALUES (%s, %s, '0')
+                """,
+                (self.user_id, PREFERENCE_REVISION_KEY),
+            )
+            cur.execute(
+                """
+                SELECT value_json
+                FROM bian_dashboard_kv
+                WHERE user_id=%s AND item_key=%s
+                FOR UPDATE
+                """,
+                (self.user_id, PREFERENCE_REVISION_KEY),
+            )
+            row = cur.fetchone()
+            try:
+                current_revision = max(0, int(json.loads(row[0] if row else "0")))
+            except Exception:
+                current_revision = 0
+            applied_count = 0
+            for revision, rows in normalized:
+                if revision <= current_revision:
+                    continue
+                cur.executemany(
+                    """
+                    INSERT INTO bian_dashboard_kv (user_id, item_key, value_json)
+                    VALUES (%s, %s, %s)
+                    ON DUPLICATE KEY UPDATE value_json=VALUES(value_json), updated_at=CURRENT_TIMESTAMP
+                    """,
+                    rows,
+                )
+                current_revision = revision
+                applied_count += 1
+            if applied_count:
+                cur.execute(
+                    """
+                    UPDATE bian_dashboard_kv
+                    SET value_json=%s, updated_at=CURRENT_TIMESTAMP
+                    WHERE user_id=%s AND item_key=%s
+                    """,
+                    (json.dumps(current_revision), self.user_id, PREFERENCE_REVISION_KEY),
+                )
+            conn.commit()
+            return {
+                "saved": True,
+                "applied": applied_count > 0,
+                "revision": current_revision,
+                "applied_count": applied_count,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def save_strategy_snapshot(self, symbols, payload):
         if not self.mysql_available():
             return False
@@ -640,6 +732,7 @@ class DashboardStorage:
                 FROM bian_auth_users
                 WHERE id=%s
                 LIMIT 1
+                FOR UPDATE
                 """,
                 (int(user_id),),
             )

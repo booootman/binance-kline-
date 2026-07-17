@@ -89,3 +89,10 @@ This pass tightens the P0 trust issues from `docs/improvement-suggestions.md`: h
 - Page unload sends the active in-flight patch and newer pending patch separately, preserving the old revision and preventing old fields from inheriting a newer revision.
 - Password hash update and other-session revocation now share one MySQL transaction; session-revocation failure rolls back the password change.
 - Human release review should still validate two real authenticated sessions, forced MySQL failure during password change, and browser pagehide delivery ordering.
+
+## 2026-07-17 Review Follow-up
+
+- Non-retryable preference responses no longer schedule zero-delay retries; retryable storage and network failures retain exponential backoff.
+- Conflict recovery patches and base snapshots are persisted per user and restored before server preferences can overwrite unresolved local fields.
+- Mixed pagehide work now uses one ordered batch request. The storage layer processes the batch under one revision row lock and transaction, so request arrival order cannot discard the in-flight patch.
+- Password verification uses `SELECT ... FOR UPDATE`, serializing concurrent changes before the old password is accepted.
