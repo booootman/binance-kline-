@@ -72,6 +72,7 @@
   var authRetryTimer = null;
   var authRetryDelayMs = 1000;
   var API_REQUEST_TIMEOUT_MS = 15000;
+  var MARKET_REQUEST_TIMEOUT_MS = 135000;
   var authRedirectStarted = false;
   var activeRequestControllers = [];
   var root = getComputedStyle(document.documentElement);
@@ -161,25 +162,18 @@
     }
     var timedOut = false;
     var timeoutId = null;
-    var timeoutPromise = new Promise(function (_resolve, reject) {
-      timeoutId = setTimeout(function () {
-        timedOut = true;
-        if (controller) controller.abort();
-        var error = new Error('请求超时');
-        error.name = 'TimeoutError';
-        error.code = 'REQUEST_TIMEOUT';
-        error.status = 408;
-        error.timeout = true;
-        reject(error);
-      }, timeoutMs);
-    });
-    var requestPromise;
-    try {
-      requestPromise = fetch(url, requestOptions);
-    } catch (error) {
-      requestPromise = Promise.reject(error);
+    var cleanedUp = false;
+    function createTimeoutError() {
+      var error = new Error('请求超时');
+      error.name = 'TimeoutError';
+      error.code = 'REQUEST_TIMEOUT';
+      error.status = 408;
+      error.timeout = true;
+      return error;
     }
     function cleanupRequest() {
+      if (cleanedUp) return;
+      cleanedUp = true;
       if (timeoutId !== null) clearTimeout(timeoutId);
       if (controller) {
         var index = activeRequestControllers.indexOf(controller);
@@ -189,26 +183,59 @@
         externalSignal.removeEventListener('abort', externalAbortHandler);
       }
     }
+    function normalizeRequestError(error) {
+      if (timedOut && !(error && error.timeout)) return createTimeoutError();
+      return error;
+    }
+    var timeoutPromise = new Promise(function (_resolve, reject) {
+      timeoutId = setTimeout(function () {
+        timedOut = true;
+        if (controller) controller.abort();
+        cleanupRequest();
+        reject(createTimeoutError());
+      }, timeoutMs);
+    });
+    var requestPromise;
+    try {
+      requestPromise = fetch(url, requestOptions);
+    } catch (error) {
+      requestPromise = Promise.reject(error);
+    }
     return Promise.race([requestPromise, timeoutPromise]).then(function (response) {
-      cleanupRequest();
-      if (response && response.status === 401) redirectToLogin();
+      if (response && response.status === 401) {
+        cleanupRequest();
+        redirectToLogin();
+      }
       if (authRedirectStarted && (!response || response.status !== 401)) {
         var error = new Error('登录已失效');
         error.status = 401;
+        cleanupRequest();
         throw error;
       }
+      if (!response || typeof response.json !== 'function') {
+        cleanupRequest();
+        return response;
+      }
+      var readJson = response.json;
+      response.json = function () {
+        var bodyPromise;
+        try {
+          bodyPromise = readJson.call(response);
+        } catch (error) {
+          bodyPromise = Promise.reject(error);
+        }
+        return Promise.race([bodyPromise, timeoutPromise]).then(function (payload) {
+          cleanupRequest();
+          return payload;
+        }, function (error) {
+          cleanupRequest();
+          throw normalizeRequestError(error);
+        });
+      };
       return response;
     }, function (error) {
       cleanupRequest();
-      if (timedOut && !(error && error.timeout)) {
-        var timeoutError = new Error('请求超时');
-        timeoutError.name = 'TimeoutError';
-        timeoutError.code = 'REQUEST_TIMEOUT';
-        timeoutError.status = 408;
-        timeoutError.timeout = true;
-        throw timeoutError;
-      }
-      throw error;
+      throw normalizeRequestError(error);
     });
   }
 
@@ -789,6 +816,7 @@
     btn._bound = true;
     btn.addEventListener('click', function () {
       apiFetch('api/logout', { method: 'POST', cache: 'no-store' })
+        .then(function (res) { return res.json().catch(function () { return {}; }); })
         .catch(function () {})
         .then(function () { window.location.href = '/login'; });
     });
@@ -1160,10 +1188,13 @@
         return res.json();
       })
       .then(function (payload) {
-        var user = payload && payload.authenticated ? payload.user : null;
-        var localIdentity = user && String(user.id) === '0' && String(user.username || '').toLowerCase() === 'local';
-        var explicitLocalMode = payload && payload.auth_enabled === false;
-        if (!user || (explicitLocalMode && !localIdentity)) throw new Error('authentication state is ambiguous');
+        var authFlag = payload && payload.auth_enabled;
+        if (authFlag !== true && authFlag !== false) throw new Error('authentication state is ambiguous');
+        var user = payload.authenticated === true ? payload.user : null;
+        var localIdentity = authFlag === false && user && user.id === 0 && user.username === 'local' && user.role === 'admin';
+        var databaseIdentity = authFlag === true && user && typeof user.id === 'number' &&
+          isFinite(user.id) && Math.floor(user.id) === user.id && user.id > 0;
+        if (!localIdentity && !databaseIdentity) throw new Error('authentication state is ambiguous');
         CURRENT_USER = user;
         preferenceServerSyncEnabled = true;
         updateAdminControls();
@@ -2830,7 +2861,7 @@
     strategyRefreshBusy = true;
     nextStrategyRefreshAt = Date.now();
     setGen();
-    apiFetch('api/market?symbols=' + encodeURIComponent(symbols), { cache: 'no-store' })
+    apiFetch('api/market?symbols=' + encodeURIComponent(symbols), { cache: 'no-store', timeoutMs: MARKET_REQUEST_TIMEOUT_MS })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         applyMarketPayloadState(payload);
@@ -2922,7 +2953,7 @@
 
   // refresh a single symbol's data in-place
   function refreshSymbol(sym, onDone) {
-    apiFetch('api/market?symbol=' + encodeURIComponent(sym), { cache: 'no-store' })
+    apiFetch('api/market?symbol=' + encodeURIComponent(sym), { cache: 'no-store', timeoutMs: MARKET_REQUEST_TIMEOUT_MS })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         applyMarketPayloadState(payload);
@@ -3066,7 +3097,7 @@
     if (btn2) btn2.disabled = true;
     setAddStatus('正在获取 ' + raw + ' 实时数据…', '');
     showLoading('正在获取 ' + raw + ' …');
-    apiFetch('api/market?symbol=' + encodeURIComponent(raw), { cache: 'no-store' })
+    apiFetch('api/market?symbol=' + encodeURIComponent(raw), { cache: 'no-store', timeoutMs: MARKET_REQUEST_TIMEOUT_MS })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         applyMarketPayloadState(payload);
@@ -3872,7 +3903,7 @@
     if (!custom.length) { done(); return; }
     rememberSymbols(custom, true);
     showLoading('正在恢复 ' + custom.length + ' 个自定义币种…');
-    apiFetch('api/market?symbols=' + encodeURIComponent(custom.join(',')), { cache: 'no-store' })
+    apiFetch('api/market?symbols=' + encodeURIComponent(custom.join(',')), { cache: 'no-store', timeoutMs: MARKET_REQUEST_TIMEOUT_MS })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         applyMarketPayloadState(payload);
@@ -3925,7 +3956,7 @@
     function startMarketBoot() {
       seedSymbolHistoryFromLocal();
       // 1. load default symbols
-    apiFetch('api/market', { cache: 'no-store' })
+    apiFetch('api/market', { cache: 'no-store', timeoutMs: MARKET_REQUEST_TIMEOUT_MS })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         applyMarketPayloadState(payload);

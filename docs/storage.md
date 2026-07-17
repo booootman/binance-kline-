@@ -44,7 +44,18 @@ reconciled before later MySQL saves, reads, due scans, or updates. Reconciliatio
 uses `(storage_user_id, signal_key)`, merges completed horizons without
 downgrading an `evaluated` record, performs an idempotent upsert, commits, and
 only then removes the migrated file rows. A failed MySQL transaction leaves the
-file intact for the next attempt.
+file intact for the next attempt. Background all-user due scans inspect every
+retained user scope before sorting and applying the global work limit, so one
+user's newer file rows cannot hide another user's due records.
+
+Logout writes the SHA-256 session-token hash to
+`runtime/auth_session_revocations.json` before attempting the MySQL delete. The
+file is atomically replaced with mode `0600` and lives on the Compose runtime
+volume. Tombstoned tokens fail authentication during a database outage; after
+MySQL recovers, the next session lookup deletes the matching database sessions
+and removes only the committed tombstones. If the tombstone cannot be persisted,
+logout still expires the browser cookie but returns HTTP 503 instead of claiming
+that server-side revocation succeeded.
 
 ## Redis
 

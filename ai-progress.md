@@ -1661,3 +1661,24 @@
 - GitNexus change detection reports critical impact across 59 flows because the shared frontend request layer participates in dashboard boot, preferences, refresh, diagnostics, reviews, and symbol management.
 - Restarted the single local auth-disabled backend on `127.0.0.1:8876` as PID `10072`; `/api/health` returned HTTP 200 and the port had exactly one listener.
 - Full deploy dry-run was skipped after the sandbox could not read the user's global Git ignore and the external approval service returned 404. The offline deployment contract test passed; real HTTPS proxy/certificate, remote `.env` mode, MySQL reconciliation, and browser EventSource/session-expiry behavior remain release checks.
+
+## 2026-07-17 Release identity, request lifecycle, and durable logout remediation
+
+- Added a unique per-attempt deployment release id derived from the archive and a cryptographic nonce. Loopback and public health checks require the exact id, the initiating client rejects cross-origin redirects, and rollback assets are cleaned only by a second SSH step after external verification.
+- Rejected literal loopback/private/non-global public deployment addresses and hardened current, previous, and staged remote `.env` files to mode `0600`.
+- Kept frontend request timeouts active through `response.json()`. Market analysis uses a 135-second budget while other APIs retain 15 seconds.
+- Required a Boolean `auth_enabled`; auth-disabled mode accepts only the exact numeric id-0 local admin, while auth-enabled mode requires a positive database user id.
+- Removed the global pre-limit from all-user file-fallback due scans, so every retained user scope is sorted before the background work limit is applied.
+- Added durable runtime session-revocation tombstones. Logout persists the token hash before MySQL deletion, rejects tombstoned tokens during outages, reconciles them after recovery, and returns HTTP 503 without retaining the browser cookie if persistence fails.
+- Updated `.env.example`, Compose wiring, deployment/storage docs, regression cases, risk/release evidence, and `feature_list.json`.
+
+## Release identity and durable logout verification
+
+- Passed `python -B scripts\smoke.py`, including unique/mismatched release health, two-phase cleanup, old `.env` hardening, all-user fairness, and MySQL-outage logout reconciliation.
+- Passed `node scripts\frontend-smoke.js`, including stalled JSON-body timeout, 135-second market budget, and missing/null/string authentication contract cases.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok`, `frontend smoke ok`, and `verify ok`.
+- Passed Python/Node syntax, `feature_list.json` parsing, and `git diff --check` apart from repository LF-to-CRLF warnings.
+- GitNexus change detection mapped 103 changed symbols to 52 flows and classified the L3 auth/request/deployment change as `critical`; its index remains stale at commit `877b3df`, so current source and tests are authoritative.
+- Restarted the single local auth-disabled backend on `127.0.0.1:8876` as PID `16748`; exactly one listener remained, health and strict id-0 auth identity passed, stale-cookie logout returned durable local success without changing the revocation file, and the served frontend contained the body-timeout and market-budget markers.
+- In-app browser automation was rejected by browser security policy for the local address, so DOM/render/console verification was not bypassed.
+- Real Bash/Docker remote execution, public HTTPS/proxy routing, process-crash durability, and real MySQL outage/recovery still require deployment-environment verification before release approval.

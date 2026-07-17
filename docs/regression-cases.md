@@ -53,16 +53,16 @@
 51. Confirm older bookTicker/depth exchange timestamps cannot roll back price, bid/ask, depth, or freshness, while a newer depth event can advance independently.
 52. Confirm a realtime execution-score drop from 75 to 67 caps a 30% backend position at 22%, and a score below 45 produces 0%.
 53. Confirm two concurrent add-symbol actions reserve capacity and a late response rechecks the eight-symbol limit before mutating dashboard data.
-54. Confirm unavailable or ambiguous `/api/auth/me` stops boot and preference sync, while only `auth_enabled=false` selects local user scope.
+54. Confirm unavailable or ambiguous `/api/auth/me` stops boot and preference sync; missing/null/string `auth_enabled` values fail closed, auth-disabled mode requires the exact numeric id-0 local admin, and auth-enabled mode requires a positive database user id.
 55. Confirm a partial record with only 5m complete stays pending, is not due at 10m, and becomes due for its missing 15m result after 15m.
 56. Confirm file-fallback signal reviews are merged into MySQL by user/key after recovery and removed from the file only after successful upsert.
 57. Confirm slow request bodies time out, active HTTP handlers cannot exceed the configured slots, and excess SSE clients receive HTTP 503.
 58. Confirm Compose binds `127.0.0.1:8000` by default, remote deploy forces loopback plus Secure cookies, and the public HTTPS proxy can reconnect EventSource after the five-minute SSE rotation.
-59. Confirm production deploy rejects a missing/non-HTTPS `--public-url`, validates public HTTPS before cleanup, and writes remote `.env` mode `0600` after all edits.
+59. Confirm production deploy rejects a missing/non-HTTPS/local-address `--public-url`, verifies one unique release id through loopback and from the initiating client, preserves rollback assets until that external check passes, and writes existing/previous/new remote `.env` files as `0600`.
 60. Confirm an auth-enabled database user whose username is exactly `local` keeps its real user id, while auth-disabled mode requires the explicit id-0 local identity.
 61. Confirm both boot-time and post-boot API 401 responses stop preference sync/timers/SSE, clear the current user, and issue only one login redirect per expiration.
-62. Confirm a never-settling add-symbol request is aborted at the frontend timeout and always releases its pending symbol reservation.
+62. Confirm a response that returns headers but never settles `response.json()` is aborted at 15 seconds, while every `/api/market` call receives the 135-second analysis budget and still releases pending UI state on timeout.
 63. Confirm strategy refresh retains a newer SSE `last` with matching source metadata, ignores a duplicate SSE event, and lets a later REST observation replace older realtime metadata.
-64. Confirm logout still returns HTTP 200 and expires the cookie when database session deletion raises.
-65. Confirm signal-review file retention keeps the newest configured limit independently for two users and reconciliation removes only committed user scopes.
+64. Confirm logout writes a durable token-hash tombstone before database deletion, returns HTTP 200 during a MySQL outage when that write succeeds, rejects the token after restart/recovery, and returns HTTP 503 while still expiring the cookie when persistence fails.
+65. Confirm signal-review file retention keeps the newest configured limit independently for two users, all-user due scans sort every retained scope before the global work limit, and reconciliation removes only committed user scopes.
 66. Confirm invalid snapshot text preserves explicit fallbacks `0` and `-1`, while `None` alone uses current time.

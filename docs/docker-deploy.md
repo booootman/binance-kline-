@@ -61,9 +61,13 @@ dashboard upstream port.
 `--check-market` only curls `/api/market` when auth is disabled; with auth enabled,
 verify market data after logging in.
 `--public-url` must be an HTTPS origin without a path, query, credentials, or
-fragment. Deployment fails unless its public `/api/health` succeeds after the
-loopback check. `--allow-no-public-url` is an explicit local-development
-override and must not be used for an authenticated production release.
+fragment; literal loopback, private, and non-global IP addresses are rejected.
+Each invocation generates a unique release id from the archive digest and a
+cryptographic nonce. Both loopback and public `/api/health` must return that id,
+and the deployment initiator verifies the public origin without accepting a
+redirect to a different origin. `--allow-no-public-url` is an explicit
+local-development override and must not be used for an authenticated production
+release.
 
 The default deployment refuses modified or untracked files. `--allow-dirty` is
 an explicit development override that includes modified tracked files and
@@ -76,12 +80,14 @@ enabled. If Git reports that an ignore source cannot be read, packaging fails
 closed instead of treating globally ignored files as upload candidates.
 
 The remote archive is extracted into a temporary release directory. The
-previous application directory remains as `/opt/bian-dashboard.previous` until
-the new Compose stack passes `/api/health`, and the uploaded archive is deleted
-only after success so a failed SSH deployment step can reuse it. `--public-port`
-updates `BIAN_PUBLIC_PORT` in the preserved remote `.env`, so later manual
-Compose restarts keep the selected port. After all generated or preserved
-secrets are updated, the script forces the remote `.env` to mode `0600`.
+previous application directory remains as `/opt/bian-dashboard.previous` and
+the uploaded archive remains available until the initiating machine verifies
+the exact release through public HTTPS. Cleanup then runs as a separate SSH
+step, so a failed or misrouted public check preserves rollback assets.
+`--public-port` and the generated `BIAN_RELEASE_ID` are persisted in the remote
+`.env`, so later manual Compose restarts keep the selected port and release
+identity. Existing, previous, and newly generated secret files are all forced
+to mode `0600`.
 
 ## Environment
 
@@ -92,6 +98,7 @@ secrets are updated, the script forces the remote `.env` to mode `0600`.
 - `BIAN_AUTH_ENABLED`: enable server-side login gate, default `1`.
 - `BIAN_AUTH_BOOTSTRAP_USER` / `BIAN_AUTH_BOOTSTRAP_PASSWORD`: only used when the MySQL users table is empty, to create the first admin account. Accounts and sessions are stored in MySQL after that. Do not leave `BIAN_AUTH_BOOTSTRAP_PASSWORD` blank on a fresh deployment.
 - `BIAN_AUTH_SESSION_TTL_SECONDS`: session lifetime, default `604800`.
+- `BIAN_AUTH_SESSION_REVOCATION_FILE`: durable logout tombstones, default `/app/runtime/auth_session_revocations.json` in Compose. Keep it on the persistent runtime volume.
 - `BIAN_AUTH_COOKIE_SECURE`: default `1`; authenticated production deployments require HTTPS.
 - `BIAN_AUTH_MAX_FAILURES` / `BIAN_AUTH_LOCKOUT_SECONDS`: basic per-IP login failure lockout.
 - `BIAN_AUTH_TRUST_PROXY_HEADERS`: default `0`; set to `1` only when the app is behind a trusted local/private reverse proxy that sets `X-Forwarded-For`.
@@ -120,6 +127,9 @@ https://YOUR_DASHBOARD_HOST/login
 
 The deployment script prints the first bootstrap password when it has to create one.
 After the first login account exists, credentials live in MySQL as password hashes and sessions live in MySQL as hashed session tokens.
+Logout first persists the current token hash to the runtime revocation file. A
+MySQL outage therefore cannot reactivate a supposedly logged-out cookie; failed
+revocation-file persistence returns HTTP 503 while still clearing the cookie.
 After logging in, use the top-right `改密码` button to change the current user's password. The old password is required, and other sessions for the same user are invalidated after a successful change.
 Admin users can use the top-right `注册账号` button to create additional `user` or `admin` accounts. Public anonymous registration is intentionally disabled.
 

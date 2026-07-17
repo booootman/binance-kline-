@@ -28,6 +28,10 @@ SIGNAL_REVIEW_FILE = os.environ.get(
     "BIAN_SIGNAL_REVIEW_FILE",
     os.path.join(ROOT, "runtime", "signal_reviews.json"),
 )
+AUTH_SESSION_REVOCATION_FILE = os.environ.get(
+    "BIAN_AUTH_SESSION_REVOCATION_FILE",
+    os.path.join(ROOT, "runtime", "auth_session_revocations.json"),
+)
 SIGNAL_REVIEW_LIMIT = int(os.environ.get("BIAN_SIGNAL_REVIEW_LIMIT", "5000"))
 STRATEGY_SNAPSHOT_LIMIT = max(10, int(os.environ.get("BIAN_STRATEGY_SNAPSHOT_LIMIT", "1000")))
 MYSQL_CONNECT_TIMEOUT_SECONDS = max(1, int(os.environ.get("BIAN_MYSQL_CONNECT_TIMEOUT_SECONDS", "3")))
@@ -98,6 +102,9 @@ class DashboardStorage:
         self._redis_available_until = 0.0
         self._redis_block_until = 0.0
         self._availability_lock = threading.RLock()
+        self._auth_revocation_lock = threading.RLock()
+        self._auth_revocations = None
+        self._auth_revocation_file_key = None
         self._signal_review_lock = threading.RLock()
         self._schema_lock = threading.RLock()
         self._mysql_schema_ready = False
@@ -487,7 +494,8 @@ class DashboardStorage:
                 return self._load_due_signal_reviews_mysql(cutoff_ms, max_rows, all_users=all_users)
             except Exception as exc:
                 LOG.warning("mysql due signal review load failed; fallback=file; error=%s", exc)
-        records = self._load_signal_reviews_file(set(), SIGNAL_REVIEW_LIMIT, all_users=all_users)
+        scan_limit = None if all_users else SIGNAL_REVIEW_LIMIT
+        records = self._load_signal_reviews_file(set(), scan_limit, all_users=all_users)
         due = []
         for item in records:
             if item.get("status") == "evaluated":
@@ -640,6 +648,112 @@ class DashboardStorage:
         finally:
             conn.close()
 
+    def _load_auth_session_revocations_locked(self):
+        shared = getattr(self, "_scope_parent", self)
+        try:
+            stat = os.stat(AUTH_SESSION_REVOCATION_FILE)
+            file_key = (stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            file_key = None
+        if shared._auth_revocations is not None and shared._auth_revocation_file_key == file_key:
+            return dict(shared._auth_revocations)
+        if file_key is None:
+            records = {}
+        else:
+            with open(AUTH_SESSION_REVOCATION_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            items = data.get("revocations") if isinstance(data, dict) else None
+            if not isinstance(items, list):
+                raise ValueError("invalid auth session revocation file")
+            records = {}
+            for item in items:
+                token_hash = str(item.get("token_hash") or "") if isinstance(item, dict) else ""
+                if len(token_hash) != 64 or any(char not in "0123456789abcdef" for char in token_hash.lower()):
+                    raise ValueError("invalid auth session revocation record")
+                records[token_hash.lower()] = int(item.get("revoked_at_ms") or 0)
+        shared._auth_revocations = records
+        shared._auth_revocation_file_key = file_key
+        return dict(records)
+
+    def _write_auth_session_revocations_locked(self, records):
+        shared = getattr(self, "_scope_parent", self)
+        parent = os.path.dirname(AUTH_SESSION_REVOCATION_FILE) or "."
+        os.makedirs(parent, exist_ok=True)
+        tmp = AUTH_SESSION_REVOCATION_FILE + f".{os.getpid()}.{threading.get_ident()}.tmp"
+        payload = {
+            "version": 1,
+            "revocations": [
+                {"token_hash": token_hash, "revoked_at_ms": int(revoked_at_ms or 0)}
+                for token_hash, revoked_at_ms in sorted(records.items())
+            ],
+        }
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=True, separators=(",", ":"))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, AUTH_SESSION_REVOCATION_FILE)
+            os.chmod(AUTH_SESSION_REVOCATION_FILE, 0o600)
+            if os.name != "nt":
+                directory_fd = os.open(parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+        stat = os.stat(AUTH_SESSION_REVOCATION_FILE)
+        shared._auth_revocations = dict(records)
+        shared._auth_revocation_file_key = (stat.st_mtime_ns, stat.st_size)
+
+    def _record_auth_session_revocation(self, token_hash):
+        shared = getattr(self, "_scope_parent", self)
+        with shared._auth_revocation_lock:
+            records = self._load_auth_session_revocations_locked()
+            records[token_hash] = int(time.time() * 1000)
+            self._write_auth_session_revocations_locked(records)
+
+    def _auth_session_is_revoked(self, token_hash):
+        shared = getattr(self, "_scope_parent", self)
+        with shared._auth_revocation_lock:
+            return token_hash in self._load_auth_session_revocations_locked()
+
+    def _reconcile_auth_session_revocations(self):
+        shared = getattr(self, "_scope_parent", self)
+        with shared._auth_revocation_lock:
+            token_hashes = list(self._load_auth_session_revocations_locked())
+        if not token_hashes or not self.mysql_available():
+            return 0
+        conn = self._mysql_connect()
+        try:
+            self._ensure_auth_schema(conn)
+            cur = conn.cursor()
+            for token_hash in token_hashes:
+                cur.execute("DELETE FROM bian_auth_sessions WHERE token_hash=%s", (token_hash,))
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+        with shared._auth_revocation_lock:
+            records = self._load_auth_session_revocations_locked()
+            changed = False
+            for token_hash in token_hashes:
+                if token_hash in records:
+                    records.pop(token_hash, None)
+                    changed = True
+            if changed:
+                self._write_auth_session_revocations_locked(records)
+        return len(token_hashes)
+
     def create_auth_session(self, user_id, user_agent="", client_ip="", ttl_seconds=7 * 24 * 3600):
         if not self.mysql_available():
             return None
@@ -669,8 +783,25 @@ class DashboardStorage:
             conn.close()
 
     def user_for_session(self, token, touch_interval_seconds=60):
-        if not token or not self.mysql_available():
+        if not token:
             return None
+        token_hash = session_token_hash(token)
+        try:
+            if self._auth_session_is_revoked(token_hash):
+                try:
+                    self._reconcile_auth_session_revocations()
+                except Exception as exc:
+                    LOG.warning("auth session revocation reconciliation failed: %s", exc)
+                return None
+        except Exception as exc:
+            LOG.error("auth session revocation state is unreadable; rejecting session: %s", exc)
+            return None
+        if not self.mysql_available():
+            return None
+        try:
+            self._reconcile_auth_session_revocations()
+        except Exception as exc:
+            LOG.warning("auth session revocation reconciliation failed: %s", exc)
         conn = self._mysql_connect()
         try:
             self._ensure_auth_schema(conn)
@@ -686,7 +817,7 @@ class DashboardStorage:
                   AND u.disabled=0
                 LIMIT 1
                 """,
-                (session_token_hash(token),),
+                (token_hash,),
             )
             row = cur.fetchone()
             if not row:
@@ -704,7 +835,7 @@ class DashboardStorage:
             if should_touch:
                 cur.execute(
                     "UPDATE bian_auth_sessions SET last_seen_at=UTC_TIMESTAMP() WHERE token_hash=%s",
-                    (session_token_hash(token),),
+                    (token_hash,),
                 )
                 conn.commit()
             return {"id": int(row[0]), "username": row[1], "role": row[2] or "user"}
@@ -712,17 +843,18 @@ class DashboardStorage:
             conn.close()
 
     def delete_auth_session(self, token):
-        if not token or not self.mysql_available():
-            return False
-        conn = self._mysql_connect()
-        try:
-            self._ensure_auth_schema(conn)
-            cur = conn.cursor()
-            cur.execute("DELETE FROM bian_auth_sessions WHERE token_hash=%s", (session_token_hash(token),))
-            conn.commit()
+        if not token:
             return True
-        finally:
-            conn.close()
+        try:
+            self._record_auth_session_revocation(session_token_hash(token))
+        except Exception:
+            LOG.exception("auth session revocation could not be persisted")
+            return False
+        try:
+            self._reconcile_auth_session_revocations()
+        except Exception as exc:
+            LOG.warning("auth session database delete deferred: %s", exc)
+        return True
 
     def change_auth_password(self, user_id, current_password, new_password, keep_token=""):
         if not user_id or not self.mysql_available():
@@ -1230,7 +1362,7 @@ class DashboardStorage:
             self._write_signal_review_file(data)
             return {"backend": "file", "inserted": inserted, "skipped": skipped}
 
-    def _load_signal_reviews_file(self, symbols, limit, all_users=False):
+    def _load_signal_reviews_file(self, symbols, limit=None, all_users=False):
         data = self._read_signal_review_file()
         out = []
         for item in data.get("records", []):
@@ -1241,7 +1373,7 @@ class DashboardStorage:
             if symbols and str(item.get("symbol") or "").upper() not in symbols:
                 continue
             out.append(item)
-            if len(out) >= limit:
+            if limit is not None and len(out) >= limit:
                 break
         return out
 

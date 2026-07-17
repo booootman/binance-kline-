@@ -65,16 +65,24 @@ const localStorage = {
 
 let timerId = 0;
 const timers = new Map();
-function setTimeoutMock(fn) {
+const timerDelays = new Map();
+function setTimeoutMock(fn, delay) {
   const id = ++timerId;
   timers.set(id, fn);
+  timerDelays.set(id, Number(delay) || 0);
   return id;
 }
-function clearTimeoutMock(id) { timers.delete(id); }
+function clearTimeoutMock(id) {
+  timers.delete(id);
+  timerDelays.delete(id);
+}
 function runTimers() {
-  const pending = Array.from(timers.values());
+  const pending = Array.from(timers.entries());
   timers.clear();
-  pending.forEach((fn) => fn());
+  pending.forEach(([id, fn]) => {
+    timerDelays.delete(id);
+    fn();
+  });
 }
 
 const fetchCalls = [];
@@ -478,29 +486,51 @@ async function main() {
   let failedAuthReady = null;
   api.loadCurrentUser((ready) => { failedAuthReady = ready; });
   assert.strictEqual(fetchCalls.length, 21, 'auth state check must issue one request');
-  fetchResolvers[20].resolve({ ok: false, status: 503, json: () => Promise.resolve({ error: 'auth unavailable' }) });
+  fetchResolvers[fetchResolvers.length - 1].resolve({ ok: false, status: 503, json: () => Promise.resolve({ error: 'auth unavailable' }) });
   await settle();
   assert.strictEqual(failedAuthReady, false, 'auth service failure must stop protected dashboard startup');
   assert.strictEqual(api.preferenceState().currentUser, null, 'auth failure must not select the shared local user scope');
   assert.strictEqual(api.preferenceState().syncEnabled, false, 'auth failure must disable preference synchronization');
 
+  for (const invalidFlag of [undefined, null, 'false']) {
+    let ambiguousReady = null;
+    api.loadCurrentUser((ready) => { ambiguousReady = ready; });
+    const payload = { authenticated: true, user: { id: 0, username: 'local', role: 'admin' } };
+    if (invalidFlag !== undefined) payload.auth_enabled = invalidFlag;
+    fetchResolvers[fetchResolvers.length - 1].resolve(responsePayload(payload));
+    await settle();
+    assert.strictEqual(ambiguousReady, false, `auth_enabled=${String(invalidFlag)} must fail closed`);
+  }
+
+  let stringLocalReady = null;
+  api.loadCurrentUser((ready) => { stringLocalReady = ready; });
+  fetchResolvers[fetchResolvers.length - 1].resolve(responsePayload({ auth_enabled: false, authenticated: true, user: { id: '0', username: 'local', role: 'admin' } }));
+  await settle();
+  assert.strictEqual(stringLocalReady, false, 'auth-disabled local identity must require the exact numeric id 0');
+
+  let zeroDatabaseReady = null;
+  api.loadCurrentUser((ready) => { zeroDatabaseReady = ready; });
+  fetchResolvers[fetchResolvers.length - 1].resolve(responsePayload({ auth_enabled: true, authenticated: true, user: { id: 0, username: 'local', role: 'user' } }));
+  await settle();
+  assert.strictEqual(zeroDatabaseReady, false, 'auth-enabled identity must require a positive database user id');
+
   let localAuthReady = null;
   api.loadCurrentUser((ready) => { localAuthReady = ready; });
-  fetchResolvers[21].resolve(responsePayload({ auth_enabled: false, authenticated: true, user: { id: 0, username: 'local', role: 'admin' } }));
+  fetchResolvers[fetchResolvers.length - 1].resolve(responsePayload({ auth_enabled: false, authenticated: true, user: { id: 0, username: 'local', role: 'admin' } }));
   await settle();
   assert.strictEqual(localAuthReady, true, 'explicit auth-disabled response may select local mode');
   assert.strictEqual(api.preferenceState().currentUser.id, 0, 'explicit local mode must retain its isolated user id');
 
   let realLocalAuthReady = null;
   api.loadCurrentUser((ready) => { realLocalAuthReady = ready; });
-  fetchResolvers[22].resolve(responsePayload({ auth_enabled: true, authenticated: true, user: { id: 7, username: 'local', role: 'user' } }));
+  fetchResolvers[fetchResolvers.length - 1].resolve(responsePayload({ auth_enabled: true, authenticated: true, user: { id: 7, username: 'local', role: 'user' } }));
   await settle();
   assert.strictEqual(realLocalAuthReady, true, 'auth-enabled database user named local must be accepted');
   assert.strictEqual(api.preferenceState().currentUser.id, 7, 'real local username must keep its database identity');
 
   let postBootPreferenceDone = false;
   api.loadServerPreferences(() => { postBootPreferenceDone = true; });
-  fetchResolvers[23].resolve({ ok: false, status: 401, json: () => Promise.resolve({ error: 'login required' }) });
+  fetchResolvers[fetchResolvers.length - 1].resolve({ ok: false, status: 401, json: () => Promise.resolve({ error: 'login required' }) });
   await settle();
   assert.strictEqual(postBootPreferenceDone, false, 'post-boot 401 must stop the protected continuation');
   assert.strictEqual(api.preferenceState().currentUser, null, 'post-boot 401 must clear the authenticated user');
@@ -510,7 +540,7 @@ async function main() {
   api.resetAuthForTest();
   let expiredBootReady = null;
   api.loadCurrentUser((ready) => { expiredBootReady = ready; });
-  fetchResolvers[24].resolve({ ok: false, status: 401, json: () => Promise.resolve({ error: 'login required' }) });
+  fetchResolvers[fetchResolvers.length - 1].resolve({ ok: false, status: 401, json: () => Promise.resolve({ error: 'login required' }) });
   await settle();
   assert.strictEqual(expiredBootReady, false, 'boot-time 401 must fail authentication readiness');
   assert.strictEqual(api.preferenceState().authRedirecting, true, 'boot-time 401 must enter redirect state');
@@ -519,12 +549,28 @@ async function main() {
   api.resetAuthForTest();
   api.setData(Array.from({ length: 7 }, (_, index) => ({ symbol: `T${index}USDT` })));
   api.addSymbol('TIMEOUT', 'history');
-  const timeoutCall = fetchCalls[25];
+  const timeoutCall = fetchCalls[fetchCalls.length - 1];
   assert(timeoutCall.options.signal, 'API requests must carry an AbortController signal');
+  assert(Array.from(timerDelays.values()).includes(135000), 'market analysis requests must use the 135-second timeout budget');
   runTimers();
   await settle();
   assert.strictEqual(timeoutCall.options.signal.aborted, true, 'request timeout must abort the underlying fetch');
   assert.strictEqual(api.pendingSymbolAddCount(), 0, 'timed-out symbol request must release its pending reservation');
+
+  let bodyTimeoutError = null;
+  const stalledRequest = api.apiFetch('api/diagnostics', { cache: 'no-store' })
+    .then((res) => res.json())
+    .catch((error) => { bodyTimeoutError = error; });
+  const stalledResolver = fetchResolvers[fetchResolvers.length - 1];
+  const stalledCall = fetchCalls[fetchCalls.length - 1];
+  stalledResolver.resolve({ ok: true, status: 200, json: () => new Promise(() => {}) });
+  await settle();
+  assert.strictEqual(stalledCall.options.signal.aborted, false, 'headers alone must not finish request timeout tracking');
+  assert(Array.from(timerDelays.values()).includes(15000), 'non-market API body reads must retain the default timeout');
+  runTimers();
+  await stalledRequest;
+  assert.strictEqual(stalledCall.options.signal.aborted, true, 'stalled JSON body must abort the underlying fetch');
+  assert(bodyTimeoutError && bodyTimeoutError.code === 'REQUEST_TIMEOUT', 'stalled JSON body must reject with a timeout error');
 
   console.log('frontend smoke ok');
 }

@@ -175,7 +175,8 @@
         "New GET /api/storage-status endpoint for checking configured storage availability",
         "Browser localStorage remains the fallback when MySQL or Redis is not configured",
         "Signal reviews written to the file fallback during a MySQL outage are merged by user/key and idempotently upserted before committed file rows are removed",
-        "File-fallback signal-review retention applies BIAN_SIGNAL_REVIEW_LIMIT independently to each storage user"
+        "File-fallback signal-review retention applies BIAN_SIGNAL_REVIEW_LIMIT independently to each storage user",
+        "Background all-user file-fallback due scans inspect all retained user scopes before globally sorting and limiting work"
       ],
       "verification": [
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py",
@@ -206,7 +207,7 @@
         "Background 5m, 15m, and 1h evaluation using Binance USD-M 1m klines",
         "Review snapshots use a publication-time book midpoint; stale analysis-start prices are not treated as publication prices",
         "Review kline fetches start with the first complete 1m candle at or after publication and exclude candles that close after the exact horizon cutoff, preventing pre-publication high/low contamination",
-        "Waiting partial reviews are explicitly deferred and file fallback rows are fairly ordered, preventing old 15m/1h waits from starving newer due signals",
+        "Waiting partial reviews are explicitly deferred and all-user file fallback scans sort before applying the global work limit, preventing one user's rows or old 15m/1h waits from starving other due signals",
         "Evaluation tracks entry reached, stop hit, same-bar stop ambiguity, max profit, max drawdown, final outcome, and failure reason",
         "Live-review max profit and outcome are net of estimated round-trip fee/slippage, while gross fields are preserved for audit/export",
         "Legacy live-review records without cost fields are normalized to net outcomes at API/statistics read time so old gross samples do not inflate hit rate",
@@ -258,8 +259,8 @@
         "Docker health checks surface a fresh auth deployment that has no users and no first-admin secret instead of leaving an unusable login page",
         "Python deployment script skips protected /api/market curl checks when auth is enabled and asks for logged-in verification instead",
         "Python deployment script requires a clean Git worktree by default, preserves repository/global/Git-info ignore rules, fails closed when ignore configuration is unreadable, excludes local .env, and offers an explicit --allow-dirty development override",
-        "Remote deployment stages a fresh release directory, preserves the previous release and uploaded archive until loopback and required public HTTPS health checks pass, persists --public-port in remote .env, and supports bounded SSH/SCP retries",
-        "Production scripted deploys require an HTTPS --public-url unless an explicit local-development override is supplied, and remote .env permissions are forced to 0600 after all secret edits",
+        "Remote deployment stages a fresh release directory, verifies one unique per-attempt release id through loopback and public HTTPS, and preserves the previous release and uploaded archive until the initiating machine completes external verification",
+        "Production scripted deploys require a non-local HTTPS --public-url unless an explicit local-development override is supplied; cleanup is a separate post-verification SSH step and existing, previous, and new remote .env files are forced to 0600",
         "Docker Compose passes an optional Redis password through the dashboard client, Redis requirepass, and authenticated healthcheck; fresh scripted deployments generate the secret",
         "Production defaults bind the application upstream to loopback, require Secure authentication cookies, and document HTTPS reverse-proxy termination",
         "HTTP handler concurrency, socket timeouts, SSE client count, and SSE response lifetime are bounded through environment variables"
@@ -270,7 +271,7 @@
         "powershell -ExecutionPolicy Bypass -File scripts/verify.ps1",
         "server-side docker compose config passed under /opt/bian-dashboard",
         "server-side docker compose up -d --build started healthy dashboard, MySQL, and Redis containers",
-        "Loopback GET /api/health is used for container and release health checks",
+        "Loopback and initiating-client GET /api/health checks require the exact unique release id before cleanup",
         "Production HTTPS dashboard, authenticated APIs, and EventSource reconnect require release-environment proxy verification"
       ],
       "limitations": [
@@ -316,9 +317,9 @@
         "Optional trusted-proxy X-Forwarded-For support through BIAN_AUTH_TRUST_PROXY_HEADERS, disabled by default",
         "Session last_seen_at touch interval through BIAN_AUTH_SESSION_TOUCH_INTERVAL_SECONDS to reduce MySQL write load",
         "Duplicate admin-created usernames return a controlled duplicate-user error even under concurrent requests",
-        "Dashboard boot accepts local scope only from an explicit auth-disabled id-0 response while auth-enabled database users named local retain their real identity",
-        "Every dashboard API fetch has an AbortController-backed timeout; any HTTP 401 stops preference sync, timers, and realtime SSE, clears the user, and redirects to login once",
-        "Logout always expires the browser session cookie even when database session deletion fails"
+        "Dashboard boot accepts local scope only from a strict auth_enabled=false Boolean response with the exact numeric id-0 local admin identity; auth-enabled users require a positive database id and may still be named local",
+        "Every dashboard API fetch keeps its AbortController timeout active through JSON body parsing; market analysis uses a separate 135-second budget while other APIs use 15 seconds, and any HTTP 401 stops preference sync, timers, and realtime SSE before one login redirect",
+        "Logout persists a runtime token-hash tombstone before database deletion, rejects tombstoned sessions during MySQL outages, reconciles them after recovery, and returns HTTP 503 if durable revocation cannot be recorded while still expiring the cookie"
       ],
       "verification": [
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py scripts/deploy.py bian.py server.py",
@@ -329,7 +330,9 @@
         "local auth smoke: health 200, dashboard redirects to /login, login page renders",
         "safe login redirect smoke covers external URLs, protocol-relative URLs, API paths, and valid dashboard paths",
         "offline smoke verifies /api/health payload shape, auth-readiness failure, and checks that password/bootstrap details are not exposed",
-        "offline smoke verifies /api/diagnostics payload shape and checks that password/bootstrap details are not exposed"
+        "offline smoke verifies /api/diagnostics payload shape and checks that password/bootstrap details are not exposed",
+        "offline frontend coverage verifies stalled JSON body timeouts, the 135-second market budget, and strict auth_enabled/user-id DTO handling",
+        "offline storage coverage verifies MySQL-outage logout tombstones, recovery deletion, and all-user fallback scan fairness"
       ],
       "limitations": [
         "Bootstrap credentials are still provided through server-only environment variables for first-user creation.",

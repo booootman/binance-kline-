@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 import io
+import json
 import os
 import sys
 import threading
@@ -119,18 +120,97 @@ def test_snapshot_fallback_and_logout_cookie():
     handler.end_headers = lambda: response.update(ended=True)
     handler.wfile = io.BytesIO()
     original_storage = server.storage
+    original_auth_enabled = server.AUTH_ENABLED
     previous_disabled = server.LOG.disabled
     server.storage = BrokenLogoutStorage()
+    server.AUTH_ENABLED = True
     server.LOG.disabled = True
     try:
         handler.logout_api()
     finally:
         server.storage = original_storage
+        server.AUTH_ENABLED = original_auth_enabled
         server.LOG.disabled = previous_disabled
-    check(response.get("status") == 200 and response.get("ended"), "logout must respond even when session deletion fails")
+    check(response.get("status") == 503 and response.get("ended"), "logout must report a non-durable session revocation")
     cookies = [value for name, value in response["headers"] if name.lower() == "set-cookie"]
     check(cookies and "Max-Age=0" in cookies[0], "logout failure path must still expire the browser cookie")
-    check(handler.wfile.getvalue() == b'{"authenticated":false}', "logout failure path must return the logged-out payload")
+    payload = json.loads(handler.wfile.getvalue().decode("utf-8"))
+    check(payload.get("authenticated") is False and payload.get("revoked") is False, "logout failure must not claim durable revocation")
+
+    local_response = {"headers": []}
+    handler.send_response = lambda status: local_response.update(status=status)
+    handler.send_header = lambda name, value: local_response["headers"].append((name, value))
+    handler.end_headers = lambda: local_response.update(ended=True)
+    handler.wfile = io.BytesIO()
+    server.storage = BrokenLogoutStorage()
+    server.AUTH_ENABLED = False
+    try:
+        handler.logout_api()
+    finally:
+        server.storage = original_storage
+        server.AUTH_ENABLED = original_auth_enabled
+    local_payload = json.loads(handler.wfile.getvalue().decode("utf-8"))
+    check(local_response.get("status") == 200 and local_payload.get("revoked") is True, "auth-disabled logout must ignore stale cookies")
+
+
+def test_logout_revocation_tombstone():
+    original_file = storage_module.AUTH_SESSION_REVOCATION_FILE
+    test_file = ROOT / "runtime" / f"smoke-auth-revocations-{os.getpid()}-{time.time_ns()}.json"
+    storage_module.AUTH_SESSION_REVOCATION_FILE = str(test_file)
+    token = "mysql-outage-session"
+    try:
+        store = storage_module.DashboardStorage()
+        store.mysql_configured = True
+        store.mysql_available = lambda: False
+        check(store.delete_auth_session(token), "logout must be durable when MySQL is down but the tombstone file is writable")
+        with store._auth_revocation_lock:
+            revocations = store._load_auth_session_revocations_locked()
+        token_hash = storage_module.session_token_hash(token)
+        check(token_hash in revocations, "MySQL outage logout must persist the token hash before database deletion")
+        if os.name != "nt":
+            check(os.stat(test_file).st_mode & 0o777 == 0o600, "auth revocation file must be private")
+
+        class FakeCursor:
+            def __init__(self):
+                self.statements = []
+
+            def execute(self, sql, params=()):
+                self.statements.append((" ".join(str(sql).split()), params))
+
+        class FakeConnection:
+            def __init__(self):
+                self.cursor_value = FakeCursor()
+                self.commits = 0
+                self.rollbacks = 0
+
+            def cursor(self):
+                return self.cursor_value
+
+            def commit(self):
+                self.commits += 1
+
+            def rollback(self):
+                self.rollbacks += 1
+
+            def close(self):
+                pass
+
+        connection = FakeConnection()
+        store.mysql_available = lambda: True
+        store._mysql_connect = lambda: connection
+        store._ensure_auth_schema = lambda _conn: None
+        check(store.user_for_session(token) is None, "a tombstoned token must be rejected after MySQL recovers")
+        deletes = [item for item in connection.cursor_value.statements if item[0].startswith("DELETE FROM bian_auth_sessions")]
+        check(deletes and deletes[0][1] == (token_hash,), "recovery must delete the tombstoned database session")
+        check(connection.commits == 1 and connection.rollbacks == 0, "tombstone reconciliation must commit the session delete")
+        with store._auth_revocation_lock:
+            check(store._load_auth_session_revocations_locked() == {}, "committed database revocation must clear the tombstone")
+    finally:
+        storage_module.AUTH_SESSION_REVOCATION_FILE = original_file
+        try:
+            test_file.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def test_review_time_boundaries():
@@ -875,7 +955,13 @@ def test_signal_review_file_retention_is_per_user():
 
         def records(prefix, start):
             return [
-                {"signal_key": f"{prefix}-{index}", "symbol": "DOGEUSDT", "snapshot_at_ms": start + index}
+                {
+                    "signal_key": f"{prefix}-{index}",
+                    "symbol": "DOGEUSDT",
+                    "side": "long",
+                    "status": "pending",
+                    "snapshot_at_ms": start + index,
+                }
                 for index in range(3)
             ]
 
@@ -890,6 +976,8 @@ def test_signal_review_file_retention_is_per_user():
         check(set(by_user) == {"u1", "u2"}, "one user's fallback writes must not evict another user")
         check(by_user["u1"] == ["u1-2", "u1-1"], "u1 must retain its two newest fallback records")
         check(by_user["u2"] == ["u2-2", "u2-1"], "u2 must retain its two newest fallback records")
+        due = store.load_due_signal_reviews(int(time.time() * 1000), max_rows=2, all_users=True)
+        check([item["storage_user_id"] for item in due] == ["u1", "u1"], "all-user due scans must sort before applying the global work limit")
 
         migrated = []
         store.user_id = "u1"
@@ -913,6 +1001,14 @@ def test_required_assets_and_report_contract():
         check((ROOT / relative).is_file(), f"required project asset missing: {relative}")
     fields = analyzer.SymbolReport.__dataclass_fields__
     check("price_observed_at_ms" in fields, "analysis price observation time must be serialized")
+    original_release_id = server.RELEASE_ID
+    try:
+        server.RELEASE_ID = "a" * 64
+        check(server.health_payload(check_storage=False, expected_release_id="a" * 64)["ok"], "matching release health must remain ready")
+        mismatch = server.health_payload(check_storage=False, expected_release_id="b" * 64)
+        check(not mismatch["ok"] and mismatch["release_match"] is False, "health must fail on a different release id")
+    finally:
+        server.RELEASE_ID = original_release_id
 
 
 def test_deploy_contracts():
@@ -950,23 +1046,94 @@ def test_deploy_contracts():
         public_port=9000,
         public_url="https://dashboard.example.com",
     )
-    remote = deploy.remote_script(args, "/tmp/bian-dashboard-test.tar.gz")
-    health_check = "http://127.0.0.1:9000/api/health"
+    release_id = "a" * 64
+    remote = deploy.remote_script(args, "/tmp/bian-dashboard-test.tar.gz", release_id)
+    finalize = deploy.finalize_remote_script(args, "/tmp/bian-dashboard-test.tar.gz")
+    health_check = f"http://127.0.0.1:9000/api/health?release_id={release_id}"
     archive_cleanup = "rm -f /tmp/bian-dashboard-test.tar.gz"
     check("BIAN_PUBLIC_PORT=9000" in remote, "public port must be persisted into the remote .env")
     check("BIAN_BIND_ADDRESS=127.0.0.1" in remote, "remote deployment must bind the application upstream to loopback")
     check("BIAN_AUTH_COOKIE_SECURE=1" in remote, "remote deployment must require secure authentication cookies")
     check('chmod 600 "$release_dir/.env"' in remote, "remote deployment must restrict secret file permissions")
     check(remote.index('chmod 600 "$release_dir/.env"') > remote.rindex("BIAN_AUTH_COOKIE_SECURE"), "secret permissions must be hardened after every .env edit")
+    check("chmod 600 /opt/bian-dashboard/.env" in remote, "existing remote secrets must be hardened before they are copied")
+    check("chmod 600 /opt/bian-dashboard.previous/.env" in remote, "retained previous secrets must be hardened")
     check("BIAN_REDIS_PASSWORD=$redis_password" in remote, "first deploy must generate a Redis password")
+    check(f"BIAN_RELEASE_ID={release_id}" in remote, "release id must be persisted into the remote environment")
     check("mktemp -d" in remote and 'mv "$release_dir" /opt/bian-dashboard' in remote, "deploy must replace from a staging directory")
     check("/opt/bian-dashboard.previous" in remote, "deploy must retain the previous release until health passes")
-    check(remote.index(health_check) < remote.index(archive_cleanup), "archive must remain available until deployment succeeds")
-    public_health_check = "https://dashboard.example.com/api/health"
+    check(health_check in remote, "loopback health must verify the new release id")
+    check(archive_cleanup not in remote and "rm -rf /opt/bian-dashboard.previous" not in remote, "deploy phase must retain rollback assets for external verification")
+    check(archive_cleanup in finalize and "rm -rf /opt/bian-dashboard.previous" in finalize, "finalize phase must clean rollback assets")
+    public_health_check = f"https://dashboard.example.com/api/health?release_id={release_id}"
     check(public_health_check in remote, "deployment must verify the configured public HTTPS health endpoint")
-    check(remote.index(public_health_check) < remote.index(archive_cleanup), "public HTTPS must pass before deployment cleanup")
+    check(remote.index(health_check) < remote.index(public_health_check), "public HTTPS must run only after loopback verifies the same release")
 
-    for invalid_url in ("http://dashboard.example.com", "https://user:secret@dashboard.example.com", "https://dashboard.example.com/app"):
+    first_release_id = deploy.archive_release_id(ROOT / "Dockerfile")
+    second_release_id = deploy.archive_release_id(ROOT / "Dockerfile")
+    check(len(first_release_id) == 64 and first_release_id != second_release_id, "each deploy attempt must receive a unique release id")
+
+    class PublicHealthResponse:
+        def __init__(self, url, payload):
+            self.url = url
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def geturl(self):
+            return self.url
+
+        def read(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+    health_args = types.SimpleNamespace(public_url=args.public_url, dry_run=False, retries=1, retry_delay=0)
+    original_urlopen = deploy.urlopen
+    try:
+        expected_url = deploy.release_health_url(args.public_url, release_id)
+        deploy.urlopen = lambda _request, timeout=0: PublicHealthResponse(expected_url, {
+            "ok": True,
+            "release_match": True,
+            "release_id": release_id,
+        })
+        deploy.verify_public_health(health_args, release_id)
+        deploy.urlopen = lambda _request, timeout=0: PublicHealthResponse(expected_url, {
+            "ok": True,
+            "release_match": False,
+            "release_id": "b" * 64,
+        })
+        try:
+            deploy.verify_public_health(health_args, release_id)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("external verification must reject an old or different release")
+        deploy.urlopen = lambda _request, timeout=0: PublicHealthResponse("https://other.example.com/api/health", {
+            "ok": True,
+            "release_match": True,
+            "release_id": release_id,
+        })
+        try:
+            deploy.verify_public_health(health_args, release_id)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("external verification must reject a redirect to a different origin")
+    finally:
+        deploy.urlopen = original_urlopen
+
+    for invalid_url in (
+        "http://dashboard.example.com",
+        "https://user:secret@dashboard.example.com",
+        "https://dashboard.example.com/app",
+        "https://127.0.0.1",
+        "https://192.168.1.10",
+        "https://100.64.0.1",
+        "https://localhost",
+    ):
         try:
             deploy.normalize_public_url(invalid_url)
         except ValueError:
@@ -994,6 +1161,7 @@ def main():
     test_cache_and_symbol_contracts()
     test_tick_rounding_and_cache_lock_ownership()
     test_snapshot_fallback_and_logout_cookie()
+    test_logout_revocation_tombstone()
     test_review_time_boundaries()
     test_publication_price_alignment()
     test_realtime_hub_recovery_and_idle_cleanup()

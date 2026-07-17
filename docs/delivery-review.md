@@ -118,3 +118,11 @@ This pass tightens the P0 trust issues from `docs/improvement-suggestions.md`: h
 - Auth-enabled users named `local` retain their database identity; only an explicit auth-disabled id-0 response selects local mode.
 - Strategy refresh keeps REST analysis price separately and preserves a realtime price only with its newer source metadata. File fallback retention is per user, logout clears cookies through database failures, explicit timestamp fallbacks are preserved, and backtest writes use held OS file locks.
 - Human release review must run the new dry-run command with the real HTTPS origin, verify `.env` permissions on the server, exercise session expiry in a browser, and validate multi-user fallback reconciliation against MySQL before staging.
+
+## 2026-07-17 Release, Request, And Logout Remediation
+
+- Deploys now carry a unique per-attempt release id through Compose and `/api/health`. Loopback and public HTTPS must report that exact id, and the initiating machine completes external verification before a separate SSH cleanup removes the archive or previous release.
+- Existing and previous `.env` files are hardened before reuse. Literal local/non-global public IPs and redirects to a different public origin are rejected.
+- Frontend timeouts remain active through JSON parsing. Market analysis receives 135 seconds; other APIs remain at 15 seconds. Authentication boot accepts only a Boolean `auth_enabled` and an identity valid for that mode.
+- All-user file-fallback review evaluation scans every retained scope before global sorting/limiting. Logout persists a runtime token-hash tombstone before MySQL deletion and reconciles it after recovery.
+- Human release review must validate the generated remote shell against Bash/Docker, exercise public HTTPS with the real proxy, and run logout/replay tests against real MySQL before staging.

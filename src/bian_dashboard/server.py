@@ -66,6 +66,7 @@ AUTH_LOCKOUT_SECONDS = int(os.environ.get("BIAN_AUTH_LOCKOUT_SECONDS", "300"))
 AUTH_TRUST_PROXY_HEADERS = os.environ.get("BIAN_AUTH_TRUST_PROXY_HEADERS", "0").lower() in ("1", "true", "yes", "on")
 AUTH_SESSION_TOUCH_INTERVAL_SECONDS = int(os.environ.get("BIAN_AUTH_SESSION_TOUCH_INTERVAL_SECONDS", "60"))
 AUTH_REQUIRE_SAME_ORIGIN_POST = os.environ.get("BIAN_AUTH_REQUIRE_SAME_ORIGIN_POST", "1").lower() not in ("0", "false", "no", "off")
+RELEASE_ID = os.environ.get("BIAN_RELEASE_ID", "").strip()
 INTERNAL_ERROR_MESSAGE = "internal server error; check server logs"
 EXPOSE_ERROR_DETAILS = os.environ.get("BIAN_EXPOSE_ERROR_DETAILS", "0").lower() in ("1", "true", "yes", "on")
 PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -1848,7 +1849,7 @@ def auth_enabled():
     return AUTH_ENABLED
 
 
-def health_payload(check_storage=True):
+def health_payload(check_storage=True, expected_release_id=""):
     mysql_configured = bool(storage and getattr(storage, "mysql_configured", False))
     redis_configured = bool(storage and getattr(storage, "redis_configured", False))
     mysql_available = bool(storage and storage.mysql_available()) if check_storage else None
@@ -1886,11 +1887,15 @@ def health_payload(check_storage=True):
         auth_info["ready"] = auth_ready
     analyzer_ok = os.path.exists(BIAN)
     web_ok = os.path.isdir(WEB_ROOT)
+    expected_release_id = str(expected_release_id or "").strip()
+    release_match = not expected_release_id or bool(RELEASE_ID and RELEASE_ID == expected_release_id)
     payload = {
-        "ok": bool(analyzer_ok and web_ok and auth_ready is not False),
+        "ok": bool(analyzer_ok and web_ok and auth_ready is not False and release_match),
         "time": now_bj(),
         "uptime_seconds": round(max(0.0, time.time() - SERVER_STARTED_AT), 3),
         "service": "bian-dashboard",
+        "release_id": RELEASE_ID,
+        "release_match": release_match,
         "bind": {"host": HOST, "port": PORT},
         "paths": {
             "web_root": web_ok,
@@ -2247,7 +2252,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            payload = health_payload(check_storage=True)
+            params = parse_qs(parsed.query or "")
+            expected_release_id = params.get("release_id", [""])[0]
+            payload = health_payload(check_storage=True, expected_release_id=expected_release_id)
             self.send_json(200 if payload.get("ok") else 503, payload)
             return
         if parsed.path == "/login":
@@ -2441,17 +2448,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def logout_api(self):
         token = self.auth_token()
-        if storage is not None:
+        revoked = not token or not auth_enabled()
+        if auth_enabled() and token and storage is not None:
             try:
-                storage.delete_auth_session(token)
+                revoked = bool(storage.delete_auth_session(token))
             except Exception:
                 LOG.exception("auth session delete failed during logout")
-        self.send_response(200)
+                revoked = False
+        payload = {"authenticated": False, "revoked": revoked}
+        if not revoked:
+            payload["error"] = "session revocation could not be persisted"
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_response(200 if revoked else 503)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Set-Cookie", f"{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+        cookie = f"{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+        if AUTH_COOKIE_SECURE:
+            cookie += "; Secure"
+        self.send_header("Set-Cookie", cookie)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b'{"authenticated":false}')
+        self.wfile.write(body)
 
     def change_password_api(self):
         try:

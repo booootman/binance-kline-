@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import ipaddress
+import json
 import os
 import posixpath
+import secrets
 import shlex
 import subprocess
 import tarfile
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
+from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,6 +76,15 @@ def normalize_public_url(value):
         raise ValueError("--public-url must be an absolute HTTPS URL")
     if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
         raise ValueError("--public-url must contain only the HTTPS origin, without credentials, path, query, or fragment")
+    hostname = str(parsed.hostname or "").strip().lower()
+    if hostname == "localhost":
+        raise ValueError("--public-url must not use a loopback or private address")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise ValueError("--public-url must not use a loopback or private address")
     return f"https://{parsed.netloc}"
 
 
@@ -81,6 +95,52 @@ def validate_deploy_args(args):
         raise SystemExit(str(exc)) from exc
     if not args.public_url and not getattr(args, "allow_no_public_url", False):
         raise SystemExit("--public-url is required; use --allow-no-public-url only for an explicitly local development deployment")
+
+
+def archive_release_id(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    digest.update(secrets.token_bytes(32))
+    return digest.hexdigest()
+
+
+def release_health_url(public_url, release_id):
+    return public_url.rstrip("/") + "/api/health?" + urlencode({"release_id": release_id})
+
+
+def verify_public_health(args, release_id):
+    if not args.public_url:
+        return
+    url = release_health_url(args.public_url, release_id)
+    if args.dry_run:
+        print("GET " + url)
+        return
+    last_error = None
+    attempts = max(1, int(args.retries))
+    for attempt in range(1, attempts + 1):
+        try:
+            request = Request(url, headers={"Accept": "application/json", "Cache-Control": "no-cache"})
+            with urlopen(request, timeout=15) as response:
+                final_url = urlsplit(response.geturl())
+                payload = json.loads(response.read().decode("utf-8"))
+            expected_origin = urlsplit(args.public_url)
+            if (
+                final_url.scheme.lower() != expected_origin.scheme.lower()
+                or final_url.netloc.lower() != expected_origin.netloc.lower()
+                or not isinstance(payload, dict)
+                or payload.get("ok") is not True
+                or payload.get("release_match") is not True
+                or payload.get("release_id") != release_id
+            ):
+                raise RuntimeError("public health returned a different release")
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts:
+                time.sleep(max(0, args.retry_delay))
+    raise SystemExit(f"public HTTPS health verification failed for release {release_id}: {last_error}")
 
 
 def run_checked(command, retries, retry_delay, dry_run=False):
@@ -167,16 +227,20 @@ def scp_base(args):
     return command
 
 
-def remote_script(args, remote_archive):
+def remote_script(args, remote_archive, release_id):
     remote_dir = shlex.quote(args.remote_dir)
     remote_parent = shlex.quote(posixpath.dirname(args.remote_dir.rstrip("/")) or "/")
     release_template = shlex.quote(args.remote_dir.rstrip("/") + ".release.XXXXXX")
     backup_dir = shlex.quote(args.remote_dir.rstrip("/") + ".previous")
     archive = shlex.quote(remote_archive)
+    release_id = str(release_id or "").strip()
+    if len(release_id) != 64 or any(char not in "0123456789abcdef" for char in release_id.lower()):
+        raise ValueError("release_id must be a 64-character hexadecimal digest")
+    release_id = release_id.lower()
     public_url = normalize_public_url(getattr(args, "public_url", ""))
     public_check = ""
     if public_url:
-        public_health_url = shlex.quote(public_url + "/api/health")
+        public_health_url = shlex.quote(release_health_url(public_url, release_id))
         public_check = f"curl -fsS --retry 6 --retry-delay 5 --max-time 15 --proto '=https' --tlsv1.2 {public_health_url} >/dev/null"
     market_check = ""
     if args.check_market:
@@ -202,6 +266,12 @@ mkdir -p {remote_parent}
 release_dir=$(mktemp -d {release_template})
 trap 'if [ -n "$release_dir" ]; then rm -rf "$release_dir"; fi' EXIT
 tar -xzf {archive} -C "$release_dir"
+if [ -f {remote_dir}/.env ]; then
+  chmod 600 {remote_dir}/.env
+fi
+if [ -f {backup_dir}/.env ]; then
+  chmod 600 {backup_dir}/.env
+fi
 if [ -f {remote_dir}/.env ]; then
   cp -p {remote_dir}/.env "$release_dir/.env"
 elif [ -f {backup_dir}/.env ]; then
@@ -233,6 +303,11 @@ if grep -q '^BIAN_AUTH_COOKIE_SECURE=' "$release_dir/.env"; then
 else
   printf 'BIAN_AUTH_COOKIE_SECURE=1\n' >> "$release_dir/.env"
 fi
+if grep -q '^BIAN_RELEASE_ID=' "$release_dir/.env"; then
+  sed -i 's/^BIAN_RELEASE_ID=.*/BIAN_RELEASE_ID={release_id}/' "$release_dir/.env"
+else
+  printf 'BIAN_RELEASE_ID={release_id}\n' >> "$release_dir/.env"
+fi
 chmod 600 "$release_dir/.env"
 cd "$release_dir"
 docker compose config >/dev/null
@@ -243,18 +318,28 @@ if [ -d {remote_dir} ]; then
     mv {remote_dir} {backup_dir}
   fi
 fi
+if [ -f {backup_dir}/.env ]; then
+  chmod 600 {backup_dir}/.env
+fi
 mv "$release_dir" {remote_dir}
 release_dir=''
 cd {remote_dir}
 docker compose up -d --build
 {ufw}
-curl -fsS --retry 12 --retry-delay 5 --max-time 10 http://127.0.0.1:{args.public_port}/api/health >/dev/null
+curl -fsS --retry 12 --retry-delay 5 --max-time 10 'http://127.0.0.1:{args.public_port}/api/health?release_id={release_id}' >/dev/null
 {public_check}
 {market_check}
 docker compose ps
+trap - EXIT
+"""
+
+
+def finalize_remote_script(args, remote_archive):
+    backup_dir = shlex.quote(args.remote_dir.rstrip("/") + ".previous")
+    archive = shlex.quote(remote_archive)
+    return f"""set -eu
 rm -rf {backup_dir}
 rm -f {archive}
-trap - EXIT
 """
 
 
@@ -271,12 +356,16 @@ def main():
     with tempfile.TemporaryDirectory(prefix="bian-deploy-") as temp_dir:
         archive_path = Path(temp_dir) / "bian-dashboard.tar.gz"
         build_archive(archive_path, include_untracked=args.allow_dirty)
+        release_id = archive_release_id(archive_path)
         mkdir_command = ssh_base(args) + [target, "mkdir -p /tmp"]
         upload_command = scp_base(args) + [str(archive_path), f"{target}:{remote_archive}"]
-        deploy_command = ssh_base(args) + [target, "bash -lc " + shlex.quote(remote_script(args, remote_archive))]
+        deploy_command = ssh_base(args) + [target, "bash -lc " + shlex.quote(remote_script(args, remote_archive, release_id))]
+        finalize_command = ssh_base(args) + [target, "bash -lc " + shlex.quote(finalize_remote_script(args, remote_archive))]
         run_checked(mkdir_command, args.retries, args.retry_delay, args.dry_run)
         run_checked(upload_command, args.retries, args.retry_delay, args.dry_run)
         run_checked(deploy_command, args.retries, args.retry_delay, args.dry_run)
+        verify_public_health(args, release_id)
+        run_checked(finalize_command, args.retries, args.retry_delay, args.dry_run)
 
 
 if __name__ == "__main__":
