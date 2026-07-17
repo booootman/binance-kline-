@@ -259,8 +259,8 @@
         "Docker health checks surface a fresh auth deployment that has no users and no first-admin secret instead of leaving an unusable login page",
         "Python deployment script skips protected /api/market curl checks when auth is enabled and asks for logged-in verification instead",
         "Python deployment script requires a clean Git worktree by default, preserves repository/global/Git-info ignore rules, fails closed when ignore configuration is unreadable, excludes local .env, and offers an explicit --allow-dirty development override",
-        "Remote deployment stages a fresh release directory, verifies one unique per-attempt release id through loopback and public HTTPS, and preserves the previous release and uploaded archive until the initiating machine completes external verification",
-        "Production scripted deploys require a non-local HTTPS --public-url unless an explicit local-development override is supplied; cleanup is a separate post-verification SSH step and existing, previous, and new remote .env files are forced to 0600",
+        "Remote deployment stages a fresh release directory, verifies one unique per-attempt release id through loopback and public HTTPS, and isolates uploaded archives plus previous directories by release id under a shared remote switch/finalize lock",
+        "Production scripted deploys require a non-local HTTPS --public-url unless an explicit local-development override is supplied; each finalizer cleans only its own rollback asset, existing/previous/new remote .env files are forced to 0600, and generated credentials are never printed",
         "Docker Compose passes an optional Redis password through the dashboard client, Redis requirepass, and authenticated healthcheck; fresh scripted deployments generate the secret",
         "Production defaults bind the application upstream to loopback, require Secure authentication cookies, and document HTTPS reverse-proxy termination",
         "HTTP handler concurrency, socket timeouts, SSE client count, and SSE response lifetime are bounded through environment variables"
@@ -271,7 +271,7 @@
         "powershell -ExecutionPolicy Bypass -File scripts/verify.ps1",
         "server-side docker compose config passed under /opt/bian-dashboard",
         "server-side docker compose up -d --build started healthy dashboard, MySQL, and Redis containers",
-        "Loopback and initiating-client GET /api/health checks require the exact unique release id before cleanup",
+        "Loopback and initiating-client GET /api/health checks require the exact unique release id before release-scoped cleanup",
         "Production HTTPS dashboard, authenticated APIs, and EventSource reconnect require release-environment proxy verification"
       ],
       "limitations": [
@@ -300,9 +300,9 @@
         "HttpOnly session cookie with hashed session token stored in MySQL",
         "Server-side auth gate for dashboard pages, APIs, preferences, and realtime SSE",
         "Public health endpoint for Docker health checks",
-        "Public /api/health returns non-secret deployment diagnostics including uptime, auth readiness, storage availability, cache counts, and required runtime path checks",
-        "/api/health returns HTTP 503 when auth is enabled but MySQL is unavailable, or when a fresh empty users table has no first-admin secret configured",
-        "Auth readiness reports has_users, login_ready, and issue fields without exposing bootstrap usernames or passwords",
+        "Public /api/health returns non-secret deployment diagnostics including uptime, cached auth readiness, storage availability, cache counts, and required runtime path checks",
+        "/api/health returns HTTP 503 when auth is enabled but MySQL or the session-revocation store is unavailable, or when a fresh empty users table has no first-admin secret configured",
+        "Auth readiness reports has_users, login_ready, revocation-store readiness, and issue fields without exposing bootstrap usernames or passwords; the full database check is cached for five seconds",
         "Admin-only /api/diagnostics returns operator cache, analyzer, storage, realtime WebSocket state, and signal-review queue state without exposing credentials",
         "Dashboard header shows an admin-only diagnostics button with a readable diagnostics modal, realtime sharing counters, signal-review queue/evaluator counters, live-review cost assumptions, and a raw JSON fallback",
         "Login and logout endpoints plus dashboard logout button",
@@ -319,7 +319,7 @@
         "Duplicate admin-created usernames return a controlled duplicate-user error even under concurrent requests",
         "Dashboard boot accepts local scope only from a strict auth_enabled=false Boolean response with the exact numeric id-0 local admin identity; auth-enabled users require a positive database id and may still be named local",
         "Every dashboard API fetch keeps its AbortController timeout active through JSON body parsing; market analysis uses a separate 135-second budget while other APIs use 15 seconds, and any HTTP 401 stops preference sync, timers, and realtime SSE before one login redirect",
-        "Logout persists a runtime token-hash tombstone before database deletion, rejects tombstoned sessions during MySQL outages, reconciles them after recovery, and returns HTTP 503 if durable revocation cannot be recorded while still expiring the cookie"
+        "Logout runs after same-origin validation but before current-session authentication, persists a runtime token-hash tombstone before database deletion, rejects tombstoned sessions during MySQL outages, reconciles them after recovery, and surfaces incomplete durable revocation while still expiring the cookie"
       ],
       "verification": [
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py scripts/deploy.py bian.py server.py",
@@ -332,7 +332,8 @@
         "offline smoke verifies /api/health payload shape, auth-readiness failure, and checks that password/bootstrap details are not exposed",
         "offline smoke verifies /api/diagnostics payload shape and checks that password/bootstrap details are not exposed",
         "offline frontend coverage verifies stalled JSON body timeouts, the 135-second market budget, and strict auth_enabled/user-id DTO handling",
-        "offline storage coverage verifies MySQL-outage logout tombstones, recovery deletion, and all-user fallback scan fairness"
+        "offline storage coverage verifies MySQL-outage logout routing/tombstones, recovery deletion, corrupt revocation readiness, cached health database checks, and all-user fallback scan fairness",
+        "offline deployment coverage verifies release-scoped cleanup, shared locking, unique remote archives, and secret-free output"
       ],
       "limitations": [
         "Bootstrap credentials are still provided through server-only environment variables for first-user creation.",

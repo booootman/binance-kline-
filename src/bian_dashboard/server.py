@@ -2200,6 +2200,12 @@ def valid_auth_username(username):
     return all(ch in allowed for ch in text)
 
 
+def valid_auth_session_token(token):
+    text = str(token or "")
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    return len(text) == 43 and all(ch in allowed for ch in text)
+
+
 def is_admin_user(user):
     return bool(user and user.get("role") == "admin")
 
@@ -2290,10 +2296,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         if parsed.path == "/api/login":
             self.login_api()
-        elif not self.require_auth(parsed.path):
-            return
         elif parsed.path == "/api/logout":
             self.logout_api()
+        elif not self.require_auth(parsed.path):
+            return
         elif parsed.path == "/api/auth/password":
             self.change_password_api()
         elif parsed.path == "/api/auth/users":
@@ -2448,8 +2454,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def logout_api(self):
         token = self.auth_token()
-        revoked = not token or not auth_enabled()
-        if auth_enabled() and token and storage is not None:
+        valid_token = valid_auth_session_token(token)
+        revoked = not auth_enabled() or not token or not valid_token
+        if auth_enabled() and valid_token and storage is not None:
             try:
                 revoked = bool(storage.delete_auth_session(token))
             except Exception:

@@ -55,7 +55,13 @@ volume. Tombstoned tokens fail authentication during a database outage; after
 MySQL recovers, the next session lookup deletes the matching database sessions
 and removes only the committed tombstones. If the tombstone cannot be persisted,
 logout still expires the browser cookie but returns HTTP 503 instead of claiming
-that server-side revocation succeeded.
+that server-side revocation succeeded. Logout routing does not require the
+current database session to validate first, so this recovery path still runs
+during a MySQL outage. Authentication readiness validates that the revocation
+store is readable and atomically replaceable; an invalid store blocks new
+sessions and makes `/api/health` return HTTP 503. The complete auth readiness
+result is cached for five seconds to keep public health probes from opening a
+new MySQL connection on every request.
 
 ## Redis
 

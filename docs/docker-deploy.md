@@ -80,10 +80,13 @@ enabled. If Git reports that an ignore source cannot be read, packaging fails
 closed instead of treating globally ignored files as upload candidates.
 
 The remote archive is extracted into a temporary release directory. The
-previous application directory remains as `/opt/bian-dashboard.previous` and
-the uploaded archive remains available until the initiating machine verifies
-the exact release through public HTTPS. Cleanup then runs as a separate SSH
-step, so a failed or misrouted public check preserves rollback assets.
+previous application directory remains under a release-specific path such as
+`/opt/bian-dashboard.previous.<release-id>`, and the uploaded archive also uses
+the release id. Remote switching and cleanup share a `flock`; a finalizer can
+delete only its own rollback directory. The archive remains available until the
+initiating machine verifies the exact release through public HTTPS. Cleanup then
+runs as a separate SSH step, so a failed, concurrent, or misrouted public check
+preserves the correct rollback asset.
 `--public-port` and the generated `BIAN_RELEASE_ID` are persisted in the remote
 `.env`, so later manual Compose restarts keep the selected port and release
 identity. Existing, previous, and newly generated secret files are all forced
@@ -125,11 +128,16 @@ After configuring TLS termination, open:
 https://YOUR_DASHBOARD_HOST/login
 ```
 
-The deployment script prints the first bootstrap password when it has to create one.
+The deployment script never prints the generated bootstrap password. On a fresh
+deployment it stores the password only in the remote mode-`0600` `.env`; retrieve
+it through the authorized SSH account.
 After the first login account exists, credentials live in MySQL as password hashes and sessions live in MySQL as hashed session tokens.
 Logout first persists the current token hash to the runtime revocation file. A
 MySQL outage therefore cannot reactivate a supposedly logged-out cookie; failed
 revocation-file persistence returns HTTP 503 while still clearing the cookie.
+The logout route remains available when current-session validation is unavailable,
+and the browser surfaces incomplete revocation instead of silently reporting a
+normal logout.
 After logging in, use the top-right `改密码` button to change the current user's password. The old password is required, and other sessions for the same user are invalidated after a successful change.
 Admin users can use the top-right `注册账号` button to create additional `user` or `admin` accounts. Public anonymous registration is intentionally disabled.
 
@@ -145,6 +153,10 @@ curl -fsS https://dashboard.example.com/api/health
 auth readiness, MySQL/Redis availability, cache counts, and whether required
 runtime paths exist. It returns HTTP 503 when auth is enabled but MySQL is not
 available, which is intentional for deployment health checks.
+Health also returns HTTP 503 when the session-revocation store is unreadable or
+cannot be atomically replaced. Full authentication readiness is cached for five
+seconds so anonymous health polling does not execute one user-count query per
+request.
 
 Example Nginx location for the HTTPS virtual host:
 

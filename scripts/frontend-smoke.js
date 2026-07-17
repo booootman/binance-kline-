@@ -28,6 +28,7 @@ source = source.slice(0, close) + `
     loadServerPreferences: loadServerPreferences,
     loadCurrentUser: loadCurrentUser,
     apiFetch: apiFetch,
+    readLogoutResponse: readLogoutResponse,
     resetAuthForTest: function () {
       authRedirectStarted = false;
       CURRENT_USER = null;
@@ -571,6 +572,14 @@ async function main() {
   await stalledRequest;
   assert.strictEqual(stalledCall.options.signal.aborted, true, 'stalled JSON body must abort the underlying fetch');
   assert(bodyTimeoutError && bodyTimeoutError.code === 'REQUEST_TIMEOUT', 'stalled JSON body must reject with a timeout error');
+
+  let logoutFailure = null;
+  await api.readLogoutResponse({
+    ok: false,
+    status: 503,
+    json: () => Promise.resolve({ revoked: false, error: 'session revocation could not be persisted' })
+  }).catch((error) => { logoutFailure = error; });
+  assert(logoutFailure && logoutFailure.status === 503, 'frontend logout must not treat revoked=false as success');
 
   console.log('frontend smoke ok');
 }

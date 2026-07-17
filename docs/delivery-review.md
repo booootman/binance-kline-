@@ -126,3 +126,11 @@ This pass tightens the P0 trust issues from `docs/improvement-suggestions.md`: h
 - Frontend timeouts remain active through JSON parsing. Market analysis receives 135 seconds; other APIs remain at 15 seconds. Authentication boot accepts only a Boolean `auth_enabled` and an identity valid for that mode.
 - All-user file-fallback review evaluation scans every retained scope before global sorting/limiting. Logout persists a runtime token-hash tombstone before MySQL deletion and reconciles it after recovery.
 - Human release review must validate the generated remote shell against Bash/Docker, exercise public HTTPS with the real proxy, and run logout/replay tests against real MySQL before staging.
+
+## 2026-07-17 Adversarial State-Machine Remediation
+
+- Logout now runs after same-origin validation but before current-session authentication, so MySQL outages and unreadable session state cannot bypass cookie clearing or durable revocation. The frontend reports incomplete revocation instead of swallowing HTTP 503.
+- Concurrent deployments use release-specific remote archives and rollback directories. Remote switch/finalize operations share a lock, and each finalizer carries the release id that scopes its cleanup.
+- Authentication readiness validates the runtime revocation store and blocks session creation when it is unusable. Full readiness is cached for five seconds to bound anonymous health-check database load.
+- Fresh deploys keep generated credentials only in the mode-`0600` remote `.env`; SSH/CI output contains retrieval guidance but no password value.
+- Human release review must fault-inject MySQL and revocation-file outages, interleave two real deployments, inspect remote output for secrets, and validate the health TTL against real MySQL before staging.

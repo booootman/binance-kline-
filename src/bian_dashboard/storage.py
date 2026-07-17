@@ -105,6 +105,8 @@ class DashboardStorage:
         self._auth_revocation_lock = threading.RLock()
         self._auth_revocations = None
         self._auth_revocation_file_key = None
+        self._auth_status_cache = None
+        self._auth_status_available_until = 0.0
         self._signal_review_lock = threading.RLock()
         self._schema_lock = threading.RLock()
         self._mysql_schema_ready = False
@@ -136,6 +138,11 @@ class DashboardStorage:
         }
 
     def auth_status(self):
+        shared = getattr(self, "_scope_parent", self)
+        now = time.time()
+        with shared._availability_lock:
+            if shared._auth_status_cache is not None and now < shared._auth_status_available_until:
+                return copy.deepcopy(shared._auth_status_cache)
         configured = bool(os.environ.get("BIAN_AUTH_ENABLED", "1").lower() not in ("0", "false", "no", "off"))
         first_admin_secret_configured = bool(
             (os.environ.get("BIAN_AUTH_BOOTSTRAP_USER") or "admin").strip()
@@ -150,27 +157,36 @@ class DashboardStorage:
             "can_create_first_admin": False,
             "login_ready": not configured,
             "issue": "" if configured else "disabled",
+            "revocation_store_ready": None,
+            "revocation_count": None,
         }
-        if not configured:
-            return status
-        if not self.mysql_available():
-            status["issue"] = "mysql_unavailable"
-            return status
-        status["mysql_available"] = True
-        conn = self._mysql_connect()
-        try:
-            count, count_error = self._auth_user_count(conn)
-        finally:
-            conn.close()
-        if count is None:
-            status["issue"] = count_error or "user_count_unknown"
-            return status
-        status["user_count_known"] = True
-        status["has_users"] = count > 0
-        status["can_create_first_admin"] = count == 0 and first_admin_secret_configured
-        status["login_ready"] = bool(count > 0 or first_admin_secret_configured)
-        if not status["login_ready"]:
-            status["issue"] = "first_admin_secret_missing"
+        if configured:
+            revocation_status = self.auth_revocation_status()
+            status["revocation_store_ready"] = revocation_status["ready"]
+            status["revocation_count"] = revocation_status["count"]
+            if not revocation_status["ready"]:
+                status["issue"] = "auth_revocation_store_unavailable"
+            elif not self.mysql_available():
+                status["issue"] = "mysql_unavailable"
+            else:
+                status["mysql_available"] = True
+                conn = self._mysql_connect()
+                try:
+                    count, count_error = self._auth_user_count(conn)
+                finally:
+                    conn.close()
+                if count is None:
+                    status["issue"] = count_error or "user_count_unknown"
+                else:
+                    status["user_count_known"] = True
+                    status["has_users"] = count > 0
+                    status["can_create_first_admin"] = count == 0 and first_admin_secret_configured
+                    status["login_ready"] = bool(count > 0 or first_admin_secret_configured)
+                    if not status["login_ready"]:
+                        status["issue"] = "first_admin_secret_missing"
+        with shared._availability_lock:
+            shared._auth_status_cache = copy.deepcopy(status)
+            shared._auth_status_available_until = time.time() + STORAGE_HEALTH_TTL_SECONDS
         return status
 
     def mysql_available(self):
@@ -675,6 +691,26 @@ class DashboardStorage:
         shared._auth_revocation_file_key = file_key
         return dict(records)
 
+    def auth_revocation_status(self):
+        shared = getattr(self, "_scope_parent", self)
+        try:
+            with shared._auth_revocation_lock:
+                records = self._load_auth_session_revocations_locked()
+            path = os.path.abspath(AUTH_SESSION_REVOCATION_FILE)
+            parent = os.path.dirname(path) or os.curdir
+            candidate = parent
+            while not os.path.exists(candidate):
+                next_candidate = os.path.dirname(candidate)
+                if next_candidate == candidate:
+                    break
+                candidate = next_candidate
+            parent_writable = os.path.isdir(candidate) and os.access(candidate, os.W_OK)
+            file_ready = not os.path.exists(path) or (os.access(path, os.R_OK) and os.access(path, os.W_OK))
+            return {"ready": bool(parent_writable and file_ready), "count": len(records)}
+        except Exception as exc:
+            LOG.error("auth session revocation store is unavailable: %s", exc)
+            return {"ready": False, "count": None}
+
     def _write_auth_session_revocations_locked(self, records):
         shared = getattr(self, "_scope_parent", self)
         parent = os.path.dirname(AUTH_SESSION_REVOCATION_FILE) or "."
@@ -755,7 +791,7 @@ class DashboardStorage:
         return len(token_hashes)
 
     def create_auth_session(self, user_id, user_agent="", client_ip="", ttl_seconds=7 * 24 * 3600):
-        if not self.mysql_available():
+        if not self.auth_revocation_status()["ready"] or not self.mysql_available():
             return None
         token = secrets.token_urlsafe(32)
         expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(ttl_seconds))

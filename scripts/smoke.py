@@ -109,12 +109,12 @@ def test_snapshot_fallback_and_logout_cookie():
 
     class BrokenLogoutStorage:
         def delete_auth_session(self, token):
-            check(token == "session-token", "logout must delete the current session token")
+            check(token == "A" * 43, "logout must delete the current session token")
             raise TimeoutError("database unavailable")
 
     handler = object.__new__(server.Handler)
     response = {"headers": []}
-    handler.auth_token = lambda: "session-token"
+    handler.auth_token = lambda: "A" * 43
     handler.send_response = lambda status: response.update(status=status)
     handler.send_header = lambda name, value: response["headers"].append((name, value))
     handler.end_headers = lambda: response.update(ended=True)
@@ -151,6 +151,17 @@ def test_snapshot_fallback_and_logout_cookie():
         server.AUTH_ENABLED = original_auth_enabled
     local_payload = json.loads(handler.wfile.getvalue().decode("utf-8"))
     check(local_response.get("status") == 200 and local_payload.get("revoked") is True, "auth-disabled logout must ignore stale cookies")
+
+    route_handler = object.__new__(server.Handler)
+    route_handler.path = "/api/logout"
+    route_handler.require_same_origin_post = lambda: True
+    route_handler.require_auth = lambda _path: (_ for _ in ()).throw(AssertionError("logout must not require a live database session"))
+    route_called = []
+    route_handler.logout_api = lambda: route_called.append(True)
+    route_handler.do_POST()
+    check(route_called == [True], "logout routing must reach revocation before current-session authentication")
+    check(server.valid_auth_session_token("A" * 43), "generated URL-safe session token shape must be accepted")
+    check(not server.valid_auth_session_token("会" * 43), "non-ASCII cookie text must not create revocation tombstones")
 
 
 def test_logout_revocation_tombstone():
@@ -899,6 +910,64 @@ def test_mysql_health_cache_expires():
     check(store._mysql_block_until > time.time(), "failed MySQL health check must start a short cooldown")
 
 
+def test_auth_revocation_readiness_and_health_cache():
+    original_file = storage_module.AUTH_SESSION_REVOCATION_FILE
+    original_auth_env = os.environ.get("BIAN_AUTH_ENABLED")
+    original_server_storage = server.storage
+    original_server_auth = server.AUTH_ENABLED
+    test_file = ROOT / "runtime" / f"smoke-auth-readiness-{os.getpid()}-{time.time_ns()}.json"
+    storage_module.AUTH_SESSION_REVOCATION_FILE = str(test_file)
+    os.environ["BIAN_AUTH_ENABLED"] = "1"
+    try:
+        test_file.write_text("not-json", encoding="utf-8")
+        broken = storage_module.DashboardStorage()
+        broken.mysql_configured = True
+        broken.mysql_available = lambda: True
+        broken._mysql_connect = lambda: (_ for _ in ()).throw(AssertionError("broken revocation readiness must fail before MySQL"))
+        status = broken.auth_status()
+        check(not status["login_ready"], "corrupt revocation state must make authentication unready")
+        check(status["issue"] == "auth_revocation_store_unavailable", "health must classify revocation storage failure")
+        check(broken.create_auth_session(1) is None, "login must not issue a session while revocation storage is unusable")
+
+        server.storage = broken
+        server.AUTH_ENABLED = True
+        health = server.health_payload(check_storage=True)
+        check(not health["ok"] and health["auth"]["revocation_store_ready"] is False, "public health must fail when session revocation cannot be enforced")
+
+        test_file.write_text('{"version":1,"revocations":[]}', encoding="utf-8")
+        healthy = storage_module.DashboardStorage()
+        healthy.mysql_configured = True
+        healthy._mysql_available_until = time.time() + 60
+        connection_count = {"value": 0}
+
+        class CountConnection:
+            def close(self):
+                pass
+
+        def connect_once_per_ttl():
+            connection_count["value"] += 1
+            return CountConnection()
+
+        healthy._mysql_connect = connect_once_per_ttl
+        healthy._auth_user_count = lambda _conn: (1, "")
+        server.storage = healthy
+        for _ in range(5):
+            check(server.health_payload(check_storage=True)["ok"], "healthy cached auth readiness must stay ready")
+        check(connection_count["value"] == 1, "public health must cache the full auth database readiness check within its TTL")
+    finally:
+        storage_module.AUTH_SESSION_REVOCATION_FILE = original_file
+        if original_auth_env is None:
+            os.environ.pop("BIAN_AUTH_ENABLED", None)
+        else:
+            os.environ["BIAN_AUTH_ENABLED"] = original_auth_env
+        server.storage = original_server_storage
+        server.AUTH_ENABLED = original_server_auth
+        try:
+            test_file.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def test_signal_review_file_reconciliation():
     original_file = storage_module.SIGNAL_REVIEW_FILE
     test_file = ROOT / "runtime" / f"smoke-signal-reviews-{os.getpid()}-{time.time_ns()}.json"
@@ -1048,7 +1117,7 @@ def test_deploy_contracts():
     )
     release_id = "a" * 64
     remote = deploy.remote_script(args, "/tmp/bian-dashboard-test.tar.gz", release_id)
-    finalize = deploy.finalize_remote_script(args, "/tmp/bian-dashboard-test.tar.gz")
+    finalize = deploy.finalize_remote_script(args, "/tmp/bian-dashboard-test.tar.gz", release_id)
     health_check = f"http://127.0.0.1:9000/api/health?release_id={release_id}"
     archive_cleanup = "rm -f /tmp/bian-dashboard-test.tar.gz"
     check("BIAN_PUBLIC_PORT=9000" in remote, "public port must be persisted into the remote .env")
@@ -1061,10 +1130,19 @@ def test_deploy_contracts():
     check("BIAN_REDIS_PASSWORD=$redis_password" in remote, "first deploy must generate a Redis password")
     check(f"BIAN_RELEASE_ID={release_id}" in remote, "release id must be persisted into the remote environment")
     check("mktemp -d" in remote and 'mv "$release_dir" /opt/bian-dashboard' in remote, "deploy must replace from a staging directory")
-    check("/opt/bian-dashboard.previous" in remote, "deploy must retain the previous release until health passes")
+    release_backup = f"/opt/bian-dashboard.previous.{release_id}"
+    check(release_backup in remote, "deploy must retain a release-specific previous directory until health passes")
     check(health_check in remote, "loopback health must verify the new release id")
-    check(archive_cleanup not in remote and "rm -rf /opt/bian-dashboard.previous" not in remote, "deploy phase must retain rollback assets for external verification")
-    check(archive_cleanup in finalize and "rm -rf /opt/bian-dashboard.previous" in finalize, "finalize phase must clean rollback assets")
+    check("flock -w 30 9" in remote and "flock -w 30 9" in finalize, "deploy switching and cleanup must share a remote lock")
+    check(remote.index("mkdir -p /opt") < remote.index("exec 9>/opt/bian-dashboard.deploy.lock"), "remote parent must exist before the deployment lock is opened")
+    check(archive_cleanup not in remote and f"rm -rf {release_backup}" not in remote, "deploy phase must retain rollback assets for external verification")
+    check(archive_cleanup in finalize and f"rm -rf {release_backup}" in finalize, "finalize phase must clean only its release-specific rollback asset")
+    other_release_id = "b" * 64
+    other_finalize = deploy.finalize_remote_script(args, "/tmp/bian-dashboard-other.tar.gz", other_release_id)
+    check(release_backup not in other_finalize, "one release finalizer must not delete another release's rollback directory")
+    check(deploy.remote_archive_path(release_id) != deploy.remote_archive_path(other_release_id), "concurrent releases must not share an uploaded archive path")
+    check('echo "first admin password: $bootstrap_password"' not in remote, "deployment output must not expose the bootstrap admin password")
+    check("first admin password stored in the release .env" in remote, "deployment output should identify the secure password location")
     public_health_check = f"https://dashboard.example.com/api/health?release_id={release_id}"
     check(public_health_check in remote, "deployment must verify the configured public HTTPS health endpoint")
     check(remote.index(health_check) < remote.index(public_health_check), "public HTTPS must run only after loopback verifies the same release")
@@ -1176,6 +1254,7 @@ def main():
     test_storage_timeouts_are_wired()
     test_http_and_sse_resource_bounds()
     test_mysql_health_cache_expires()
+    test_auth_revocation_readiness_and_health_cache()
     test_signal_review_file_reconciliation()
     test_signal_review_file_retention_is_per_user()
     test_required_assets_and_report_contract()

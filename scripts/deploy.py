@@ -110,6 +110,17 @@ def release_health_url(public_url, release_id):
     return public_url.rstrip("/") + "/api/health?" + urlencode({"release_id": release_id})
 
 
+def normalize_release_id(value):
+    release_id = str(value or "").strip().lower()
+    if len(release_id) != 64 or any(char not in "0123456789abcdef" for char in release_id):
+        raise ValueError("release_id must be a 64-character hexadecimal digest")
+    return release_id
+
+
+def remote_archive_path(release_id):
+    return f"/tmp/bian-dashboard-{normalize_release_id(release_id)}.tar.gz"
+
+
 def verify_public_health(args, release_id):
     if not args.public_url:
         return
@@ -228,15 +239,15 @@ def scp_base(args):
 
 
 def remote_script(args, remote_archive, release_id):
+    release_id = normalize_release_id(release_id)
+    remote_base = args.remote_dir.rstrip("/")
     remote_dir = shlex.quote(args.remote_dir)
     remote_parent = shlex.quote(posixpath.dirname(args.remote_dir.rstrip("/")) or "/")
-    release_template = shlex.quote(args.remote_dir.rstrip("/") + ".release.XXXXXX")
-    backup_dir = shlex.quote(args.remote_dir.rstrip("/") + ".previous")
+    release_template = shlex.quote(remote_base + ".release.XXXXXX")
+    backup_dir = shlex.quote(remote_base + ".previous." + release_id)
+    legacy_backup_dir = shlex.quote(remote_base + ".previous")
+    lock_file = shlex.quote(remote_base + ".deploy.lock")
     archive = shlex.quote(remote_archive)
-    release_id = str(release_id or "").strip()
-    if len(release_id) != 64 or any(char not in "0123456789abcdef" for char in release_id.lower()):
-        raise ValueError("release_id must be a 64-character hexadecimal digest")
-    release_id = release_id.lower()
     public_url = normalize_public_url(getattr(args, "public_url", ""))
     public_check = ""
     if public_url:
@@ -263,6 +274,8 @@ fi
 """
     return f"""set -eu
 mkdir -p {remote_parent}
+exec 9>{lock_file}
+flock -w 30 9
 release_dir=$(mktemp -d {release_template})
 trap 'if [ -n "$release_dir" ]; then rm -rf "$release_dir"; fi' EXIT
 tar -xzf {archive} -C "$release_dir"
@@ -272,10 +285,15 @@ fi
 if [ -f {backup_dir}/.env ]; then
   chmod 600 {backup_dir}/.env
 fi
+if [ -f {legacy_backup_dir}/.env ]; then
+  chmod 600 {legacy_backup_dir}/.env
+fi
 if [ -f {remote_dir}/.env ]; then
   cp -p {remote_dir}/.env "$release_dir/.env"
 elif [ -f {backup_dir}/.env ]; then
   cp -p {backup_dir}/.env "$release_dir/.env"
+elif [ -f {legacy_backup_dir}/.env ]; then
+  cp -p {legacy_backup_dir}/.env "$release_dir/.env"
 else
   cp "$release_dir/.env.example" "$release_dir/.env"
   bootstrap_password=$(openssl rand -hex 18)
@@ -286,7 +304,7 @@ else
   sed -i "s/^BIAN_MYSQL_PASSWORD=.*/BIAN_MYSQL_PASSWORD=$mysql_password/" "$release_dir/.env"
   sed -i "s/^BIAN_MYSQL_ROOT_PASSWORD=.*/BIAN_MYSQL_ROOT_PASSWORD=$mysql_root_password/" "$release_dir/.env"
   sed -i "s/^BIAN_REDIS_PASSWORD=.*/BIAN_REDIS_PASSWORD=$redis_password/" "$release_dir/.env"
-  echo "first admin password: $bootstrap_password"
+  echo "first admin password stored in the release .env; retrieve it over SSH after deployment"
 fi
 if grep -q '^BIAN_PUBLIC_PORT=' "$release_dir/.env"; then
   sed -i "s/^BIAN_PUBLIC_PORT=.*/BIAN_PUBLIC_PORT={args.public_port}/" "$release_dir/.env"
@@ -311,18 +329,23 @@ fi
 chmod 600 "$release_dir/.env"
 cd "$release_dir"
 docker compose config >/dev/null
-if [ -d {remote_dir} ]; then
-  if [ -d {backup_dir} ]; then
-    rm -rf {remote_dir}
-  else
+if [ -f {remote_dir}/.env ] && grep -q '^BIAN_RELEASE_ID={release_id}$' {remote_dir}/.env; then
+  rm -rf "$release_dir"
+  release_dir=''
+else
+  if [ -e {backup_dir} ]; then
+    echo "release-specific backup already exists; refusing to overwrite it" >&2
+    exit 1
+  fi
+  if [ -d {remote_dir} ]; then
     mv {remote_dir} {backup_dir}
   fi
+  if [ -f {backup_dir}/.env ]; then
+    chmod 600 {backup_dir}/.env
+  fi
+  mv "$release_dir" {remote_dir}
+  release_dir=''
 fi
-if [ -f {backup_dir}/.env ]; then
-  chmod 600 {backup_dir}/.env
-fi
-mv "$release_dir" {remote_dir}
-release_dir=''
 cd {remote_dir}
 docker compose up -d --build
 {ufw}
@@ -334,10 +357,15 @@ trap - EXIT
 """
 
 
-def finalize_remote_script(args, remote_archive):
-    backup_dir = shlex.quote(args.remote_dir.rstrip("/") + ".previous")
+def finalize_remote_script(args, remote_archive, release_id):
+    release_id = normalize_release_id(release_id)
+    remote_base = args.remote_dir.rstrip("/")
+    backup_dir = shlex.quote(remote_base + ".previous." + release_id)
+    lock_file = shlex.quote(remote_base + ".deploy.lock")
     archive = shlex.quote(remote_archive)
     return f"""set -eu
+exec 9>{lock_file}
+flock -w 30 9
 rm -rf {backup_dir}
 rm -f {archive}
 """
@@ -352,15 +380,15 @@ def main():
     if changes:
         print("warning: deploying modified and untracked non-ignored files because --allow-dirty was specified")
     target = f"{args.user}@{args.host}"
-    remote_archive = f"/tmp/bian-dashboard-{os.getpid()}.tar.gz"
     with tempfile.TemporaryDirectory(prefix="bian-deploy-") as temp_dir:
         archive_path = Path(temp_dir) / "bian-dashboard.tar.gz"
         build_archive(archive_path, include_untracked=args.allow_dirty)
         release_id = archive_release_id(archive_path)
+        remote_archive = remote_archive_path(release_id)
         mkdir_command = ssh_base(args) + [target, "mkdir -p /tmp"]
         upload_command = scp_base(args) + [str(archive_path), f"{target}:{remote_archive}"]
         deploy_command = ssh_base(args) + [target, "bash -lc " + shlex.quote(remote_script(args, remote_archive, release_id))]
-        finalize_command = ssh_base(args) + [target, "bash -lc " + shlex.quote(finalize_remote_script(args, remote_archive))]
+        finalize_command = ssh_base(args) + [target, "bash -lc " + shlex.quote(finalize_remote_script(args, remote_archive, release_id))]
         run_checked(mkdir_command, args.retries, args.retry_delay, args.dry_run)
         run_checked(upload_command, args.retries, args.retry_delay, args.dry_run)
         run_checked(deploy_command, args.retries, args.retry_delay, args.dry_run)

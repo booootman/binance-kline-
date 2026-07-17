@@ -816,9 +816,24 @@
     btn._bound = true;
     btn.addEventListener('click', function () {
       apiFetch('api/logout', { method: 'POST', cache: 'no-store' })
-        .then(function (res) { return res.json().catch(function () { return {}; }); })
-        .catch(function () {})
-        .then(function () { window.location.href = '/login'; });
+        .then(readLogoutResponse)
+        .then(function () { window.location.href = '/login'; })
+        .catch(function (error) {
+          if (!authRedirectStarted && window.alert) {
+            window.alert('退出未完全成功：' + (error.message || '服务端会话未撤销'));
+          }
+          window.location.href = '/login';
+        });
+    });
+  }
+  function readLogoutResponse(res) {
+    return res.json().catch(function () { return {}; }).then(function (payload) {
+      if (!res.ok || payload.revoked !== true) {
+        var error = new Error(payload.error || ('HTTP ' + res.status));
+        error.status = res.status;
+        throw error;
+      }
+      return payload;
     });
   }
   function setDiagnosticsMessage(text, cls) {
