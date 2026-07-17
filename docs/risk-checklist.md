@@ -21,10 +21,13 @@
 - Deployment source risk: production deploys should use a clean Git worktree. `--allow-dirty` is an explicit exception, and ignored files plus the local `.env` must remain excluded.
 - Deployment recovery risk: the previous release directory and uploaded archive are retained until the new release passes health checks. A failed release still requires operator review before deciding whether to retry or restore the previous directory.
 - Preference conflict risk: rejected patches are reconciled against the request's server snapshot. Same-field server changes win; only fields unchanged on the server are retried. Simultaneous edits still require deployment-level multi-session verification.
+- Preference recovery risk: a failed reconciliation read must retain its patch in a dedicated recovery queue and retry only the read; it must never promote the unresolved patch into a POST.
 - Preference outage risk: configured MySQL unavailability must return HTTP 503. Treating it as empty revision zero would make a stale browser overwrite the recovered database.
+- Local preference fallback risk: an explicitly unconfigured MySQL backend must disable server preference POSTs; otherwise the documented localStorage mode creates permanent retry traffic.
 - Realtime worker-generation risk: a stopped worker may finish a delayed connect or receive after its replacement starts. Every direct-worker state mutation must verify the current generation.
 - Same-origin parsing risk: an entirely missing source header remains allowed for CLI clients, but present opaque or malformed values such as `Origin: null` must fail closed.
-- Preference unload risk: an in-flight-only beacon must reuse the original request revision. Generating a newer revision would let an unconfirmed stale patch bypass conflict ordering.
+- Preference unload risk: in-flight and pending patches must be sent separately. The in-flight patch keeps its original revision, while the pending patch gets a newer revision without inheriting older fields.
+- Password-change transaction risk: password hash update and other-session revocation must commit atomically. Reporting success after a failed revocation leaves old authenticated sessions active.
 - Realtime status risk: an explicit upstream error with no fresh price is offline even when the browser-to-server SSE remains open; transport connectivity alone must not display an endless connecting state.
 - Symbol restore risk: removed default symbols must be excluded before calculating the eight-symbol capacity, or valid custom symbols will be truncated during boot.
 - Global-ignore risk: dirty deployment must preserve repository, global, and Git-info ignore rules and fail closed if any configured ignore source is unreadable.

@@ -81,3 +81,11 @@ This pass tightens the P0 trust issues from `docs/improvement-suggestions.md`: h
 - Direct WebSocket workers carry a generation token; stopped workers cannot publish connection state, errors, counters, timestamps, or messages after replacement.
 - Same-origin POST validation distinguishes an absent CLI source header from a present invalid source and rejects `Origin: null` or malformed values.
 - Human release review should exercise two authenticated browser sessions, a MySQL interruption, and a real Binance WebSocket restart before deployment approval.
+
+## 2026-07-17 Preference Recovery And Auth Atomicity
+
+- Failed preference conflict reads retain a dedicated recovery record and retry GET reconciliation with backoff; unresolved patches are never promoted into POST writes.
+- Explicitly unconfigured MySQL disables server preference synchronization while preserving browser localStorage behavior.
+- Page unload sends the active in-flight patch and newer pending patch separately, preserving the old revision and preventing old fields from inheriting a newer revision.
+- Password hash update and other-session revocation now share one MySQL transaction; session-revocation failure rolls back the password change.
+- Human release review should still validate two real authenticated sessions, forced MySQL failure during password change, and browser pagehide delivery ordering.

@@ -64,6 +64,8 @@
   var preferencesUnloadFlushed = false;
   var preferenceServerRevision = 0;
   var preferenceServerSnapshot = {};
+  var preferenceConflictRecovery = null;
+  var preferenceServerSyncEnabled = true;
   var root = getComputedStyle(document.documentElement);
   var C = {
     ink: root.getPropertyValue('--ink').trim(),
@@ -293,6 +295,10 @@
     var mysql = payload && payload.storage && payload.storage.mysql;
     return !(mysql && mysql.configured === true && mysql.available === false);
   }
+  function preferenceStorageConfigured(payload) {
+    var mysql = payload && payload.storage && payload.storage.mysql;
+    return !(mysql && mysql.configured === false);
+  }
   function updatePreferenceServerState(prefs, revision, replace) {
     var normalized = prefs && typeof prefs === 'object' ? clonePreferencePatch(prefs) : {};
     if (replace) preferenceServerSnapshot = normalized;
@@ -329,8 +335,39 @@
         mergePreferencePatch(pendingPreferencePatch, retryPatch, false);
       });
   }
+  function completePreferenceSave(retryableFailure) {
+    preferenceSaveInFlight = false;
+    preferenceInFlightPatch = {};
+    preferenceInFlightRevision = 0;
+    if (!preferenceServerSyncEnabled) {
+      pendingPreferencePatch = {};
+      preferenceConflictRecovery = null;
+      return;
+    }
+    var hasPendingWork = !!preferenceConflictRecovery || Object.keys(pendingPreferencePatch).length > 0;
+    if (hasPendingWork && !preferenceSaveTimer) {
+      preferenceSaveTimer = setTimeout(flushServerPreferences, retryableFailure ? preferenceRetryDelayMs : 0);
+      if (retryableFailure) preferenceRetryDelayMs = Math.min(60000, preferenceRetryDelayMs * 2);
+    }
+  }
+  function flushPreferenceConflictRecovery() {
+    if (!preferenceConflictRecovery) return false;
+    var recovery = preferenceConflictRecovery;
+    preferenceSaveInFlight = true;
+    preferenceInFlightPatch = {};
+    preferenceInFlightRevision = 0;
+    reconcilePreferenceConflict(recovery.patch, recovery.baseSnapshot).then(function () {
+      preferenceConflictRecovery = null;
+      preferenceRetryDelayMs = 5000;
+      completePreferenceSave(false);
+    }).catch(function (err) {
+      console.warn('[dashboard] preference conflict reconciliation failed:', err.message);
+      completePreferenceSave(true);
+    });
+    return true;
+  }
   function saveServerPreferences(patch) {
-    if (!patch || typeof patch !== 'object') return;
+    if (!preferenceServerSyncEnabled || !patch || typeof patch !== 'object') return;
     preferencesUnloadFlushed = false;
     mergePreferencePatch(pendingPreferencePatch, patch, true);
     if (preferenceSaveTimer) clearTimeout(preferenceSaveTimer);
@@ -339,7 +376,13 @@
   function flushServerPreferences() {
     if (preferenceSaveTimer) clearTimeout(preferenceSaveTimer);
     preferenceSaveTimer = null;
+    if (!preferenceServerSyncEnabled) {
+      pendingPreferencePatch = {};
+      preferenceConflictRecovery = null;
+      return;
+    }
     if (preferenceSaveInFlight) return;
+    if (flushPreferenceConflictRecovery()) return;
     var prefs = pendingPreferencePatch;
     pendingPreferencePatch = {};
     if (!prefs || !Object.keys(prefs).length) return;
@@ -357,6 +400,10 @@
       cache: 'no-store'
     }).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (payload) {
+        if (!preferenceStorageConfigured(payload)) {
+          preferenceServerSyncEnabled = false;
+          return;
+        }
         if (!res.ok || payload.saved !== true) {
           var error = new Error(payload.error || ('HTTP ' + res.status));
           error.status = res.ok ? 503 : res.status;
@@ -375,9 +422,17 @@
       saveFailed = true;
       if (err && err.preferenceConflict) {
         console.warn('[dashboard] preference revision conflict; reconciling server state');
+        preferenceInFlightPatch = {};
+        preferenceInFlightRevision = 0;
         return reconcilePreferenceConflict(prefs, baseSnapshot).then(function () {
           saveFailed = false;
+          preferenceRetryDelayMs = 5000;
         }).catch(function (reconcileError) {
+          preferenceConflictRecovery = {
+            patch: clonePreferencePatch(prefs),
+            baseSnapshot: clonePreferencePatch(baseSnapshot)
+          };
+          retryableFailure = true;
           console.warn('[dashboard] preference conflict reconciliation failed:', reconcileError.message);
         });
       }
@@ -386,24 +441,11 @@
       retryableFailure = !status || status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
       console.warn('[dashboard] preference sync failed:', err.message);
     }).then(function () {
-      preferenceSaveInFlight = false;
-      preferenceInFlightPatch = {};
-      preferenceInFlightRevision = 0;
-      if (Object.keys(pendingPreferencePatch).length && !preferenceSaveTimer && (!saveFailed || retryableFailure)) {
-        preferenceSaveTimer = setTimeout(flushServerPreferences, retryableFailure ? preferenceRetryDelayMs : 0);
-        if (retryableFailure) preferenceRetryDelayMs = Math.min(60000, preferenceRetryDelayMs * 2);
-      }
+      completePreferenceSave(retryableFailure && saveFailed);
     });
   }
-  function flushPreferencesOnUnload() {
-    if (preferencesUnloadFlushed) return;
-    preferencesUnloadFlushed = true;
-    var prefs = {};
-    mergePreferencePatch(prefs, preferenceInFlightPatch, true);
-    mergePreferencePatch(prefs, pendingPreferencePatch, true);
-    if (!Object.keys(prefs).length) return;
-    var hasPending = Object.keys(pendingPreferencePatch).length > 0;
-    var revision = !hasPending && preferenceInFlightRevision ? preferenceInFlightRevision : nextPreferenceRevision();
+  function sendPreferencePatchOnUnload(prefs, revision) {
+    if (!prefs || !Object.keys(prefs).length || !revision) return;
     var body = JSON.stringify({ preferences: prefs, revision: revision });
     var sent = false;
     if (navigator.sendBeacon && typeof Blob !== 'undefined') {
@@ -417,6 +459,14 @@
         cache: 'no-store',
         keepalive: true
       }).catch(function () {});
+    }
+  }
+  function flushPreferencesOnUnload() {
+    if (preferencesUnloadFlushed || !preferenceServerSyncEnabled) return;
+    preferencesUnloadFlushed = true;
+    sendPreferencePatchOnUnload(preferenceInFlightPatch, preferenceInFlightRevision);
+    if (Object.keys(pendingPreferencePatch).length) {
+      sendPreferencePatchOnUnload(pendingPreferencePatch, nextPreferenceRevision());
     }
   }
   function normalizeServerSymbolPreferences(prefs) {
@@ -471,6 +521,10 @@
     fetch('api/preferences', { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
+        if (!preferenceStorageConfigured(payload)) {
+          preferenceServerSyncEnabled = false;
+          return;
+        }
         if (!preferenceStorageReady(payload)) throw new Error('preference storage is unavailable');
         var serverRevision = Math.max(0, Number(payload.revision) || 0);
         var serverPrefs = payload.preferences || {};

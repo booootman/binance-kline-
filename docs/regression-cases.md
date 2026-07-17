@@ -41,4 +41,7 @@
 39. Confirm configured MySQL preference storage returns HTTP 503 while unavailable and does not trigger a full localStorage snapshot writeback.
 40. Confirm a stopped realtime worker that finishes connecting late cannot change connection counters, errors, timestamps, prices, or the current hub's connected state.
 41. Confirm missing Origin/Referer headers remain CLI-compatible, while `Origin: null` and malformed source headers are rejected.
-42. Confirm an unload beacon replaying only the active in-flight preference patch reuses that request's revision instead of promoting the patch.
+42. Confirm mixed unload work sends the active in-flight patch with its original revision and sends newer pending fields separately without copying old fields into the newer revision.
+43. Confirm a failed conflict-reconciliation GET retains the rejected patch and retries another GET before any safe field is written.
+44. Confirm `storage.mysql.configured=false` disables server preference sync while localStorage continues to work without recurring POST retries.
+45. Confirm password hash update and other-session revocation use one transaction, and a revocation failure rolls back the password update.

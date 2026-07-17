@@ -2461,11 +2461,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if new_password == current_password:
                 self.send_json(400, {"changed": False, "error": "new password must be different"})
                 return
-            ok, error = storage.change_auth_password(user["id"], current_password, new_password)
+            ok, error = storage.change_auth_password(user["id"], current_password, new_password, keep_token=token)
             if not ok:
                 self.send_json(401, {"changed": False, "error": error or "password change failed"})
                 return
-            storage.delete_other_auth_sessions(user["id"], token)
             LOG.warning("auth password changed; user=%s; client_ip=%s", user.get("username"), self.client_ip())
             self.send_json(200, {"changed": True, "user": {"username": user.get("username"), "role": user.get("role")}})
         except BadRequestError as exc:

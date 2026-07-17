@@ -627,7 +627,7 @@ class DashboardStorage:
         finally:
             conn.close()
 
-    def change_auth_password(self, user_id, current_password, new_password):
+    def change_auth_password(self, user_id, current_password, new_password, keep_token=""):
         if not user_id or not self.mysql_available():
             return False, "auth database is not ready"
         conn = self._mysql_connect()
@@ -656,8 +656,19 @@ class DashboardStorage:
                 """,
                 (hash_password(new_password), int(user_id)),
             )
+            keep_hash = session_token_hash(keep_token) if keep_token else ""
+            if keep_hash:
+                cur.execute(
+                    "DELETE FROM bian_auth_sessions WHERE user_id=%s AND token_hash<>%s",
+                    (int(user_id), keep_hash),
+                )
+            else:
+                cur.execute("DELETE FROM bian_auth_sessions WHERE user_id=%s", (int(user_id),))
             conn.commit()
             return True, ""
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 

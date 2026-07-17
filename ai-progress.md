@@ -1577,3 +1577,20 @@
 - Restarted the local development backend on `127.0.0.1:8876`; one listener remained, health was OK, and the served frontend contained `reconcilePreferenceConflict`.
 - In-app browser navigation to the local URL was blocked by the browser security policy, so browser console/render verification was skipped rather than bypassed.
 - Real multi-session MySQL ordering and a healthy Binance WebSocket restart remain deployment-environment checks.
+
+## 2026-07-17 Preference recovery and password transaction remediation
+
+- Added a dedicated preference conflict-recovery queue. A failed reconciliation GET now retries the GET with backoff and never promotes an unresolved stale patch into a POST.
+- Disabled server preference synchronization when the API explicitly reports MySQL as unconfigured, preserving localStorage fallback without permanent retry traffic.
+- Split pagehide delivery into an original-revision in-flight patch and a separate newer pending patch, preventing old fields from inheriting the pending revision.
+- Moved password hash update and other-session revocation into one MySQL transaction and pass the current session token into that transaction.
+- Added deterministic regressions for reconciliation read recovery, unconfigured storage fallback, mixed unload beacons, atomic commit, and rollback on session-revocation failure.
+
+## Preference recovery remediation verification
+
+- Passed `python -B scripts\smoke.py`, including atomic password/session commit and rollback assertions.
+- Passed `node scripts\frontend-smoke.js`, including failed reconciliation GET recovery, mixed unload separation, and unconfigured MySQL fallback assertions.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok`, `frontend smoke ok`, and `verify ok`.
+- Passed Python compilation, frontend syntax, `feature_list.json` parsing, and `git diff --check` apart from existing LF-to-CRLF warnings.
+- GitNexus detected 57 changed symbols and 11 affected processes for this patch, with `high` overall impact because preference readiness participates in boot and conflict flows.
+- Real MySQL transaction failure injection, two-session browser ordering, and pagehide network delivery remain deployment-environment checks.

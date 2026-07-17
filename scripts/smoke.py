@@ -407,6 +407,103 @@ def test_same_origin_rejects_invalid_source_headers():
     check(server.same_origin_allowed("https://dashboard.example.com", host), "matching Origin must remain allowed")
 
 
+def test_password_change_revokes_sessions_atomically():
+    current_hash = storage_module.hash_password("old-password")
+
+    class AuthCursor:
+        def __init__(self, fail_delete=False):
+            self.fail_delete = fail_delete
+            self.statements = []
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            self.statements.append((normalized, params))
+            if self.fail_delete and normalized.startswith("DELETE FROM bian_auth_sessions"):
+                raise TimeoutError("session revoke failed")
+
+        def fetchone(self):
+            return current_hash, 0
+
+    class AuthConnection:
+        def __init__(self, fail_delete=False):
+            self.cursor_obj = AuthCursor(fail_delete=fail_delete)
+            self.commits = 0
+            self.rollbacks = 0
+
+        def cursor(self):
+            return self.cursor_obj
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+        def close(self):
+            pass
+
+    store = storage_module.DashboardStorage()
+    store.mysql_configured = True
+    store.mysql_available = lambda: True
+    store._ensure_auth_schema = lambda conn: None
+    success_conn = AuthConnection()
+    store._mysql_connect = lambda: success_conn
+    changed = store.change_auth_password(7, "old-password", "new-password", keep_token="current-token")
+    check(changed == (True, ""), "password change and session revoke must succeed together")
+    sql = [statement for statement, _params in success_conn.cursor_obj.statements]
+    check(any(statement.startswith("UPDATE bian_auth_users") for statement in sql), "password hash must be updated")
+    check(any(statement.startswith("DELETE FROM bian_auth_sessions") for statement in sql), "other sessions must be revoked")
+    check(success_conn.commits == 1, "password and session changes must share one commit")
+
+    failed_conn = AuthConnection(fail_delete=True)
+    store._mysql_connect = lambda: failed_conn
+    try:
+        store.change_auth_password(7, "old-password", "new-password", keep_token="current-token")
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("session revoke failure must fail the password transaction")
+    check(failed_conn.commits == 0 and failed_conn.rollbacks == 1, "failed session revoke must roll back the password update")
+
+    class AtomicAuthStorage:
+        def __init__(self):
+            self.keep_token = None
+
+        def change_auth_password(self, user_id, current_password, new_password, keep_token=""):
+            self.keep_token = keep_token
+            return True, ""
+
+        def delete_other_auth_sessions(self, *_args, **_kwargs):
+            raise AssertionError("handler must not use a second session transaction")
+
+    fake_storage = AtomicAuthStorage()
+    response = {}
+    handler = object.__new__(server.Handler)
+    handler.auth_token = lambda: "current-token"
+    handler.current_user = lambda: {"id": 7, "username": "alice", "role": "user"}
+    handler.read_json_body = lambda: {
+        "current_password": "old-password",
+        "new_password": "new-password",
+        "confirm_password": "new-password",
+    }
+    handler.client_ip = lambda: "127.0.0.1"
+    handler.send_json = lambda status, payload: response.update(status=status, payload=payload)
+    original_enabled = server.AUTH_ENABLED
+    original_storage = server.storage
+    original_ready = server.ensure_auth_ready
+    try:
+        server.AUTH_ENABLED = True
+        server.storage = fake_storage
+        server.ensure_auth_ready = lambda: True
+        handler.change_password_api()
+    finally:
+        server.AUTH_ENABLED = original_enabled
+        server.storage = original_storage
+        server.ensure_auth_ready = original_ready
+    check(response.get("status") == 200 and response.get("payload", {}).get("changed"), "atomic password change must report success")
+    check(fake_storage.keep_token == "current-token", "current session token must be preserved inside the atomic transaction")
+
+
 def test_storage_timeouts_are_wired():
     captured = {}
 
@@ -516,6 +613,7 @@ def main():
     test_redis_read_degrades()
     test_preference_revision_guard()
     test_same_origin_rejects_invalid_source_headers()
+    test_password_change_revokes_sessions_atomically()
     test_storage_timeouts_are_wired()
     test_mysql_health_cache_expires()
     test_required_assets_and_report_contract()
