@@ -31,7 +31,8 @@ python scripts/deploy.py
 ```
 
 The defaults target `root@159.223.91.36`, use the private key at `~/Desktop/id_ed25519`,
-upload a clean project package, preserve the remote `.env` if it already exists, and run:
+require a clean Git worktree, upload only selected Git files, preserve the remote
+`.env` if it already exists, and run:
 
 ```bash
 docker compose up -d --build
@@ -42,13 +43,31 @@ Useful options:
 ```bash
 python scripts/deploy.py --host 159.223.91.36 --key C:\Users\WIN11\Desktop\id_ed25519
 python scripts/deploy.py --retries 5 --retry-delay 20 --scp-limit-kbps 1024
-python scripts/deploy.py --public-port 8000 --check-market
+python scripts/deploy.py --public-port 9000 --check-market
 python scripts/deploy.py --no-ufw
+python scripts/deploy.py --allow-dirty --dry-run
 ```
 
 By default, when UFW is active on the server, the script only allows the current SSH client IP to access the dashboard port. It does not open port `8000` to the whole internet.
 `--check-market` only curls `/api/market` when auth is disabled; with auth enabled,
 verify market data after logging in.
+
+The default deployment refuses modified or untracked files. `--allow-dirty` is
+an explicit development override that includes modified tracked files and
+untracked non-ignored files; Git-ignored files and the local `.env` are never
+packaged. Commit and review production changes before deploying whenever
+possible.
+
+The dirty-worktree override keeps repository, global, and Git-info ignore rules
+enabled. If Git reports that an ignore source cannot be read, packaging fails
+closed instead of treating globally ignored files as upload candidates.
+
+The remote archive is extracted into a temporary release directory. The
+previous application directory remains as `/opt/bian-dashboard.previous` until
+the new Compose stack passes `/api/health`, and the uploaded archive is deleted
+only after success so a failed SSH deployment step can reuse it. `--public-port`
+updates `BIAN_PUBLIC_PORT` in the preserved remote `.env`, so later manual
+Compose restarts keep the selected port.
 
 ## Environment
 
@@ -65,6 +84,11 @@ verify market data after logging in.
 - `BIAN_AUTH_REQUIRE_SAME_ORIGIN_POST`: default `1`; dashboard POST APIs, including login, reject browser requests whose `Origin`/`Referer` host does not match `Host` or a trusted `X-Forwarded-Host`. `X-Forwarded-Host` is trusted only when `BIAN_AUTH_TRUST_PROXY_HEADERS=1` and the peer is a local/private reverse proxy.
 - `BIAN_EXPOSE_ERROR_DETAILS`: default `0`; keep disabled on public deployments so `/api/market` returns only classified user-facing errors instead of analyzer `detail`/`stderr`. Temporarily set to `1` only while debugging server logs and upstream failures.
 - `BIAN_SSE_MAX_SECONDS`: maximum lifetime of one browser SSE response, default `21600` (6 hours). EventSource reconnects automatically; reverse proxies must disable response buffering and allow long-lived reads.
+- `BIAN_REALTIME_STALE_SECONDS`: restart a connected realtime worker after this many seconds without a Binance message, default `45`.
+- `BIAN_MYSQL_CONNECT_TIMEOUT_SECONDS` / `BIAN_MYSQL_READ_TIMEOUT_SECONDS` / `BIAN_MYSQL_WRITE_TIMEOUT_SECONDS`: bound MySQL stalls; defaults are `3` / `5` / `5` seconds.
+- `BIAN_REDIS_CONNECT_TIMEOUT_SECONDS` / `BIAN_REDIS_READ_TIMEOUT_SECONDS`: bound Redis stalls; both default to `2` seconds. Failed reads degrade to the next cache/analyzer layer.
+- `BIAN_REDIS_PASSWORD`: optional Redis authentication secret. A non-empty value is passed to the dashboard, enables Redis `requirepass`, and is used by the container healthcheck. The deployment script generates it on a fresh remote `.env`.
+- `BIAN_STRATEGY_SNAPSHOT_LIMIT`: retained strategy snapshots per authenticated storage user, default `1000`.
 - `BIAN_SIGNAL_REVIEW_TAKER_FEE_BPS` / `BIAN_SIGNAL_REVIEW_SLIPPAGE_BPS`: one-way fee/slippage assumptions used when live-review outcomes are shown net of estimated round-trip cost; defaults are `5` and `2`.
 - `BIAN_MYSQL_USER`, `BIAN_MYSQL_PASSWORD`, `BIAN_MYSQL_ROOT_PASSWORD`, `BIAN_MYSQL_DATABASE`.
 

@@ -1493,3 +1493,87 @@
 - Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok` and `verify ok`.
 - Passed `node --check web\assets\charts.js` and `git diff --check` apart from existing LF-to-CRLF warnings.
 - SSH and public-browser access to `159.223.91.36` timed out from the current environment, so deployed-container logs could not be inspected and the rebuilt server still needs deployment verification.
+
+## 2026-07-16 Three-round review remediation
+
+- Aligned live-review price and time by recording the analyzer ticker observation time, refreshing a Binance futures book midpoint immediately before publication, and refusing to treat a stale analysis-start price as the publication price.
+- Changed 1m review sampling to fetch the signal's current minute, include only bars that close on or before the exact 5m/15m/1h horizon, and prevent recorded entry/stop times from predating publication.
+- Added realtime WebSocket supervision for exited workers and stale upstream messages, observable restart counters, and atomic hub acquisition/idle cleanup to prevent orphaned duplicate Binance connections.
+- Canonicalized market cache keys as sorted symbol sets and made market/realtime APIs reject more than eight unique symbols instead of silently truncating them.
+- Deferred waiting `partial` review rows to the back of the queue and added fair update-time ordering for the runtime-file fallback so old 15m/1h waits cannot starve newer due records.
+- Made Redis read exceptions degrade to cache misses with cooldown; added bounded MySQL/Redis connection and read/write waits plus expiring health caches.
+- Serialized frontend preference writes and added monotonic per-user MySQL revisions. Page unload replays unconfirmed patches with `sendBeacon`, while stale server state can no longer overwrite a newer browser revision.
+- Fixed Chinese `偏多` / `偏空` signal-history rendering, HTML-escaped stored history labels, enforced the eight-symbol UI limit, based LIVE freshness on local receipt of a new event identity, and made missing strategy timestamps fail closed.
+- Restored `.env.example`, `scripts/smoke.py`, `scripts/deploy.py`, `scripts/frontend-smoke.js`, and `docs/storage.md`; verification now executes both Python and frontend behavior regressions.
+
+## Three-round remediation verification
+
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok`, `frontend smoke ok`, and `verify ok`.
+- Passed `python -B bian.py --symbols DOGEUSDT,TLMUSDT --json`; both reports included `price_observed_at_ms`, verified tick metadata, positive stops, and complete strategy output.
+- Passed local unauthenticated `GET /api/market?symbols=DOGEUSDT,TLMUSDT`: `stale=false`, publication prices were present for both symbols, analysis took about 2.84 seconds, and publication enrichment took about 0.42 seconds.
+- Local SSE HTTP framing and retry events worked, but the Binance WebSocket upstream timed out during the 12-second observation and reported `connected=false`; deployment-network validation remains required.
+- Docker Compose validation was skipped because Docker is not installed on this Windows machine.
+- In-app visual browser verification was skipped because the browser security policy rejected the local `127.0.0.1:8876` target; frontend production functions were still executed by `scripts/frontend-smoke.js`.
+- Real MySQL/Redis transaction and timeout behavior remains to be verified against deployed services; offline fake-connection regressions cover revision ordering, timeout wiring, health-cache expiry, Redis degradation, and review ownership.
+
+## Next review
+
+- Rebuild the deployment and verify MySQL preference revision ordering with two concurrent authenticated sessions.
+- Verify Redis failover by interrupting the deployed Redis container while `/api/market` is requested.
+- Observe a healthy Binance WebSocket long enough to confirm `restart_count` recovery after an intentional upstream interruption.
+
+## 2026-07-16 Review bug remediation
+
+- Excluded a signal's partial publication minute from 1m OHLC evaluation, so pre-publication high/low cannot be relabeled as a post-publication entry or stop. Publications exactly on a minute boundary still use that complete candle.
+- Required a positive integer revision in both the preference HTTP API and MySQL storage method; missing, boolean, fractional, zero, and negative revisions are rejected before any upsert.
+- Replaced directory-wide deployment packaging with a Git-derived manifest. Clean worktrees are required by default, `--allow-dirty` is explicit, and ignored files plus the local `.env` remain excluded.
+- Changed remote deployment to validate a temporary release, preserve the prior directory and uploaded archive until health succeeds, and persist `--public-port` in the remote `.env`.
+- Updated storage/deployment documentation, regression cases, risk/release evidence, and `feature_list.json` to match the stricter contracts.
+
+## Review bug remediation verification
+
+- Passed `python -B scripts\smoke.py`, including partial-minute entry/stop, aligned-minute, invalid revision, deploy manifest, release staging, port, and retry-order regressions.
+- Passed `python -B -m py_compile scripts\deploy.py scripts\smoke.py src\bian_dashboard\server.py src\bian_dashboard\storage.py`.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok`, `frontend smoke ok`, and `verify ok`.
+- Passed deployment subprocess checks proving dirty worktrees are rejected by default, `--allow-dirty` dry-run succeeds, port 9000 is persisted, and archive cleanup follows health verification.
+- Passed `node --check web\assets\charts.js`, `feature_list.json` parsing, and `git diff --check` apart from existing LF-to-CRLF warnings.
+- Local Bash/Docker and real MySQL/Redis were unavailable, so generated remote-shell syntax, container release switching, and live database transaction behavior still require deployment-environment verification.
+
+## 2026-07-16 Follow-up review remediation
+
+- Preference sync now treats `applied=false` as a revision conflict, preserves the exact patch, advances beyond the returned server revision, and retries. Temporary HTTP 200 `saved=false` storage responses also retry with backoff.
+- Realtime badge selection now reports offline for an explicit upstream error without a fresh price instead of remaining in connecting state while SSE transport is open.
+- Server preference normalization applies removed symbols before calculating active/default capacity, so removing DOGE/TLM leaves room for all eight custom symbols.
+- Deployment no longer disables the global Git excludes file. Dirty packaging preserves all Git ignore sources and fails closed when an ignore source cannot be read.
+- Docker Compose now passes `BIAN_REDIS_PASSWORD` to the dashboard and Redis services, enables `requirepass` for non-empty secrets, and authenticates its healthcheck. Fresh scripted deployments generate the Redis password.
+- Updated storage/deployment docs, regression and risk evidence, delivery review, and `feature_list.json`.
+
+## Follow-up remediation verification
+
+- Passed `python -B scripts\smoke.py` with deployment ignore-integrity and Redis Compose contract coverage.
+- Passed `node scripts\frontend-smoke.js` with conflict retry, storage retry, upstream-error badge, and eight-custom-symbol restore regressions.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok`, `frontend smoke ok`, and `verify ok`.
+- Confirmed an actual `--allow-dirty --dry-run` fails closed in the current environment because the configured global Git ignore is unreadable.
+- Confirmed the running server on port 8876 serves the updated conflict-retry, offline-error, and symbol-normalization frontend code.
+- Passed `feature_list.json` parsing and `git diff --check` apart from existing LF-to-CRLF warnings.
+- Docker, Bash, a YAML parser, and real MySQL/Redis are unavailable locally, so Compose parsing, Redis authentication, remote shell execution, and deployed multi-session preference behavior remain release-environment checks.
+
+## 2026-07-17 Concurrency and preference consistency remediation
+
+- Replaced unconditional preference-conflict promotion with server refresh plus three-way field reconciliation. Same-field server changes win; only fields unchanged from the request base snapshot retry.
+- Stopped treating configured MySQL preference outages as an empty revision-zero server. Preference GET now returns HTTP 503 and the browser keeps local fallback state without writing a full stale snapshot.
+- In-flight-only unload beacons reuse the active request revision instead of promoting an unconfirmed patch.
+- Added direct WebSocket worker generations and guarded connect, disconnect, error, message, counter, and timestamp mutations against stopped workers.
+- Changed same-origin validation to allow only a truly absent browser source header for CLI compatibility and reject `Origin: null` or malformed values.
+- Added deterministic Python and VM frontend regressions for same-field and non-overlapping preference conflicts, outage writeback suppression, unload revision reuse, delayed WebSocket connections, and invalid source headers.
+
+## Concurrency remediation verification
+
+- Passed `python -B scripts\smoke.py` with stopped-worker, unavailable preference storage, and invalid Origin regressions.
+- Passed `node scripts\frontend-smoke.js` with preference three-way reconciliation, storage-outage, retry, and unload revision regressions.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok`, `frontend smoke ok`, and `verify ok`.
+- Passed Python compilation, frontend syntax, `feature_list.json` parsing, and `git diff --check` apart from existing LF-to-CRLF warnings.
+- GitNexus detected 182 changed symbols and 150 affected processes across the full pre-existing worktree, retaining an overall `critical` review classification.
+- Restarted the local development backend on `127.0.0.1:8876`; one listener remained, health was OK, and the served frontend contained `reconcilePreferenceConflict`.
+- In-app browser navigation to the local URL was blocked by the browser security policy, so browser console/render verification was skipped rather than bypassed.
+- Real multi-session MySQL ordering and a healthy Binance WebSocket restart remain deployment-environment checks.

@@ -25,10 +25,13 @@ Invoke-NativeChecked "python py_compile" python -B -m py_compile `
   .\scripts\smoke.py
 
 Invoke-NativeChecked "node syntax check" node --check .\web\assets\charts.js
+Invoke-NativeChecked "frontend smoke syntax check" node --check .\scripts\frontend-smoke.js
 
 Invoke-NativeChecked "bian help" python -B .\bian.py --help | Out-Null
 
 Invoke-NativeChecked "offline smoke tests" python -B .\scripts\smoke.py
+Invoke-NativeChecked "frontend offline smoke tests" node .\scripts\frontend-smoke.js
+Invoke-NativeChecked "deploy help" python -B .\scripts\deploy.py --help | Out-Null
 
 Get-ChildItem -Path $Root -Directory -Recurse -Filter "__pycache__" |
   Where-Object {

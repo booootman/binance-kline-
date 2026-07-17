@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""Offline regression checks for the dashboard's high-risk shared paths."""
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import threading
+import time
+import types
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+os.environ["BIAN_AUTH_ENABLED"] = "0"
+
+from bian_dashboard import analyzer  # noqa: E402
+from bian_dashboard import server  # noqa: E402
+from bian_dashboard import storage as storage_module  # noqa: E402
+import deploy  # noqa: E402
+
+
+def check(condition, message):
+    if not condition:
+        raise AssertionError(message)
+
+
+def candle(open_ms, open_price, high, low, close, close_ms=None):
+    return [
+        open_ms,
+        str(open_price),
+        str(high),
+        str(low),
+        str(close),
+        "0",
+        close_ms if close_ms is not None else open_ms + 59_999,
+    ]
+
+
+def test_cache_and_symbol_contracts():
+    check(server.cache_key(["TLMUSDT", "DOGEUSDT"]) == "DOGEUSDT,TLMUSDT", "cache key must be canonical")
+    payload = {"symbols": ["DOGEUSDT", "TLMUSDT"], "data": []}
+    check(server.payload_matches(payload, ["TLMUSDT", "DOGEUSDT"]), "cache payload must match symbol permutations")
+    query = "symbols=" + ",".join(f"S{i}USDT" for i in range(server.MAX_SYMBOLS + 1))
+    try:
+        server.parse_symbols(query, reject_overflow=True)
+    except server.BadRequestError:
+        pass
+    else:
+        raise AssertionError("oversized symbol requests must be rejected")
+
+
+def test_review_time_boundaries():
+    captured = {}
+    original = server.request_binance_json
+    try:
+        def fake_request(path, params, timeout=20):
+            captured.update(params)
+            return []
+
+        server.request_binance_json = fake_request
+        snapshot_ms = 1_700_000_030_000
+        end_ms = snapshot_ms + 5 * 60_000
+        server.fetch_review_klines("DOGEUSDT", snapshot_ms, end_ms)
+        expected_start_ms = snapshot_ms + (-snapshot_ms % 60_000)
+        check(captured["startTime"] == expected_start_ms, "review fetch must start with the first full post-publication minute")
+        check(captured["endTime"] == end_ms, "review fetch must stop at the exact horizon")
+    finally:
+        server.request_binance_json = original
+
+    snapshot_ms = 90_000
+    record = {
+        "side": "long",
+        "entry_price": 99,
+        "stop_price": 90,
+        "snapshot_price": 0,
+        "snapshot_at_ms": snapshot_ms,
+    }
+    candles = [
+        candle(60_000, 100, 101, 98, 100, 119_999),
+        candle(120_000, 100, 103, 100, 102, 179_999),
+        candle(360_000, 102, 999, 1, 500, 419_999),
+    ]
+    result = server.evaluate_horizon_from_klines(record, "5m", 5 * 60_000, candles)
+    check(result["bars"] == 1, "partial start and post-horizon bars must be excluded")
+    check(result["gross_max_profit_pct"] < 10, "post-horizon high must not leak into review profit")
+    check(result["entry_reached"] is False, "pre-publication low must not create a post-publication entry")
+
+    entered_record = dict(record, snapshot_price=99)
+    stop_result = server.evaluate_horizon_from_klines(
+        entered_record,
+        "5m",
+        5 * 60_000,
+        [
+            candle(60_000, 99, 100, 89, 99, 119_999),
+            candle(120_000, 99, 101, 95, 100, 179_999),
+        ],
+    )
+    check(stop_result["entry_reached"] is True, "publication price should still establish an immediate entry")
+    check(stop_result["stop_hit"] is False, "pre-publication low must not create a post-publication stop")
+
+    aligned_record = dict(record, snapshot_at_ms=120_000)
+    aligned_result = server.evaluate_horizon_from_klines(
+        aligned_record,
+        "5m",
+        5 * 60_000,
+        [candle(120_000, 100, 101, 98, 100, 179_999)],
+    )
+    check(aligned_result["entry_reached"] is True, "a candle starting exactly at publication remains usable")
+    check(aligned_result["entry_time_ms"] == 120_000, "aligned entry time must equal publication time")
+
+
+def sample_market_payload(observed_at_ms):
+    return {
+        "published_at_ms": 100_000,
+        "generated_at": "2026-07-16 12:00:00",
+        "data": [
+            {
+                "symbol": "DOGEUSDT",
+                "last": 100,
+                "price_observed_at_ms": 10_000,
+                "publication_price": 101,
+                "publication_price_observed_at_ms": observed_at_ms,
+                "publication_price_source": "test",
+                "bias": "偏多",
+                "pct_24h": 1,
+                "funding_rate": 0,
+                "indicators": {},
+                "timeframe_advice": [
+                    {
+                        "name": "短线",
+                        "bias": "偏多",
+                        "long_entry": 100,
+                        "stop_hint": 95,
+                        "confidence": 60,
+                        "direction_score": 65,
+                        "execution_score": 60,
+                        "risk_gate": "正常",
+                        "candle_state": "已完成K线",
+                        "trigger_check": {"status": "watch"},
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_publication_price_alignment():
+    fresh = server.build_signal_review_records(sample_market_payload(99_500))[0]
+    check(fresh["snapshot_price"] == 101, "fresh publication price must anchor live review")
+    check(fresh["snapshot_at_ms"] == 100_000, "review must start at publication time")
+    stale = server.build_signal_review_records(sample_market_payload(70_000))[0]
+    check(stale["snapshot_price"] == 0, "stale analysis price must not impersonate publication price")
+
+
+def test_realtime_hub_recovery_and_idle_cleanup():
+    class DeadThread:
+        def is_alive(self):
+            return False
+
+    hub = server.RealtimePriceHub("dead")
+    hub.symbols = ["DOGEUSDT"]
+    hub.direct_thread = DeadThread()
+    calls = []
+    hub.ensure = lambda symbols: calls.append(list(symbols)) or True
+    previous_disabled = server.LOG.disabled
+    server.LOG.disabled = True
+    try:
+        restarted = hub.maintain(["DOGEUSDT"])
+    finally:
+        server.LOG.disabled = previous_disabled
+    check(restarted, "dead realtime worker should restart")
+    check(calls == [["DOGEUSDT"]] and hub.restart_count == 1, "realtime restart must be observable")
+
+    with server._realtime_hubs_lock:
+        server._realtime_hubs.clear()
+    acquired, _, _ = server.realtime_hub_for_request(["DOGEUSDT"])
+    check(acquired.client_count == 1, "hub selection must acquire before releasing the registry lock")
+    acquired.stop_if_idle()
+    check(server._realtime_hubs.get(acquired.key) is acquired, "an acquired hub must survive idle cleanup")
+    acquired.release()
+    with acquired.lock:
+        if acquired.idle_timer:
+            acquired.idle_timer.cancel()
+            acquired.idle_timer = None
+    acquired.stop_if_idle()
+    check(acquired.key not in server._realtime_hubs, "an actually idle hub must be removed")
+
+
+def test_realtime_stopped_worker_cannot_publish_state():
+    entered = [threading.Event(), threading.Event()]
+    releases = [threading.Event(), threading.Event()]
+    call_lock = threading.Lock()
+    call_count = 0
+
+    class FakeConnection:
+        def __init__(self, index):
+            self.index = index
+
+        async def __aenter__(self):
+            entered[self.index].set()
+            while not releases[self.index].is_set():
+                await asyncio.sleep(0.01)
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def recv(self):
+            await asyncio.sleep(10)
+
+    def fake_connect(*_args, **_kwargs):
+        nonlocal call_count
+        with call_lock:
+            index = call_count
+            call_count += 1
+        return FakeConnection(index)
+
+    original_connect = server.websocket_connect
+    hub = server.RealtimePriceHub("worker-generation")
+    old_thread = None
+    new_thread = None
+    try:
+        server.websocket_connect = fake_connect
+        with hub.lock:
+            hub.symbols = ["OLDUSDT"]
+            hub.start_direct_locked(hub.symbols)
+            old_thread = hub.direct_thread
+        check(entered[0].wait(2), "old realtime worker must begin connecting")
+
+        with hub.lock:
+            hub.stop_locked()
+            hub.symbols = ["NEWUSDT"]
+            hub.start_direct_locked(hub.symbols)
+            new_thread = hub.direct_thread
+        check(entered[1].wait(2), "replacement realtime worker must begin connecting")
+
+        releases[0].set()
+        if old_thread:
+            old_thread.join(2)
+        snapshot = hub.snapshot(["NEWUSDT"])
+        check(not snapshot["connected"], "stopped worker must not mark the replacement connection as connected")
+        check(hub.connect_count == 0, "stopped worker must not increment the current hub connect count")
+    finally:
+        with hub.lock:
+            hub.stop_locked()
+        releases[0].set()
+        releases[1].set()
+        if old_thread:
+            old_thread.join(2)
+        if new_thread:
+            new_thread.join(2)
+        server.websocket_connect = original_connect
+
+
+def test_due_review_deferral():
+    now_ms = int(time.time() * 1000)
+
+    class FakeStorage:
+        def __init__(self):
+            self.deferred = []
+
+        def load_due_signal_reviews(self, _now_ms, max_rows=40, all_users=False):
+            return [{
+                "signal_key": "wait-for-15m",
+                "symbol": "DOGEUSDT",
+                "side": "long",
+                "entry_price": 100,
+                "stop_price": 95,
+                "snapshot_price": 100,
+                "snapshot_at_ms": now_ms - 10 * 60_000,
+                "evaluation": {"5m": {"status": "done", "failure_reason": "ok"}},
+                "storage_user_id": "u1",
+            }]
+
+        def defer_signal_review(self, signal_key, user_id=None):
+            self.deferred.append((signal_key, user_id))
+            return True
+
+        def update_signal_review_evaluation(self, *args, **kwargs):
+            raise AssertionError("waiting record must not be rewritten as evaluated")
+
+    fake = FakeStorage()
+    original_storage = server.storage
+    try:
+        server.storage = fake
+        result = server.evaluate_due_signal_reviews(max_records=1, blocking=True)
+    finally:
+        server.storage = original_storage
+    check(result["deferred"] == 1, "waiting partial record must be moved behind other due work")
+    check(fake.deferred == [("wait-for-15m", "u1")], "deferral must preserve owning user")
+
+
+def test_redis_read_degrades():
+    class BrokenRedis:
+        def get(self, key):
+            raise TimeoutError(key)
+
+    store = storage_module.DashboardStorage()
+    store.redis_configured = True
+    store._redis_client = BrokenRedis()
+    previous_disabled = storage_module.LOG.disabled
+    storage_module.LOG.disabled = True
+    try:
+        cached = store.get_market_payload("DOGEUSDT")
+    finally:
+        storage_module.LOG.disabled = previous_disabled
+    check(cached is None, "Redis read failure must degrade to a cache miss")
+    check(store._redis_client is None and store._redis_block_until > time.time(), "Redis failures must start a cooldown")
+
+
+class FakePreferenceCursor:
+    def __init__(self, revision):
+        self.revision = revision
+        self.rowcount = 1
+        self.executemany_rows = []
+        self.last_sql = ""
+
+    def execute(self, sql, params=()):
+        self.last_sql = " ".join(sql.split())
+
+    def executemany(self, sql, rows):
+        self.last_sql = " ".join(sql.split())
+        self.executemany_rows.extend(rows)
+
+    def fetchone(self):
+        return (str(self.revision),)
+
+
+class FakePreferenceConnection:
+    def __init__(self, revision):
+        self.cursor_obj = FakePreferenceCursor(revision)
+        self.commits = 0
+        self.rollbacks = 0
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def close(self):
+        pass
+
+
+def test_preference_revision_guard():
+    store = storage_module.DashboardStorage()
+    store.mysql_configured = True
+    store.mysql_available = lambda: True
+    store._ensure_mysql_schema = lambda conn: None
+
+    stale_conn = FakePreferenceConnection(5)
+    store._mysql_connect = lambda: stale_conn
+    stale = store.save_preferences({"custom_symbols": ["DOGEUSDT"]}, revision=4)
+    check(stale == {"saved": True, "applied": False, "revision": 5}, "late preference write must be rejected")
+    check(not stale_conn.cursor_obj.executemany_rows, "rejected preference write must not touch values")
+
+    fresh_conn = FakePreferenceConnection(5)
+    store._mysql_connect = lambda: fresh_conn
+    fresh = store.save_preferences({"custom_symbols": ["TLMUSDT"]}, revision=6)
+    check(fresh == {"saved": True, "applied": True, "revision": 6}, "newer preference revision must apply")
+    check(fresh_conn.cursor_obj.executemany_rows, "accepted preference write must upsert values")
+
+    for invalid_revision in (None, 0, -1, True, 1.5):
+        try:
+            store.save_preferences({"custom_symbols": ["OLDUSDT"]}, revision=invalid_revision)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid preference revision must be rejected: {invalid_revision!r}")
+
+    handler = object.__new__(server.Handler)
+    response = {}
+    handler.read_json_body = lambda: {"preferences": {"custom_symbols": ["OLDUSDT"]}}
+    handler.send_json = lambda status, payload: response.update(status=status, payload=payload)
+    handler.save_preferences_api()
+    check(response.get("status") == 400, "preference API must reject a missing revision")
+    check("revision" in response.get("payload", {}).get("error", ""), "missing revision error must be explicit")
+
+    handler.read_json_body = lambda: {"preferences": {"custom_symbols": ["OLDUSDT"]}, "revision": True}
+    handler.save_preferences_api()
+    check(response.get("status") == 400, "preference API must reject boolean revisions")
+
+    class UnavailablePreferenceStorage:
+        mysql_configured = True
+
+        def mysql_available(self):
+            return False
+
+        def status(self):
+            return {"mysql": {"configured": True, "available": False}, "redis": {"configured": False, "available": False}}
+
+    handler.request_storage = lambda: UnavailablePreferenceStorage()
+    handler.serve_preferences()
+    check(response.get("status") == 503, "preference GET must fail when configured MySQL is unavailable")
+
+
+def test_same_origin_rejects_invalid_source_headers():
+    host = "dashboard.example.com"
+    check(server.same_origin_allowed("", host), "missing browser source header must preserve CLI compatibility")
+    check(not server.same_origin_allowed("null", host), "Origin:null must not bypass same-origin checks")
+    check(not server.same_origin_allowed("not-a-url", host), "malformed Origin must not bypass same-origin checks")
+    check(server.same_origin_allowed("https://dashboard.example.com", host), "matching Origin must remain allowed")
+
+
+def test_storage_timeouts_are_wired():
+    captured = {}
+
+    class FakeConnection:
+        def close(self):
+            pass
+
+    fake_pymysql = types.SimpleNamespace(connect=lambda **kwargs: captured.update(kwargs) or FakeConnection())
+    previous = sys.modules.get("pymysql")
+    sys.modules["pymysql"] = fake_pymysql
+    try:
+        store = storage_module.DashboardStorage()
+        store._mysql_connect().close()
+    finally:
+        if previous is None:
+            sys.modules.pop("pymysql", None)
+        else:
+            sys.modules["pymysql"] = previous
+    check(captured.get("connect_timeout") == storage_module.MYSQL_CONNECT_TIMEOUT_SECONDS, "MySQL connect timeout missing")
+    check(captured.get("read_timeout") == storage_module.MYSQL_READ_TIMEOUT_SECONDS, "MySQL read timeout missing")
+    check(captured.get("write_timeout") == storage_module.MYSQL_WRITE_TIMEOUT_SECONDS, "MySQL write timeout missing")
+
+
+def test_mysql_health_cache_expires():
+    class FakeConnection:
+        def close(self):
+            pass
+
+    store = storage_module.DashboardStorage()
+    store.mysql_configured = True
+    store._mysql_connect = lambda: FakeConnection()
+    check(store.mysql_available(), "initial MySQL health check should succeed")
+    store._mysql_available_until = 0
+    store._mysql_connect = lambda: (_ for _ in ()).throw(TimeoutError("mysql unavailable"))
+    previous_disabled = storage_module.LOG.disabled
+    storage_module.LOG.disabled = True
+    try:
+        available = store.mysql_available()
+    finally:
+        storage_module.LOG.disabled = previous_disabled
+    check(not available, "expired MySQL health cache must perform a real connection check")
+    check(store._mysql_block_until > time.time(), "failed MySQL health check must start a short cooldown")
+
+
+def test_required_assets_and_report_contract():
+    for relative in ("scripts/deploy.py", "scripts/frontend-smoke.js", ".env.example"):
+        check((ROOT / relative).is_file(), f"required project asset missing: {relative}")
+    fields = analyzer.SymbolReport.__dataclass_fields__
+    check("price_observed_at_ms" in fields, "analysis price observation time must be serialized")
+
+
+def test_deploy_contracts():
+    selected = sorted(deploy.REQUIRED_DEPLOY_FILES | {".env", "runtime/secret.json", ".git/config"})
+    original_git_output = deploy.git_output
+    deploy.git_output = lambda *args, **kwargs: ("\0".join(selected) + "\0").encode("utf-8")
+    try:
+        files = set(deploy.deployment_files(include_untracked=True))
+    finally:
+        deploy.git_output = original_git_output
+    check(deploy.REQUIRED_DEPLOY_FILES.issubset(files), "deploy archive must contain required application files")
+    check(".env" not in files, "deploy archive must never contain the local .env")
+    check(not any(name.startswith((".git/", "runtime/")) for name in files), "deploy archive must exclude Git and runtime files")
+
+    class IgnoreWarningResult:
+        stdout = b""
+        stderr = b"warning: unable to access global git ignore: Permission denied"
+
+    original_run = deploy.subprocess.run
+    deploy.subprocess.run = lambda *args, **kwargs: IgnoreWarningResult()
+    try:
+        try:
+            deploy.git_output("ls-files", "--others", require_ignore_integrity=True)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("unreadable global Git ignore must fail closed")
+    finally:
+        deploy.subprocess.run = original_run
+
+    args = types.SimpleNamespace(
+        remote_dir="/opt/bian-dashboard",
+        check_market=False,
+        no_ufw=True,
+        public_port=9000,
+    )
+    remote = deploy.remote_script(args, "/tmp/bian-dashboard-test.tar.gz")
+    health_check = "http://127.0.0.1:9000/api/health"
+    archive_cleanup = "rm -f /tmp/bian-dashboard-test.tar.gz"
+    check("BIAN_PUBLIC_PORT=9000" in remote, "public port must be persisted into the remote .env")
+    check("BIAN_REDIS_PASSWORD=$redis_password" in remote, "first deploy must generate a Redis password")
+    check("mktemp -d" in remote and 'mv "$release_dir" /opt/bian-dashboard' in remote, "deploy must replace from a staging directory")
+    check("/opt/bian-dashboard.previous" in remote, "deploy must retain the previous release until health passes")
+    check(remote.index(health_check) < remote.index(archive_cleanup), "archive must remain available until deployment succeeds")
+
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    check(compose.count("BIAN_REDIS_PASSWORD") >= 5, "Compose must wire the Redis password through app, server, and healthcheck")
+    check("--requirepass" in compose and "REDISCLI_AUTH" in compose, "Redis password must be enforced and health-checked")
+
+
+def main():
+    test_cache_and_symbol_contracts()
+    test_review_time_boundaries()
+    test_publication_price_alignment()
+    test_realtime_hub_recovery_and_idle_cleanup()
+    test_realtime_stopped_worker_cannot_publish_state()
+    test_due_review_deferral()
+    test_redis_read_degrades()
+    test_preference_revision_guard()
+    test_same_origin_rejects_invalid_source_headers()
+    test_storage_timeouts_are_wired()
+    test_mysql_health_cache_expires()
+    test_required_assets_and_report_contract()
+    test_deploy_contracts()
+    print("smoke ok")
+
+
+if __name__ == "__main__":
+    main()

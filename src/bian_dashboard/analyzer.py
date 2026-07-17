@@ -176,6 +176,7 @@ class TimeframeAdvice:
 class SymbolReport:
     symbol: str
     last: float
+    price_observed_at_ms: int
     pct_24h: float
     high_24h: float
     low_24h: float
@@ -1498,6 +1499,7 @@ def analyze_symbol(symbol: str) -> SymbolReport:
             for interval in INTERVALS
         }
         ticker = ticker_future.result()
+        price_observed_at_ms = int(time.time() * 1000)
         premium = premium_future.result()
         meta = meta_future.result()
         book = book_future.result()
@@ -1561,6 +1563,7 @@ def analyze_symbol(symbol: str) -> SymbolReport:
     return SymbolReport(
         symbol=symbol,
         last=last,
+        price_observed_at_ms=price_observed_at_ms,
         pct_24h=pct_24h,
         high_24h=float(ticker["highPrice"]),
         low_24h=float(ticker["lowPrice"]),

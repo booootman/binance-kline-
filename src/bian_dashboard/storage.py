@@ -30,6 +30,13 @@ SIGNAL_REVIEW_FILE = os.environ.get(
 )
 SIGNAL_REVIEW_LIMIT = int(os.environ.get("BIAN_SIGNAL_REVIEW_LIMIT", "5000"))
 STRATEGY_SNAPSHOT_LIMIT = max(10, int(os.environ.get("BIAN_STRATEGY_SNAPSHOT_LIMIT", "1000")))
+MYSQL_CONNECT_TIMEOUT_SECONDS = max(1, int(os.environ.get("BIAN_MYSQL_CONNECT_TIMEOUT_SECONDS", "3")))
+MYSQL_READ_TIMEOUT_SECONDS = max(1, int(os.environ.get("BIAN_MYSQL_READ_TIMEOUT_SECONDS", "5")))
+MYSQL_WRITE_TIMEOUT_SECONDS = max(1, int(os.environ.get("BIAN_MYSQL_WRITE_TIMEOUT_SECONDS", "5")))
+REDIS_CONNECT_TIMEOUT_SECONDS = max(1, int(os.environ.get("BIAN_REDIS_CONNECT_TIMEOUT_SECONDS", "2")))
+REDIS_READ_TIMEOUT_SECONDS = max(1, int(os.environ.get("BIAN_REDIS_READ_TIMEOUT_SECONDS", "2")))
+STORAGE_HEALTH_TTL_SECONDS = 5
+PREFERENCE_REVISION_KEY = "__preference_revision__"
 
 
 def _utc_datetime(value=None):
@@ -86,7 +93,11 @@ class DashboardStorage:
         self._redis_client = None
         self._mysql_checked = False
         self._redis_checked = False
+        self._mysql_available_until = 0.0
+        self._mysql_block_until = 0.0
+        self._redis_available_until = 0.0
         self._redis_block_until = 0.0
+        self._availability_lock = threading.RLock()
         self._signal_review_lock = threading.RLock()
         self._schema_lock = threading.RLock()
         self._mysql_schema_ready = False
@@ -158,33 +169,54 @@ class DashboardStorage:
     def mysql_available(self):
         if not self.mysql_configured:
             return False
-        if self._mysql_checked and self._mysql_driver:
-            return True
+        shared = getattr(self, "_scope_parent", self)
+        now = time.time()
+        with shared._availability_lock:
+            if now < shared._mysql_block_until:
+                return False
+            if now < shared._mysql_available_until:
+                return True
         try:
             conn = self._mysql_connect()
             conn.close()
+            with shared._availability_lock:
+                shared._mysql_available_until = time.time() + STORAGE_HEALTH_TTL_SECONDS
+                shared._mysql_block_until = 0.0
             return True
         except Exception as exc:
+            with shared._availability_lock:
+                shared._mysql_available_until = 0.0
+                shared._mysql_block_until = time.time() + STORAGE_HEALTH_TTL_SECONDS
             LOG.warning("mysql storage unavailable: %s", exc)
             return False
 
     def redis_available(self):
         if not self.redis_configured:
             return False
-        if self._redis_client is not None:
-            return True
+        shared = getattr(self, "_scope_parent", self)
+        now = time.time()
+        with shared._availability_lock:
+            if now < shared._redis_block_until:
+                return False
+            if now < shared._redis_available_until:
+                return True
         try:
-            client = self._redis_connect()
+            client = shared._redis_client or self._redis_connect()
             client.ping()
-            self._redis_client = client
+            shared._redis_client = client
+            with shared._availability_lock:
+                shared._redis_available_until = time.time() + STORAGE_HEALTH_TTL_SECONDS
             return True
         except Exception as exc:
-            LOG.warning("redis cache unavailable: %s", exc)
+            self._block_redis(exc)
             return False
 
     def load_preferences(self):
+        return self.load_preferences_with_revision()[0]
+
+    def load_preferences_with_revision(self):
         if not self.mysql_available():
-            return {}
+            return {}, 0
         conn = self._mysql_connect()
         try:
             self._ensure_mysql_schema(conn)
@@ -194,28 +226,72 @@ class DashboardStorage:
                 (self.user_id,),
             )
             prefs = {}
+            revision = 0
             for key, raw in cur.fetchall():
+                if key == PREFERENCE_REVISION_KEY:
+                    try:
+                        revision = max(0, int(json.loads(raw)))
+                    except Exception:
+                        revision = 0
+                    continue
                 try:
                     prefs[key] = json.loads(raw)
                 except Exception:
                     prefs[key] = None
-            return prefs
+            return prefs, revision
         finally:
             conn.close()
 
-    def save_preferences(self, prefs):
+    def save_preferences(self, prefs, revision=None):
         if not isinstance(prefs, dict) or not prefs:
             return False
+        try:
+            raw_revision = revision
+            if isinstance(raw_revision, bool):
+                raise ValueError
+            normalized_revision = int(revision)
+            if normalized_revision <= 0 or (isinstance(raw_revision, float) and raw_revision != normalized_revision):
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ValueError("preference revision must be a positive integer") from exc
         if not self.mysql_available():
             return False
         conn = self._mysql_connect()
         try:
             self._ensure_mysql_schema(conn)
             cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT IGNORE INTO bian_dashboard_kv (user_id, item_key, value_json)
+                VALUES (%s, %s, '0')
+                """,
+                (self.user_id, PREFERENCE_REVISION_KEY),
+            )
+            cur.execute(
+                """
+                SELECT value_json
+                FROM bian_dashboard_kv
+                WHERE user_id=%s AND item_key=%s
+                FOR UPDATE
+                """,
+                (self.user_id, PREFERENCE_REVISION_KEY),
+            )
+            row = cur.fetchone()
+            try:
+                current_revision = max(0, int(json.loads(row[0] if row else "0")))
+            except Exception:
+                current_revision = 0
+            if normalized_revision <= current_revision:
+                conn.commit()
+                return {"saved": True, "applied": False, "revision": current_revision}
             rows = [
                 (self.user_id, str(key), json.dumps(value, ensure_ascii=False, separators=(",", ":")))
                 for key, value in prefs.items()
+                if str(key) != PREFERENCE_REVISION_KEY
             ]
+            if not rows:
+                conn.rollback()
+                return False
             cur.executemany(
                 """
                 INSERT INTO bian_dashboard_kv (user_id, item_key, value_json)
@@ -224,8 +300,16 @@ class DashboardStorage:
                 """,
                 rows,
             )
+            cur.execute(
+                """
+                UPDATE bian_dashboard_kv
+                SET value_json=%s, updated_at=CURRENT_TIMESTAMP
+                WHERE user_id=%s AND item_key=%s
+                """,
+                (json.dumps(normalized_revision), self.user_id, PREFERENCE_REVISION_KEY),
+            )
             conn.commit()
-            return True
+            return {"saved": True, "applied": True, "revision": normalized_revision}
         finally:
             conn.close()
 
@@ -317,9 +401,13 @@ class DashboardStorage:
                 continue
             if int(item.get("snapshot_at_ms") or 0) <= cutoff_ms:
                 due.append(item)
-            if len(due) >= max_rows:
-                break
-        return due
+        due.sort(
+            key=lambda item: (
+                int(item.get("updated_at_ms") or item.get("created_at_ms") or item.get("snapshot_at_ms") or 0),
+                int(item.get("snapshot_at_ms") or 0),
+            )
+        )
+        return due[:max_rows]
 
     def update_signal_review_evaluation(self, signal_key, status, failure_reason, evaluation, user_id=None):
         signal_key = str(signal_key or "")
@@ -334,6 +422,17 @@ class DashboardStorage:
             except Exception as exc:
                 LOG.warning("mysql signal review update failed; fallback=file; error=%s", exc)
         return self._update_signal_review_file(signal_key, status, failure_reason, evaluation, user_id=user_id)
+
+    def defer_signal_review(self, signal_key, user_id=None):
+        signal_key = str(signal_key or "")
+        if not signal_key:
+            return False
+        if self.mysql_available():
+            try:
+                return self._defer_signal_review_mysql(signal_key, user_id=user_id)
+            except Exception as exc:
+                LOG.warning("mysql signal review defer failed; fallback=file; error=%s", exc)
+        return self._defer_signal_review_file(signal_key, user_id=user_id)
 
     def ensure_auth_bootstrap(self):
         if not self.mysql_available():
@@ -586,7 +685,11 @@ class DashboardStorage:
         client = self._redis_safe_client()
         if client is None:
             return None
-        raw = client.get("bian:market:" + key)
+        try:
+            raw = client.get("bian:market:" + key)
+        except Exception as exc:
+            self._block_redis(exc)
+            return None
         if not raw:
             return None
         try:
@@ -749,6 +852,7 @@ class DashboardStorage:
                 SET status=%s,
                     failure_reason=%s,
                     evaluation_json=%s,
+                    updated_at=CURRENT_TIMESTAMP,
                     evaluated_at=CASE WHEN %s='evaluated' THEN UTC_TIMESTAMP() ELSE evaluated_at END
                 WHERE user_id=%s AND signal_key=%s
                 """,
@@ -760,6 +864,24 @@ class DashboardStorage:
                     str(user_id or self.user_id),
                     signal_key[:191],
                 ),
+            )
+            conn.commit()
+            return bool(cur.rowcount)
+        finally:
+            conn.close()
+
+    def _defer_signal_review_mysql(self, signal_key, user_id=None):
+        conn = self._mysql_connect()
+        try:
+            self._ensure_signal_review_schema(conn)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE bian_signal_reviews
+                SET updated_at=CURRENT_TIMESTAMP
+                WHERE user_id=%s AND signal_key=%s AND status IN ('pending', 'partial')
+                """,
+                (str(user_id or self.user_id), signal_key[:191]),
             )
             conn.commit()
             return bool(cur.rowcount)
@@ -844,6 +966,7 @@ class DashboardStorage:
                 clone = dict(item)
                 clone["storage_user_id"] = self.user_id
                 clone["created_at_ms"] = now_ms
+                clone["updated_at_ms"] = now_ms
                 items.append(clone)
                 existing.add(scoped_key)
                 inserted += 1
@@ -891,23 +1014,46 @@ class DashboardStorage:
                 self._write_signal_review_file(data)
             return updated
 
+    def _defer_signal_review_file(self, signal_key, user_id=None):
+        with self._signal_review_lock:
+            data = self._read_signal_review_file()
+            expected_user_id = str(user_id or self.user_id)
+            updated = False
+            for item in data.get("records", []):
+                if (
+                    isinstance(item, dict)
+                    and str(item.get("signal_key")) == signal_key
+                    and str(item.get("storage_user_id") or "default") == expected_user_id
+                    and item.get("status") in ("pending", "partial")
+                ):
+                    item["updated_at_ms"] = int(time.time() * 1000)
+                    updated = True
+                    break
+            if updated:
+                self._write_signal_review_file(data)
+            return updated
+
     def _redis_safe_client(self):
-        if not self.redis_configured or time.time() < self._redis_block_until:
+        shared = getattr(self, "_scope_parent", self)
+        if not self.redis_configured or time.time() < shared._redis_block_until:
             return None
-        if self._redis_client is not None:
-            return self._redis_client
+        if shared._redis_client is not None:
+            return shared._redis_client
         try:
             client = self._redis_connect()
             client.ping()
-            self._redis_client = client
+            shared._redis_client = client
+            shared._redis_available_until = time.time() + STORAGE_HEALTH_TTL_SECONDS
             return client
         except Exception as exc:
             self._block_redis(exc)
             return None
 
     def _block_redis(self, exc):
-        self._redis_client = None
-        self._redis_block_until = time.time() + 30
+        shared = getattr(self, "_scope_parent", self)
+        shared._redis_client = None
+        shared._redis_available_until = 0.0
+        shared._redis_block_until = time.time() + 30
         LOG.warning("redis operation failed; disabled for 30s: %s", exc)
 
     def _mysql_connect(self):
@@ -928,6 +1074,9 @@ class DashboardStorage:
                 database=config["database"],
                 charset="utf8mb4",
                 autocommit=False,
+                connect_timeout=MYSQL_CONNECT_TIMEOUT_SECONDS,
+                read_timeout=MYSQL_READ_TIMEOUT_SECONDS,
+                write_timeout=MYSQL_WRITE_TIMEOUT_SECONDS,
             )
         except ImportError:
             pass
@@ -946,6 +1095,9 @@ class DashboardStorage:
                 password=config["password"],
                 database=config["database"],
                 charset="utf8mb4",
+                connection_timeout=MYSQL_CONNECT_TIMEOUT_SECONDS,
+                read_timeout=MYSQL_READ_TIMEOUT_SECONDS,
+                write_timeout=MYSQL_WRITE_TIMEOUT_SECONDS,
             )
         except ImportError as exc:
             self._mysql_checked = True
@@ -962,13 +1114,22 @@ class DashboardStorage:
         self._redis_checked = True
         url = os.environ.get("BIAN_REDIS_URL", "").strip()
         if url:
-            return redis.Redis.from_url(url, decode_responses=True)
+            return redis.Redis.from_url(
+                url,
+                decode_responses=True,
+                socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+                socket_timeout=REDIS_READ_TIMEOUT_SECONDS,
+                health_check_interval=30,
+            )
         return redis.Redis(
             host=os.environ.get("BIAN_REDIS_HOST", "127.0.0.1"),
             port=int(os.environ.get("BIAN_REDIS_PORT", "6379")),
             db=int(os.environ.get("BIAN_REDIS_DB", "0")),
             password=os.environ.get("BIAN_REDIS_PASSWORD") or None,
             decode_responses=True,
+            socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+            socket_timeout=REDIS_READ_TIMEOUT_SECONDS,
+            health_check_interval=30,
         )
 
     def _mysql_config(self):

@@ -92,6 +92,7 @@ SIGNAL_REVIEW_SLIPPAGE_BPS = float(os.environ.get("BIAN_SIGNAL_REVIEW_SLIPPAGE_B
 SSE_MAX_SECONDS = max(60, int(os.environ.get("BIAN_SSE_MAX_SECONDS", str(6 * 60 * 60))))
 SSE_HEARTBEAT_SECONDS = 15
 REALTIME_IDLE_SECONDS = 30
+REALTIME_STALE_SECONDS = max(10, int(os.environ.get("BIAN_REALTIME_STALE_SECONDS", "45")))
 MEMORY_CACHE_MAX_ITEMS = 64
 
 _last_payloads = {}
@@ -136,6 +137,7 @@ class RealtimePriceHub:
         self.error = None
         self.direct_stop = None
         self.direct_thread = None
+        self.direct_generation = 0
         self.direct_connected = False
         self.connect_count = 0
         self.disconnect_count = 0
@@ -144,6 +146,7 @@ class RealtimePriceHub:
         self.last_message_ms = 0
         self.last_price_event_ms = 0
         self.last_depth_event_ms = 0
+        self.restart_count = 0
         self.client_count = 0
         self.idle_timer = None
 
@@ -166,12 +169,11 @@ class RealtimePriceHub:
             self.idle_timer.start()
 
     def stop_if_idle(self):
-        with self.lock:
-            if self.client_count:
-                return
-            self.stop_locked()
         with _realtime_hubs_lock:
-            if _realtime_hubs.get(self.key) is self:
+            with self.lock:
+                if self.client_count or _realtime_hubs.get(self.key) is not self:
+                    return
+                self.stop_locked()
                 _realtime_hubs.pop(self.key, None)
 
     def ensure(self, symbols):
@@ -215,6 +217,7 @@ class RealtimePriceHub:
 
     def stop_locked(self):
         old_thread = self.direct_thread
+        self.direct_generation += 1
         if self.direct_stop:
             self.direct_stop.set()
         self.direct_stop = None
@@ -240,25 +243,58 @@ class RealtimePriceHub:
             self.error = (self.error or "") + "; websockets is not installed"
             LOG.error("realtime direct websocket unavailable: websockets is not installed; symbols=%s", symbols)
             return False
+        self.direct_generation += 1
+        generation = self.direct_generation
         self.direct_stop = threading.Event()
         self.direct_thread = threading.Thread(
             target=self.run_direct,
-            args=(list(symbols), self.direct_stop),
+            args=(list(symbols), self.direct_stop, generation),
             daemon=True,
         )
         self.direct_thread.start()
         return True
 
-    def run_direct(self, symbols, stop_event):
+    def _direct_worker_is_current_locked(self, stop_event, generation):
+        return self.direct_stop is stop_event and self.direct_generation == generation
+
+    def run_direct(self, symbols, stop_event, generation):
         try:
-            asyncio.run(self.direct_loop(symbols, stop_event))
+            asyncio.run(self.direct_loop(symbols, stop_event, generation))
         except Exception as exc:
             with self.lock:
-                self.error = str(exc)
-                self.direct_connected = False
-            LOG.exception("realtime direct websocket loop crashed; symbols=%s", symbols)
+                current = self._direct_worker_is_current_locked(stop_event, generation)
+                if current:
+                    self.error = str(exc)
+                    self.direct_connected = False
+            if current:
+                LOG.exception("realtime direct websocket loop crashed; symbols=%s", symbols)
 
-    async def direct_loop(self, symbols, stop_event):
+    def maintain(self, symbols):
+        symbols = sorted(dict.fromkeys(symbols))
+        now_ms = int(time.time() * 1000)
+        reason = ""
+        with self.lock:
+            direct_alive = bool(self.direct_thread and self.direct_thread.is_alive())
+            if self.direct_thread is not None and not direct_alive:
+                reason = "worker_exited"
+            elif self.direct_connected:
+                activity_ms = max(self.last_message_ms, self.last_connected_ms)
+                if activity_ms and now_ms - activity_ms > REALTIME_STALE_SECONDS * 1000:
+                    reason = "message_stale"
+            if not reason:
+                return True
+            self.restart_count += 1
+            LOG.warning(
+                "realtime websocket restarting; reason=%s; symbols=%s; restart_count=%s",
+                reason,
+                symbols,
+                self.restart_count,
+            )
+            self.stop_locked()
+            self.symbols = []
+        return self.ensure(symbols)
+
+    async def direct_loop(self, symbols, stop_event, generation):
         parts = []
         for symbol in symbols:
             lower = symbol.lower()
@@ -266,46 +302,60 @@ class RealtimePriceHub:
             parts.append(f"{lower}@depth20@500ms")
         streams = "/".join(parts)
         url = f"wss://fstream.binance.com/stream?streams={streams}"
-        while not stop_event.is_set():
-            try:
-                async with websocket_connect(
-                    url,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    open_timeout=10,
-                    close_timeout=3,
-                ) as ws:
+        try:
+            while not stop_event.is_set():
+                try:
+                    async with websocket_connect(
+                        url,
+                        ping_interval=20,
+                        ping_timeout=10,
+                        open_timeout=10,
+                        close_timeout=3,
+                    ) as ws:
+                        with self.lock:
+                            if not self._direct_worker_is_current_locked(stop_event, generation) or stop_event.is_set():
+                                break
+                            self.error = None
+                            self.direct_connected = True
+                            self.connect_count += 1
+                            connect_count = self.connect_count
+                            self.last_connected_ms = int(time.time() * 1000)
+                        LOG.info("realtime websocket connected; symbols=%s; connect_count=%s", symbols, connect_count)
+                        while not stop_event.is_set():
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=1)
+                            except asyncio.TimeoutError:
+                                continue
+                            with self.lock:
+                                if not self._direct_worker_is_current_locked(stop_event, generation):
+                                    break
+                            self.handle_message(json.loads(raw), direct_worker=(stop_event, generation))
+                except Exception as exc:
+                    error_text = f"{type(exc).__name__}: {exc}".strip()
                     with self.lock:
-                        self.error = None
-                        self.direct_connected = True
-                        self.connect_count += 1
-                        self.last_connected_ms = int(time.time() * 1000)
-                    LOG.info("realtime websocket connected; symbols=%s; connect_count=%s", symbols, self.connect_count)
-                    while not stop_event.is_set():
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=1)
-                        except asyncio.TimeoutError:
-                            continue
-                        self.handle_message(json.loads(raw))
-            except Exception as exc:
-                error_text = f"{type(exc).__name__}: {exc}".strip()
-                with self.lock:
-                    self.error = error_text
+                        if not self._direct_worker_is_current_locked(stop_event, generation):
+                            break
+                        self.error = error_text
+                        self.direct_connected = False
+                        self.disconnect_count += 1
+                        disconnect_count = self.disconnect_count
+                        self.last_disconnected_ms = int(time.time() * 1000)
+                    if stop_event.is_set():
+                        break
+                    LOG.error(
+                        "realtime websocket disconnected; reconnect_in=3s; symbols=%s; disconnect_count=%s; error=%s",
+                        symbols,
+                        disconnect_count,
+                        error_text,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(3)
+        finally:
+            with self.lock:
+                if self._direct_worker_is_current_locked(stop_event, generation):
                     self.direct_connected = False
-                    self.disconnect_count += 1
-                    self.last_disconnected_ms = int(time.time() * 1000)
-                if stop_event.is_set():
-                    break
-                LOG.error(
-                    "realtime websocket disconnected; reconnect_in=3s; symbols=%s; disconnect_count=%s; error=%s",
-                    symbols,
-                    self.disconnect_count,
-                    error_text,
-                    exc_info=True,
-                )
-                await asyncio.sleep(3)
 
-    def handle_message(self, msg):
+    def handle_message(self, msg, direct_worker=None):
         try:
             data = msg.get("data", msg) if isinstance(msg, dict) else {}
             symbol = normalize_symbol(data.get("s"))
@@ -314,6 +364,8 @@ class RealtimePriceHub:
             event_ms = int(data.get("T") or data.get("E") or int(time.time() * 1000))
             received_ms = int(time.time() * 1000)
             with self.lock:
+                if direct_worker and not self._direct_worker_is_current_locked(*direct_worker):
+                    return
                 self.last_message_ms = received_ms
             bids_raw = data.get("b")
             asks_raw = data.get("a")
@@ -352,6 +404,8 @@ class RealtimePriceHub:
                     "depth_source": "futures_depth20",
                 }
                 with self.lock:
+                    if direct_worker and not self._direct_worker_is_current_locked(*direct_worker):
+                        return
                     item = dict(self.latest.get(symbol, {}))
                     has_book_ticker = "bookTicker" in str(item.get("source") or "")
                     item.update(depth_update)
@@ -388,6 +442,8 @@ class RealtimePriceHub:
                 "source": "futures_bookTicker",
             }
             with self.lock:
+                if direct_worker and not self._direct_worker_is_current_locked(*direct_worker):
+                    return
                 old = dict(self.latest.get(symbol, {}))
                 old.update(item)
                 if old.get("depth_ok"):
@@ -398,6 +454,8 @@ class RealtimePriceHub:
             persist_realtime_later(symbol, old)
         except Exception as exc:
             with self.lock:
+                if direct_worker and not self._direct_worker_is_current_locked(*direct_worker):
+                    return
                 self.error = str(exc)
             LOG.exception("realtime websocket message parse failed; error=%s; message=%r", exc, msg)
 
@@ -435,33 +493,36 @@ def normalize_symbol(raw):
     return symbol
 
 
-def normalize_symbols(raw_parts, fallback=None, limit=MAX_SYMBOLS):
+def normalize_symbols(raw_parts, fallback=None, limit=MAX_SYMBOLS, reject_overflow=False):
     symbols = []
     seen = set()
     for raw in raw_parts or []:
         symbol = normalize_symbol(raw)
-        if symbol and symbol not in seen:
-            symbols.append(symbol)
-            seen.add(symbol)
+        if not symbol or symbol in seen:
+            continue
         if len(symbols) >= limit:
+            if reject_overflow:
+                raise BadRequestError(f"at most {limit} symbols are allowed")
             break
+        symbols.append(symbol)
+        seen.add(symbol)
     return symbols or list(fallback or [])
 
 
-def parse_query_symbols(query, fallback=None, limit=MAX_SYMBOLS):
+def parse_query_symbols(query, fallback=None, limit=MAX_SYMBOLS, reject_overflow=False):
     params = parse_qs(query or "")
     raw_parts = list(params.get("symbol", []))
     for item in params.get("symbols", []):
         raw_parts.extend(item.split(","))
-    return normalize_symbols(raw_parts, fallback=fallback, limit=limit)
+    return normalize_symbols(raw_parts, fallback=fallback, limit=limit, reject_overflow=reject_overflow)
 
 
-def parse_symbols(query):
-    return parse_query_symbols(query, fallback=DEFAULT_SYMBOLS)
+def parse_symbols(query, reject_overflow=False):
+    return parse_query_symbols(query, fallback=DEFAULT_SYMBOLS, reject_overflow=reject_overflow)
 
 
 def cache_key(symbols):
-    return ",".join(symbols)
+    return ",".join(sorted(normalize_symbols(symbols)))
 
 
 def realtime_cache_key(symbols):
@@ -558,6 +619,7 @@ def realtime_hub_for_request(symbols):
     with _realtime_hubs_lock:
         exact = _realtime_hubs.get(key)
         if exact is not None:
+            exact.acquire()
             return exact, requested, "exact"
         requested_set = set(requested)
         reusable = []
@@ -570,9 +632,11 @@ def realtime_hub_for_request(symbols):
         if reusable:
             reusable.sort(key=lambda item: (item[0], item[1]))
             _, _, hub, hub_symbols = reusable[0]
+            hub.acquire()
             return hub, hub_symbols, "superset"
         hub = RealtimePriceHub(key)
         _realtime_hubs[key] = hub
+        hub.acquire()
         return hub, requested, "new"
 
 
@@ -598,12 +662,14 @@ def realtime_sharing_stats():
 def payload_matches(payload, symbols):
     if not isinstance(payload, dict):
         return False
-    if payload.get("symbols") == symbols:
+    expected_key = cache_key(symbols)
+    if cache_key(payload.get("symbols") or []) == expected_key:
         return True
     data = payload.get("data")
     if not isinstance(data, list):
         return False
-    return [item.get("symbol") for item in data if isinstance(item, dict)] == symbols
+    returned = [item.get("symbol") for item in data if isinstance(item, dict)]
+    return cache_key(returned) == expected_key
 
 
 def load_cache(symbols):
@@ -890,7 +956,13 @@ def build_signal_review_records(payload):
         symbol = normalize_symbol(report.get("symbol"))
         if not symbol:
             continue
-        snapshot_price = float_or_zero(report.get("last"))
+        publication_price = float_or_zero(report.get("publication_price"))
+        publication_price_ms = int(report.get("publication_price_observed_at_ms") or 0)
+        if publication_price_ms <= 0:
+            publication_price = float_or_zero(report.get("last"))
+            publication_price_ms = int(report.get("price_observed_at_ms") or 0)
+        price_age_ms = snapshot_ms - publication_price_ms if publication_price_ms > 0 else -1
+        snapshot_price = publication_price if 0 <= price_age_ms <= 15_000 else 0.0
         for advice in report.get("timeframe_advice") or []:
             if not isinstance(advice, dict):
                 continue
@@ -948,6 +1020,9 @@ def build_signal_review_records(payload):
                         "report_bias": report.get("bias"),
                         "pct_24h": report.get("pct_24h"),
                         "funding_rate": report.get("funding_rate"),
+                        "snapshot_price_observed_at_ms": publication_price_ms,
+                        "snapshot_price_age_ms": price_age_ms,
+                        "snapshot_price_source": report.get("publication_price_source") or "analysis_ticker",
                         "market_regime": market_regime,
                         "advice": advice,
                     },
@@ -977,9 +1052,35 @@ def request_binance_json(path, params, timeout=20):
     raise RuntimeError(f"Binance review data fetch failed: {last_error}")
 
 
+def fetch_publication_prices(symbols):
+    requested = set(normalize_symbols(symbols))
+    data = request_binance_json("/fapi/v1/ticker/bookTicker", {}, timeout=5)
+    observed_at_ms = int(time.time() * 1000)
+    prices = {}
+    for item in data if isinstance(data, list) else [data]:
+        if not isinstance(item, dict):
+            continue
+        symbol = normalize_symbol(item.get("symbol"))
+        if symbol not in requested:
+            continue
+        bid = float_or_zero(item.get("bidPrice"))
+        ask = float_or_zero(item.get("askPrice"))
+        if bid <= 0 or ask <= 0:
+            continue
+        prices[symbol] = {
+            "price": (bid + ask) / 2.0,
+            "bid": bid,
+            "ask": ask,
+            "observed_at_ms": observed_at_ms,
+            "source": "futures_bookTicker_publication",
+        }
+    return prices
+
+
 def fetch_review_klines(symbol, start_ms, end_ms):
-    start_ms = max(0, int(start_ms or 0) + 1)
-    end_ms = max(start_ms + 60_000, int(end_ms or 0))
+    snapshot_ms = max(0, int(start_ms or 0))
+    start_ms = snapshot_ms + (-snapshot_ms % 60_000)
+    end_ms = max(snapshot_ms + 60_000, int(end_ms or 0))
     minutes = max(1, int((end_ms - start_ms) / 60_000) + 3)
     data = request_binance_json(
         "/fapi/v1/klines",
@@ -987,7 +1088,7 @@ def fetch_review_klines(symbol, start_ms, end_ms):
             "symbol": normalize_symbol(symbol),
             "interval": "1m",
             "startTime": start_ms,
-            "endTime": end_ms + 60_000,
+            "endTime": end_ms,
             "limit": min(1000, minutes),
         },
         timeout=20,
@@ -1006,7 +1107,8 @@ def evaluate_horizon_from_klines(record, horizon, horizon_ms, candles):
     for raw in candles or []:
         try:
             open_ms = int(raw[0])
-            if open_ms < snapshot_ms or open_ms > end_ms:
+            close_ms = int(raw[6]) if len(raw) > 6 else open_ms + 59_999
+            if open_ms < snapshot_ms or close_ms > end_ms:
                 continue
             usable.append(
                 {
@@ -1014,7 +1116,7 @@ def evaluate_horizon_from_klines(record, horizon, horizon_ms, candles):
                     "high": float(raw[2]),
                     "low": float(raw[3]),
                     "close": float(raw[4]),
-                    "close_ms": int(raw[6]) if len(raw) > 6 else open_ms + 59_999,
+                    "close_ms": close_ms,
                 }
             )
         except Exception:
@@ -1066,14 +1168,14 @@ def evaluate_horizon_from_klines(record, horizon, horizon_ms, candles):
         triggered_this_bar = False
         if not entry_reached and bar_hits_entry(bar):
             entry_reached = True
-            entry_time_ms = bar["open_ms"]
+            entry_time_ms = max(snapshot_ms, bar["open_ms"])
             triggered_this_bar = True
         if not entry_reached:
             continue
 
         if bar_hits_stop(bar):
             stopped = True
-            stop_time_ms = bar["open_ms"]
+            stop_time_ms = max(snapshot_ms, bar["open_ms"])
             if triggered_this_bar:
                 ambiguous = True
             break
@@ -1242,6 +1344,7 @@ def evaluate_due_signal_reviews(max_records=40, blocking=False):
         due = storage.load_due_signal_reviews(now_ms, max_rows=max_records, all_users=auth_enabled())
         updated = 0
         evaluated = 0
+        deferred = 0
         evaluated_by_key = {}
         for record in due:
             signal_key = str(record.get("signal_key") or "")
@@ -1258,6 +1361,11 @@ def evaluate_due_signal_reviews(max_records=40, blocking=False):
                 status, failure_reason, evaluation, changed = cached_result
                 evaluation = copy.deepcopy(evaluation)
             if not changed:
+                if storage.defer_signal_review(
+                    record.get("signal_key"),
+                    user_id=record.get("storage_user_id"),
+                ):
+                    deferred += 1
                 continue
             if storage.update_signal_review_evaluation(
                 record.get("signal_key"),
@@ -1271,7 +1379,13 @@ def evaluate_due_signal_reviews(max_records=40, blocking=False):
                     evaluated += 1
         if updated:
             LOG.info("signal reviews evaluated; updated=%s; evaluated=%s; due=%s", updated, evaluated, len(due))
-        result = {"evaluated": evaluated, "updated": updated, "due": len(due), "skipped": 0}
+        result = {
+            "evaluated": evaluated,
+            "updated": updated,
+            "deferred": deferred,
+            "due": len(due),
+            "skipped": 0,
+        }
         with _signal_review_trigger_lock:
             _signal_review_eval_state["last_finished_at"] = time.time()
             _signal_review_eval_state["last_result"] = result
@@ -1817,6 +1931,7 @@ def diagnostics_payload(check_storage=True):
                     "latest_count": len(hub.latest),
                     "connect_count": hub.connect_count,
                     "disconnect_count": hub.disconnect_count,
+                    "restart_count": hub.restart_count,
                     "last_connected_ms": hub.last_connected_ms,
                     "last_disconnected_ms": hub.last_disconnected_ms,
                     "last_message_ms": hub.last_message_ms,
@@ -1933,10 +2048,13 @@ def request_source_host(source_url):
 
 
 def same_origin_allowed(source_url, host_header, forwarded_host=""):
-    parsed = urlparse(str(source_url or "").strip())
+    source_text = str(source_url or "").strip()
+    if not source_text:
+        return True
+    parsed = urlparse(source_text)
     source_host = request_source_host(source_url)
     if not source_host:
-        return True
+        return False
     source_scheme = parsed.scheme.lower()
     allowed = {
         normalize_host_port(host_header, source_scheme),
@@ -2407,7 +2525,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_json(500, {"created": False, "error": INTERNAL_ERROR_MESSAGE})
 
     def serve_api(self, query):
-        symbols = parse_symbols(query)
+        try:
+            symbols = parse_symbols(query, reject_overflow=True)
+        except BadRequestError as exc:
+            self.send_json(400, {"error": str(exc), "error_type": "bad_request"})
+            return
         user_storage = self.request_storage()
         key = cache_key(symbols)
         now = time.time()
@@ -2505,13 +2627,31 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 )
                 return
             analysis_completed_at = time.time()
-            generated_at = now_bj(analysis_completed_at)
+            try:
+                publication_prices = fetch_publication_prices(symbols)
+            except Exception as exc:
+                publication_prices = {}
+                LOG.warning("publication price refresh failed; symbols=%s; error=%s", symbols, exc)
+            for report in data:
+                if not isinstance(report, dict):
+                    continue
+                report["analysis_price"] = float_or_zero(report.get("last"))
+                price = publication_prices.get(normalize_symbol(report.get("symbol")))
+                if price:
+                    report["publication_price"] = price["price"]
+                    report["publication_bid"] = price["bid"]
+                    report["publication_ask"] = price["ask"]
+                    report["publication_price_observed_at_ms"] = price["observed_at_ms"]
+                    report["publication_price_source"] = price["source"]
+            published_at = time.time()
+            generated_at = now_bj(published_at)
             payload = {
                 "generated_at": generated_at,
-                "published_at_ms": int(analysis_completed_at * 1000),
+                "published_at_ms": int(published_at * 1000),
                 "analysis_started_at": now_bj(analysis_started_at),
-                "analysis_completed_at": generated_at,
+                "analysis_completed_at": now_bj(analysis_completed_at),
                 "analysis_duration_ms": max(0, round((analysis_completed_at - analysis_started_at) * 1000)),
+                "publication_delay_ms": max(0, round((published_at - analysis_completed_at) * 1000)),
                 "symbols": symbols,
                 "data": data,
                 "stale": False,
@@ -2519,7 +2659,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "warning": None,
             }
             with _payload_lock:
-                _last_payloads[cache_key(symbols)] = {"ts": analysis_completed_at, "payload": payload}
+                _last_payloads[cache_key(symbols)] = {"ts": published_at, "payload": payload}
             save_cache(symbols, payload)
             response_payload = dict(payload)
             if storage is not None:
@@ -2544,31 +2684,42 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_cached_or_error(str(exc), "", symbols)
 
     def serve_realtime_prices(self, query):
-        symbols = parse_symbols(query)
+        try:
+            symbols = parse_symbols(query, reject_overflow=True)
+        except BadRequestError as exc:
+            self.send_json(400, {"error": str(exc), "error_type": "bad_request"})
+            return
         hub, ensure_symbols, sharing = realtime_hub_for_request(symbols)
         record_realtime_sharing(sharing)
-        hub.acquire()
-        hub.ensure(ensure_symbols)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+        try:
+            hub.ensure(ensure_symbols)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+        except Exception:
+            hub.release()
+            raise
 
         last_payload = None
         last_emit = 0
+        next_maintenance = 0
         started = time.time()
         try:
             self.wfile.write(b"retry: 1000\n\n")
             self.wfile.flush()
             while time.time() - started < SSE_MAX_SECONDS:
+                now = time.time()
+                if now >= next_maintenance:
+                    hub.maintain(ensure_symbols)
+                    next_maintenance = now + 5
                 snap = hub.snapshot(symbols)
                 snap["hub_key"] = hub.key
                 snap["sharing"] = sharing
                 payload = json.dumps(snap, ensure_ascii=False, separators=(",", ":"))
-                now = time.time()
                 if payload != last_payload or now - last_emit >= SSE_HEARTBEAT_SECONDS:
                     self.wfile.write(("data: " + payload + "\n\n").encode("utf-8"))
                     self.wfile.flush()
@@ -2582,23 +2733,55 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def serve_preferences(self):
         user_storage = self.request_storage()
-        prefs = user_storage.load_preferences() if user_storage is not None else {}
-        self.send_json(200, {
-            "preferences": prefs,
-            "storage": storage.status() if storage is not None else {"mysql": {"configured": False}, "redis": {"configured": False}},
-        })
+        fallback_status = {"mysql": {"configured": False, "available": False}, "redis": {"configured": False, "available": False}}
+        try:
+            if user_storage is not None and getattr(user_storage, "mysql_configured", False):
+                if not user_storage.mysql_available():
+                    self.send_json(503, {
+                        "error": "preference storage is unavailable",
+                        "storage": user_storage.status() if hasattr(user_storage, "status") else fallback_status,
+                    })
+                    return
+            if user_storage is not None:
+                prefs, revision = user_storage.load_preferences_with_revision()
+                storage_status = user_storage.status() if hasattr(user_storage, "status") else fallback_status
+            else:
+                prefs, revision = {}, 0
+                storage_status = fallback_status
+            self.send_json(200, {
+                "preferences": prefs,
+                "revision": revision,
+                "storage": storage_status,
+            })
+        except Exception:
+            LOG.exception("load preferences failed")
+            self.send_json(503, {"error": "preference storage is unavailable", "storage": fallback_status})
 
     def save_preferences_api(self):
         try:
             body = self.read_json_body()
-            prefs = body.get("preferences") if isinstance(body, dict) and isinstance(body.get("preferences"), dict) else body
+            prefs = body.get("preferences") if isinstance(body, dict) else None
             if not isinstance(prefs, dict):
                 self.send_json(400, {"saved": False, "error": "preferences must be a JSON object"})
                 return
+            revision = body.get("revision") if isinstance(body, dict) else None
+            try:
+                raw_revision = revision
+                if isinstance(raw_revision, bool):
+                    raise ValueError
+                revision = int(revision)
+                if revision <= 0 or (isinstance(raw_revision, float) and raw_revision != revision):
+                    raise ValueError
+            except (TypeError, ValueError):
+                self.send_json(400, {"saved": False, "error": "revision must be a positive integer"})
+                return
             user_storage = self.request_storage()
-            saved = user_storage.save_preferences(prefs) if user_storage is not None else False
+            result = user_storage.save_preferences(prefs, revision=revision) if user_storage is not None else False
+            saved = bool(result.get("saved")) if isinstance(result, dict) else bool(result)
             self.send_json(200, {
-                "saved": bool(saved),
+                "saved": saved,
+                "applied": bool(result.get("applied", saved)) if isinstance(result, dict) else saved,
+                "revision": int(result.get("revision") or revision or 0) if isinstance(result, dict) else int(revision or 0),
                 "storage": storage.status() if storage is not None else {"mysql": {"configured": False}, "redis": {"configured": False}},
             })
         except BadRequestError as exc:

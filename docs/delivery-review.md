@@ -57,3 +57,27 @@ This pass tightens the P0 trust issues from `docs/improvement-suggestions.md`: h
 
 - Historical quality is a non-overlapping 5m proxy using next-bar-open fills. It is not a full execution-grade or live-isomorphic backtest and does not change the opening score.
 - Human review should check `src/bian_dashboard/analyzer.py`, `web/assets/charts.js`, and the updated docs before staging.
+
+## 2026-07-16 Review Bug Remediation
+
+- Live review now starts with the first complete 1m candle at or after publication; a mid-minute candle cannot reuse pre-publication high/low as a later entry or stop.
+- Preference POSTs require a positive revision at both the HTTP and MySQL storage boundaries.
+- Deployment packages use a Git-derived manifest, reject dirty worktrees by default, and never include the local `.env` or ignored files.
+- Remote deployment validates a temporary release, preserves the previous directory until health passes, keeps the uploaded archive for retries, and persists `--public-port` in the remote `.env`.
+- Human release review should inspect the server/storage API contract, deploy dry-run output, and all new smoke assertions before staging.
+
+## 2026-07-16 Follow-up Bug Remediation
+
+- Preference conflicts are reconciled against current server state; same-field stale values are discarded and only unchanged fields retry. Temporary storage failures still preserve the exact patch for retry.
+- Realtime status reports offline when the upstream WebSocket has an explicit error and no fresh price, even if SSE transport remains open.
+- Server preferences remove hidden default symbols before calculating capacity for up to eight custom symbols.
+- Dirty deployment preserves all Git ignore sources and fails closed when an ignore file cannot be read.
+- Redis password configuration now reaches the dashboard client, Redis `requirepass`, first-deploy secret generation, and authenticated healthcheck.
+
+## 2026-07-17 Concurrency And Storage Remediation
+
+- Preference conflict recovery now performs a three-way field comparison instead of promoting every rejected patch. In-flight-only unload beacons reuse their original revision.
+- Configured preference storage returns HTTP 503 while MySQL is unavailable, so revision zero cannot trigger a stale full-browser writeback.
+- Direct WebSocket workers carry a generation token; stopped workers cannot publish connection state, errors, counters, timestamps, or messages after replacement.
+- Same-origin POST validation distinguishes an absent CLI source header from a present invalid source and rejects `Origin: null` or malformed values.
+- Human release review should exercise two authenticated browser sessions, a MySQL interruption, and a real Binance WebSocket restart before deployment approval.

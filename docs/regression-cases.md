@@ -27,3 +27,18 @@
 25. Confirm `runtime/backtest_cache.json` is created and reused by analyzer/server calls.
 26. Confirm `/api/realtime-prices?symbols=DOGEUSDT` streams `depth_imbalance`, `bid_depth_top5_usd`, and `ask_depth_top5_usd`.
 27. Confirm invalid symbols return HTTP 400 instead of stale cache.
+28. Confirm a signal published mid-minute ignores that minute's full OHLC high/low, while a candle opening exactly at publication remains eligible.
+29. Confirm `/api/preferences` rejects a missing, zero, or negative `revision` and that the storage layer cannot upsert without a positive revision.
+30. Confirm `python scripts/deploy.py --dry-run --allow-dirty --public-port 9000` writes `BIAN_PUBLIC_PORT=9000` into the remote release `.env` before Compose validation.
+31. Confirm the deployment archive cleanup appears after `/api/health`, so a failed deploy command can retry with the same uploaded archive.
+32. Confirm the default deploy rejects a dirty worktree and Git-ignored files never appear in the archive manifest.
+33. Confirm a preference response with `saved=true, applied=false` fetches current server preferences, drops a same-field stale patch, and retries only fields unchanged since the request's base snapshot.
+34. Confirm HTTP 200 with `saved=false` is treated as a retryable storage outage rather than leaving the patch idle.
+35. Confirm an open SSE carrying `connected=false`, no fresh price, and an upstream error renders offline rather than connecting forever.
+36. Confirm removing both default symbols leaves capacity for eight server-saved custom symbols during boot.
+37. Confirm `--allow-dirty` fails closed when Git cannot read a global ignore source.
+38. Confirm Docker Compose passes `BIAN_REDIS_PASSWORD` to both services, enables `requirepass`, and authenticates the Redis healthcheck.
+39. Confirm configured MySQL preference storage returns HTTP 503 while unavailable and does not trigger a full localStorage snapshot writeback.
+40. Confirm a stopped realtime worker that finishes connecting late cannot change connection counters, errors, timestamps, prices, or the current hub's connected state.
+41. Confirm missing Origin/Referer headers remain CLI-compatible, while `Origin: null` and malformed source headers are rejected.
+42. Confirm an unload beacon replaying only the active in-flight preference patch reuses that request's revision instead of promoting the patch.

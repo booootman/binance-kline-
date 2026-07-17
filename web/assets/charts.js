@@ -14,6 +14,7 @@
     error: ''
   };
   var AUTO_STRATEGY_REFRESH_MS = 5 * 60 * 1000;
+  var MAX_SYMBOLS = 8;
   var LIVE_TRIGGER_CONFIRM_MAX_AGE_MS = 90 * 1000;
   var STRATEGY_WARN_AGE_MS = 7 * 60 * 1000;
   var STRATEGY_BLOCK_AGE_MS = 12 * 60 * 1000;
@@ -38,7 +39,8 @@
     tvInterval: 'bian_dashboard_tv_kline_interval',
     signalAlert: 'bian_dashboard_signal_alert_pref',
     customSymbols: 'bian_dashboard_custom_syms',
-    removedSymbols: 'bian_dashboard_removed_syms'
+    removedSymbols: 'bian_dashboard_removed_syms',
+    preferenceRevision: 'bian_dashboard_preference_revision'
   };
   var SIGNAL_HISTORY_KEY = STORAGE_KEYS.signalHistory;
   var SYMBOL_HISTORY_KEY = STORAGE_KEYS.symbolHistory;
@@ -48,6 +50,7 @@
   var SIGNAL_ALERT_PREF_KEY = STORAGE_KEYS.signalAlert;
   var LS_KEY = STORAGE_KEYS.customSymbols;
   var REMOVED_KEY = STORAGE_KEYS.removedSymbols;
+  var PREFERENCE_REVISION_KEY = STORAGE_KEYS.preferenceRevision;
   var tvKlineInterval = loadTvKlineInterval();
   var tvKlineKey = '';
   var signalAlertPref = loadSignalAlertPref();
@@ -55,6 +58,12 @@
   var pendingPreferencePatch = {};
   var preferenceSaveTimer = null;
   var preferenceRetryDelayMs = 5000;
+  var preferenceSaveInFlight = false;
+  var preferenceInFlightPatch = {};
+  var preferenceInFlightRevision = 0;
+  var preferencesUnloadFlushed = false;
+  var preferenceServerRevision = 0;
+  var preferenceServerSnapshot = {};
   var root = getComputedStyle(document.documentElement);
   var C = {
     ink: root.getPropertyValue('--ink').trim(),
@@ -94,6 +103,7 @@
     SIGNAL_ALERT_PREF_KEY = scoped(STORAGE_KEYS.signalAlert);
     LS_KEY = scoped(STORAGE_KEYS.customSymbols);
     REMOVED_KEY = scoped(STORAGE_KEYS.removedSymbols);
+    PREFERENCE_REVISION_KEY = scoped(STORAGE_KEYS.preferenceRevision);
     tvKlineInterval = loadTvKlineInterval();
     signalAlertPref = loadSignalAlertPref();
   }
@@ -253,43 +263,172 @@
     try { localStorage.setItem(TV_KLINE_INTERVAL_KEY, v); } catch (e) {}
     saveServerPreferences({ tv_kline_interval: v });
   }
+  function loadPreferenceRevision() {
+    try { return Math.max(0, Number(localStorage.getItem(PREFERENCE_REVISION_KEY)) || 0); } catch (e) { return 0; }
+  }
+  function rememberPreferenceRevision(value) {
+    var revision = Math.max(loadPreferenceRevision(), Number(value) || 0);
+    try { localStorage.setItem(PREFERENCE_REVISION_KEY, String(revision)); } catch (e) {}
+    return revision;
+  }
+  function nextPreferenceRevision() {
+    var revision = Math.max(Date.now() * 1000, loadPreferenceRevision() + 1);
+    return rememberPreferenceRevision(revision);
+  }
+  function mergePreferencePatch(target, patch, overwrite) {
+    Object.keys(patch || {}).forEach(function (key) {
+      if (overwrite || !Object.prototype.hasOwnProperty.call(target, key)) target[key] = patch[key];
+    });
+    return target;
+  }
+  function clonePreferencePatch(patch) {
+    try { return JSON.parse(JSON.stringify(patch || {})); } catch (e) { return {}; }
+  }
+  function preferenceValueEqual(leftExists, left, rightExists, right) {
+    if (leftExists !== rightExists) return false;
+    if (!leftExists) return true;
+    try { return JSON.stringify(left) === JSON.stringify(right); } catch (e) { return left === right; }
+  }
+  function preferenceStorageReady(payload) {
+    var mysql = payload && payload.storage && payload.storage.mysql;
+    return !(mysql && mysql.configured === true && mysql.available === false);
+  }
+  function updatePreferenceServerState(prefs, revision, replace) {
+    var normalized = prefs && typeof prefs === 'object' ? clonePreferencePatch(prefs) : {};
+    if (replace) preferenceServerSnapshot = normalized;
+    else mergePreferencePatch(preferenceServerSnapshot, normalized, true);
+    preferenceServerRevision = Math.max(0, Number(revision) || 0);
+    rememberPreferenceRevision(preferenceServerRevision);
+  }
+  function reconcilePreferenceConflict(rejectedPatch, baseSnapshot) {
+    return fetch('api/preferences', { cache: 'no-store' })
+      .then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (payload) {
+          if (!res.ok || !preferenceStorageReady(payload)) throw new Error(payload.error || ('HTTP ' + res.status));
+          return payload;
+        });
+      })
+      .then(function (payload) {
+        var serverPrefs = payload.preferences && typeof payload.preferences === 'object' ? payload.preferences : {};
+        var retryPatch = {};
+        Object.keys(rejectedPatch || {}).forEach(function (key) {
+          var baseHas = Object.prototype.hasOwnProperty.call(baseSnapshot || {}, key);
+          var serverHas = Object.prototype.hasOwnProperty.call(serverPrefs, key);
+          if (preferenceValueEqual(baseHas, baseSnapshot[key], serverHas, serverPrefs[key])) {
+            retryPatch[key] = rejectedPatch[key];
+          }
+        });
+        var applyPatch = {};
+        Object.keys(serverPrefs).forEach(function (key) {
+          var hasNewerLocal = Object.prototype.hasOwnProperty.call(pendingPreferencePatch, key);
+          var willRetry = Object.prototype.hasOwnProperty.call(retryPatch, key);
+          if (!hasNewerLocal && !willRetry) applyPatch[key] = serverPrefs[key];
+        });
+        updatePreferenceServerState(serverPrefs, payload.revision, true);
+        applyServerPreferences(applyPatch);
+        mergePreferencePatch(pendingPreferencePatch, retryPatch, false);
+      });
+  }
   function saveServerPreferences(patch) {
     if (!patch || typeof patch !== 'object') return;
-    Object.keys(patch).forEach(function (key) { pendingPreferencePatch[key] = patch[key]; });
+    preferencesUnloadFlushed = false;
+    mergePreferencePatch(pendingPreferencePatch, patch, true);
     if (preferenceSaveTimer) clearTimeout(preferenceSaveTimer);
     preferenceSaveTimer = setTimeout(flushServerPreferences, 350);
   }
   function flushServerPreferences() {
+    if (preferenceSaveTimer) clearTimeout(preferenceSaveTimer);
+    preferenceSaveTimer = null;
+    if (preferenceSaveInFlight) return;
     var prefs = pendingPreferencePatch;
     pendingPreferencePatch = {};
-    preferenceSaveTimer = null;
     if (!prefs || !Object.keys(prefs).length) return;
+    var revision = nextPreferenceRevision();
+    var baseSnapshot = clonePreferencePatch(preferenceServerSnapshot);
+    var retryableFailure = false;
+    var saveFailed = false;
+    preferenceSaveInFlight = true;
+    preferenceInFlightPatch = prefs;
+    preferenceInFlightRevision = revision;
     fetch('api/preferences', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ preferences: prefs }),
+      body: JSON.stringify({ preferences: prefs, revision: revision }),
       cache: 'no-store'
     }).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (payload) {
         if (!res.ok || payload.saved !== true) {
           var error = new Error(payload.error || ('HTTP ' + res.status));
-          error.status = res.status;
+          error.status = res.ok ? 503 : res.status;
           throw error;
         }
+        if (payload.applied === false) {
+          var conflict = new Error('preference revision conflict');
+          conflict.status = 409;
+          conflict.preferenceConflict = true;
+          throw conflict;
+        }
+        updatePreferenceServerState(prefs, payload.revision || revision, false);
         preferenceRetryDelayMs = 5000;
       });
     }).catch(function (err) {
-      Object.keys(prefs).forEach(function (key) {
-        if (!Object.prototype.hasOwnProperty.call(pendingPreferencePatch, key)) pendingPreferencePatch[key] = prefs[key];
-      });
-      var status = Number(err && err.status) || 0;
-      var retryable = !status || status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
-      if (retryable && !preferenceSaveTimer) {
-        preferenceSaveTimer = setTimeout(flushServerPreferences, preferenceRetryDelayMs);
-        preferenceRetryDelayMs = Math.min(60000, preferenceRetryDelayMs * 2);
+      saveFailed = true;
+      if (err && err.preferenceConflict) {
+        console.warn('[dashboard] preference revision conflict; reconciling server state');
+        return reconcilePreferenceConflict(prefs, baseSnapshot).then(function () {
+          saveFailed = false;
+        }).catch(function (reconcileError) {
+          console.warn('[dashboard] preference conflict reconciliation failed:', reconcileError.message);
+        });
       }
+      mergePreferencePatch(pendingPreferencePatch, prefs, false);
+      var status = Number(err && err.status) || 0;
+      retryableFailure = !status || status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
       console.warn('[dashboard] preference sync failed:', err.message);
+    }).then(function () {
+      preferenceSaveInFlight = false;
+      preferenceInFlightPatch = {};
+      preferenceInFlightRevision = 0;
+      if (Object.keys(pendingPreferencePatch).length && !preferenceSaveTimer && (!saveFailed || retryableFailure)) {
+        preferenceSaveTimer = setTimeout(flushServerPreferences, retryableFailure ? preferenceRetryDelayMs : 0);
+        if (retryableFailure) preferenceRetryDelayMs = Math.min(60000, preferenceRetryDelayMs * 2);
+      }
     });
+  }
+  function flushPreferencesOnUnload() {
+    if (preferencesUnloadFlushed) return;
+    preferencesUnloadFlushed = true;
+    var prefs = {};
+    mergePreferencePatch(prefs, preferenceInFlightPatch, true);
+    mergePreferencePatch(prefs, pendingPreferencePatch, true);
+    if (!Object.keys(prefs).length) return;
+    var hasPending = Object.keys(pendingPreferencePatch).length > 0;
+    var revision = !hasPending && preferenceInFlightRevision ? preferenceInFlightRevision : nextPreferenceRevision();
+    var body = JSON.stringify({ preferences: prefs, revision: revision });
+    var sent = false;
+    if (navigator.sendBeacon && typeof Blob !== 'undefined') {
+      sent = navigator.sendBeacon('api/preferences', new Blob([body], { type: 'application/json' }));
+    }
+    if (!sent && window.fetch) {
+      window.fetch('api/preferences', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body,
+        cache: 'no-store',
+        keepalive: true
+      }).catch(function () {});
+    }
+  }
+  function normalizeServerSymbolPreferences(prefs) {
+    prefs = prefs && typeof prefs === 'object' ? prefs : {};
+    var hasRemoved = Array.isArray(prefs.removed_symbols);
+    var hasCustom = Array.isArray(prefs.custom_symbols);
+    var removed = hasRemoved ? normalizeSymbolList(prefs.removed_symbols) : loadRemovedSyms();
+    var active = normalizeSymbolList(DATA).filter(function (sym) { return removed.indexOf(sym) < 0; });
+    var custom = hasCustom ? normalizeSymbolList(prefs.custom_symbols).filter(function (sym) {
+      return removed.indexOf(sym) < 0 && active.indexOf(sym) < 0;
+    }).slice(0, Math.max(0, MAX_SYMBOLS - active.length)) : null;
+    return { hasRemoved: hasRemoved, hasCustom: hasCustom, removed: removed, custom: custom, active: active };
   }
   function applyServerPreferences(prefs) {
     if (!prefs || typeof prefs !== 'object') return;
@@ -298,23 +437,14 @@
       if (Array.isArray(prefs.symbol_history)) {
         symbolHistorySeed = symbolHistorySeed.concat(prefs.symbol_history);
       }
-      if (Array.isArray(prefs.custom_symbols)) {
-        var custom = [];
-        prefs.custom_symbols.forEach(function (item) {
-          var sym = normalizeClientSymbol(item);
-          if (sym && custom.indexOf(sym) < 0) custom.push(sym);
-        });
-        localStorage.setItem(LS_KEY, JSON.stringify(custom));
-        symbolHistorySeed = symbolHistorySeed.concat(custom);
+      var symbolPrefs = normalizeServerSymbolPreferences(prefs);
+      if (symbolPrefs.hasRemoved) {
+        localStorage.setItem(REMOVED_KEY, JSON.stringify(symbolPrefs.removed));
+        symbolHistorySeed = symbolHistorySeed.concat(symbolPrefs.removed);
       }
-      if (Array.isArray(prefs.removed_symbols)) {
-        var removed = [];
-        prefs.removed_symbols.forEach(function (item) {
-          var sym = normalizeClientSymbol(item);
-          if (sym && removed.indexOf(sym) < 0) removed.push(sym);
-        });
-        localStorage.setItem(REMOVED_KEY, JSON.stringify(removed));
-        symbolHistorySeed = symbolHistorySeed.concat(removed);
+      if (symbolPrefs.hasCustom) {
+        localStorage.setItem(LS_KEY, JSON.stringify(symbolPrefs.custom));
+        symbolHistorySeed = symbolHistorySeed.concat(symbolPrefs.custom);
       }
       if (prefs.position_state && typeof prefs.position_state === 'object') {
         localStorage.setItem(POSITION_STATE_KEY, JSON.stringify(prefs.position_state));
@@ -341,7 +471,11 @@
     fetch('api/preferences', { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
-        applyServerPreferences(payload.preferences || {});
+        if (!preferenceStorageReady(payload)) throw new Error('preference storage is unavailable');
+        var serverRevision = Math.max(0, Number(payload.revision) || 0);
+        var serverPrefs = payload.preferences || {};
+        updatePreferenceServerState(serverPrefs, serverRevision, true);
+        applyServerPreferences(serverPrefs);
       })
       .catch(function (err) {
         console.warn('[dashboard] preference load failed, using browser localStorage:', err.message);
@@ -1039,12 +1173,12 @@
       if (old && old.symbol) oldBySymbol[old.symbol] = old;
     });
     var stamp = generatedAt || GEN || '';
-    var ms = parseSnapshotMs(stamp) || Date.now();
+    var ms = parseSnapshotMs(stamp);
     return (arr || []).map(function (r) {
       if (!r || typeof r !== 'object') return r;
       var old = oldBySymbol[r.symbol];
       if (old) {
-        ['_price_snapshot_ms', '_depth_snapshot_ms', '_price_bid', '_price_ask', '_price_source', '_price_kind', '_depth_imbalance', '_bid_depth_top5_usd', '_ask_depth_top5_usd', '_depth_ladder'].forEach(function (key) {
+        ['_price_snapshot_ms', '_depth_snapshot_ms', '_price_source_ms', '_depth_source_ms', '_price_bid', '_price_ask', '_price_source', '_price_kind', '_depth_imbalance', '_bid_depth_top5_usd', '_ask_depth_top5_usd', '_depth_ladder'].forEach(function (key) {
           if (old[key] != null && r[key] == null) r[key] = old[key];
         });
       }
@@ -1106,6 +1240,9 @@
     });
     return active;
   }
+  function hasSymbolCapacity() {
+    return normalizeSymbolList(DATA).length < MAX_SYMBOLS;
+  }
   function symbolHistoryCandidates() {
     var active = activeSymbolMap();
     return loadSymbolHistory().filter(function (sym) { return !active[sym]; }).slice(0, 18);
@@ -1124,7 +1261,7 @@
     var out = [];
     function add(sym) {
       var symbol = normalizeClientSymbol(sym);
-      if (!symbol || removed.indexOf(symbol) >= 0 || out.indexOf(symbol) >= 0) return;
+      if (!symbol || removed.indexOf(symbol) >= 0 || out.indexOf(symbol) >= 0 || out.length >= MAX_SYMBOLS) return;
       out.push(symbol);
     }
     DATA.forEach(function (r) { if (r && r.symbol) add(r.symbol); });
@@ -1799,20 +1936,20 @@
     var items = loadSignalHistory().filter(function (x) { return x.symbol === r.symbol; }).slice(0, 30);
     if (!items.length) { host.innerHTML = '<div class="history-empty">暂无信号历史</div>'; return; }
     host.innerHTML = items.map(function (x) {
-      var biasCls = x.bias === 'bull' ? 'bull' : x.bias === 'bear' ? 'bear' : 'wait';
-      var biasText = x.bias === 'bull' ? '偏多' : x.bias === 'bear' ? '偏空' : '观望';
+      var biasCls = biasClass(String(x.bias || ''));
+      var biasText = biasCls === 'bull' ? '偏多' : biasCls === 'bear' ? '偏空' : '观望';
       return '<div class="history-item">' +
-        '<div class="ht"><span>' + shortTime(x.ts) + ' · ' + x.reason + '</span><span>' + (x.advice || '') + '</span></div>' +
+        '<div class="ht"><span>' + shortTime(x.ts) + ' · ' + htmlSafe(x.reason) + '</span><span>' + htmlSafe(x.advice || '') + '</span></div>' +
         '<div class="hb">' +
           '<span class="hl-bias ' + biasCls + '">' + biasText + '</span>' +
           '<span>开仓<span class="hl-conf">' + x.confidence + '</span></span>' +
           '<span>方向<span class="hl-conf">' + (x.directionScore != null ? x.directionScore : '-') + '</span></span>' +
-          '<span class="hl-risk">' + x.risk + '</span>' +
+          '<span class="hl-risk">' + htmlSafe(x.risk) + '</span>' +
           '<span class="sep">|</span>' +
-          '<span>' + (x.entryLabel || '入场') + ' <b>' + fmtPrice(Number(x.entry || 0)) + '</b>' + (x.entryDistance ? ' ' + x.entryDistance : '') + '</span>' +
+          '<span>' + htmlSafe(x.entryLabel || '入场') + ' <b>' + fmtPrice(Number(x.entry || 0)) + '</b>' + (x.entryDistance ? ' ' + htmlSafe(x.entryDistance) : '') + '</span>' +
           '<span>止损 <b>' + fmtPrice(Number(x.stop || 0)) + '</b></span>' +
           '<span class="sep">|</span>' +
-          '<span>' + x.position + '</span>' +
+          '<span>' + htmlSafe(x.position) + '</span>' +
         '</div>' +
       '</div>';
     }).join('');
@@ -2307,7 +2444,7 @@
     }
   }
   function currentSymbolsKey() {
-    return DATA.map(function (r) { return r.symbol; }).sort().join(',');
+    return DATA.map(function (r) { return r.symbol; }).sort().slice(0, MAX_SYMBOLS).join(',');
   }
   function startRealtimePrices() {
     if (!window.EventSource) {
@@ -2355,13 +2492,20 @@
     if (!item || !item.symbol || item.price == null) return;
     var price = Number(item.price);
     if (!isFinite(price)) return;
-    var ms = Number(item.price_event_ms || item.event_ms || item.price_received_ms || item.received_ms || Date.now());
-    var depthMs = Number(item.depth_event_ms || item.depth_received_ms || 0);
+    var sourceMs = Number(item.price_received_ms || item.received_ms || item.price_event_ms || item.event_ms || 0);
+    var depthSourceMs = Number(item.depth_received_ms || item.depth_event_ms || 0);
+    var receivedAt = Date.now();
     DATA.forEach(function (r) {
       if (r.symbol !== item.symbol) return;
       r.last = price;
-      r._price_snapshot_ms = ms;
-      if (depthMs > 0) r._depth_snapshot_ms = depthMs;
+      if (sourceMs > 0 && sourceMs !== Number(r._price_source_ms || 0)) {
+        r._price_source_ms = sourceMs;
+        r._price_snapshot_ms = receivedAt;
+      }
+      if (depthSourceMs > 0 && depthSourceMs !== Number(r._depth_source_ms || 0)) {
+        r._depth_source_ms = depthSourceMs;
+        r._depth_snapshot_ms = receivedAt;
+      }
       if (item.source) r._price_source = item.source;
       if (item.price_kind) r._price_kind = item.price_kind;
       if (item.bid != null) r._price_bid = item.bid;
@@ -2454,7 +2598,7 @@
         var sym = normalizeClientSymbol(item);
         if (sym && out.indexOf(sym) < 0) out.push(sym);
       });
-      return out;
+      return out.slice(0, MAX_SYMBOLS);
     } catch (e) { return []; }
   }
   function loadRemovedSyms() {
@@ -2609,6 +2753,10 @@
       renderSymbolTabs();
       render();
       setAddStatus(raw + ' 已打开', 'ok');
+      return;
+    }
+    if (!hasSymbolCapacity()) {
+      setAddStatus('最多同时打开 ' + MAX_SYMBOLS + ' 个币种，请先移除一个。', 'err');
       return;
     }
     var btn2 = document.getElementById('add-sym-btn');
@@ -3365,6 +3513,7 @@
   function onResize() { charts.forEach(function (c) { c.resize(); }); }
 
   function cleanup() {
+    flushPreferencesOnUnload();
     if (realtimeSource) {
       realtimeSource.close();
       realtimeSource = null;
@@ -3403,6 +3552,13 @@
     var custom = loadCustomSyms().filter(function (sym) {
       return !DATA.some(function (r) { return r.symbol === sym; });
     });
+    var available = Math.max(0, MAX_SYMBOLS - DATA.length);
+    if (custom.length > available) {
+      rememberSymbols(custom.slice(available), false);
+      custom = custom.slice(0, available);
+      try { localStorage.setItem(LS_KEY, JSON.stringify(custom)); } catch (e) {}
+      saveServerPreferences({ custom_symbols: custom });
+    }
     if (!custom.length) { done(); return; }
     rememberSymbols(custom, true);
     showLoading('正在恢复 ' + custom.length + ' 个自定义币种…');
@@ -3432,6 +3588,7 @@
     if (!clockTimer) clockTimer = setInterval(tick, 1000);
     window.addEventListener('resize', onResize);
     window.addEventListener('beforeunload', cleanup);
+    window.addEventListener('pagehide', flushPreferencesOnUnload);
     DATA = stampReports(DATA, GEN);
     showLoading('正在调用 bian.py 获取实时行情…');
     loadCurrentUser(function () {
@@ -3478,17 +3635,17 @@
     return Math.max(0, Date.now() - Number(report._price_snapshot_ms)) <= 20000;
   }
 
-  function refreshLiveBadge() {
+  function realtimeBadgeMode() {
     var fresh = realtimePriceIsFresh(cur());
     if (REALTIME_STATE.transportOpen && REALTIME_STATE.upstreamConnected && fresh) {
-      updateLiveBadge('live');
-    } else if (fresh && REALTIME_STATE.lastPayloadAt) {
-      updateLiveBadge('reconnecting');
-    } else if (REALTIME_STATE.transportOpen) {
-      updateLiveBadge('connecting');
-    } else {
-      updateLiveBadge('offline');
+      return 'live';
     }
+    if (fresh && REALTIME_STATE.lastPayloadAt) return 'reconnecting';
+    if (REALTIME_STATE.error) return 'offline';
+    return REALTIME_STATE.transportOpen ? 'connecting' : 'offline';
+  }
+  function refreshLiveBadge() {
+    updateLiveBadge(realtimeBadgeMode());
   }
 
   function updateLiveBadge(mode) {
