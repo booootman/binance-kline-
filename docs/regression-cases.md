@@ -42,8 +42,19 @@
 40. Confirm a stopped realtime worker that finishes connecting late cannot change connection counters, errors, timestamps, prices, or the current hub's connected state.
 41. Confirm missing Origin/Referer headers remain CLI-compatible, while `Origin: null` and malformed source headers are rejected.
 42. Confirm mixed unload work sends one ordered batch containing the active in-flight patch at its original revision and newer pending fields at a later revision.
-43. Confirm a failed conflict-reconciliation GET persists the rejected patch, survives runtime memory loss or reload, and retries another GET before any safe field is written.
+43. Confirm a rejected patch is persisted before conflict reconciliation completes, survives pagehide/runtime memory loss, and retries another GET before any safe field is written.
 44. Confirm `storage.mysql.configured=false` disables server preference sync while localStorage continues to work without recurring POST retries.
 45. Confirm password verification locks the user row, password hash update and other-session revocation use one transaction, and a revocation failure rolls back the password update.
-46. Confirm HTTP 400/401/403 preference failures remain pending without scheduling another request, while 429/503 failures continue to retry with backoff.
+46. Confirm HTTP 400/401/403 preference POST and recovery GET failures remain pending without scheduling another request, while 429/503 failures continue to retry with backoff.
 47. Confirm an ordered preference batch skips a stale first revision, applies a newer second revision, and rolls back all entries when a later write fails.
+48. Confirm a newer same-key edit replaces the persisted recovery value and an older reconciliation completion cannot clear or replay the superseded value.
+49. Confirm `round_to_tick` outputs legal tick multiples and `down <= input <= up` for fine and non-power-of-ten ticks.
+50. Confirm releasing an old backtest cache lock cannot delete a replacement lock with a different owner token.
+51. Confirm older bookTicker/depth exchange timestamps cannot roll back price, bid/ask, depth, or freshness, while a newer depth event can advance independently.
+52. Confirm a realtime execution-score drop from 75 to 67 caps a 30% backend position at 22%, and a score below 45 produces 0%.
+53. Confirm two concurrent add-symbol actions reserve capacity and a late response rechecks the eight-symbol limit before mutating dashboard data.
+54. Confirm unavailable or ambiguous `/api/auth/me` stops boot and preference sync, while only `auth_enabled=false` selects local user scope.
+55. Confirm a partial record with only 5m complete stays pending, is not due at 10m, and becomes due for its missing 15m result after 15m.
+56. Confirm file-fallback signal reviews are merged into MySQL by user/key after recovery and removed from the file only after successful upsert.
+57. Confirm slow request bodies time out, active HTTP handlers cannot exceed the configured slots, and excess SSE clients receive HTTP 503.
+58. Confirm Compose binds `127.0.0.1:8000` by default, remote deploy forces loopback plus Secure cookies, and the public HTTPS proxy can reconnect EventSource after the five-minute SSE rotation.

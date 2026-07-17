@@ -190,6 +190,16 @@ if grep -q '^BIAN_PUBLIC_PORT=' "$release_dir/.env"; then
 else
   printf '\nBIAN_PUBLIC_PORT={args.public_port}\n' >> "$release_dir/.env"
 fi
+if grep -q '^BIAN_BIND_ADDRESS=' "$release_dir/.env"; then
+  sed -i 's/^BIAN_BIND_ADDRESS=.*/BIAN_BIND_ADDRESS=127.0.0.1/' "$release_dir/.env"
+else
+  printf 'BIAN_BIND_ADDRESS=127.0.0.1\n' >> "$release_dir/.env"
+fi
+if grep -q '^BIAN_AUTH_COOKIE_SECURE=' "$release_dir/.env"; then
+  sed -i 's/^BIAN_AUTH_COOKIE_SECURE=.*/BIAN_AUTH_COOKIE_SECURE=1/' "$release_dir/.env"
+else
+  printf 'BIAN_AUTH_COOKIE_SECURE=1\n' >> "$release_dir/.env"
+fi
 cd "$release_dir"
 docker compose config >/dev/null
 if [ -d {remote_dir} ]; then

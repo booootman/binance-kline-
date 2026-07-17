@@ -28,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Sequence
 
@@ -410,16 +411,16 @@ def guess_tick_size(price: float) -> float:
 
 
 def round_to_tick(value: float, tick_size: float, mode: str = "nearest") -> float:
-    tick = tick_size if tick_size > 0 else guess_tick_size(value)
-    value = max(tick, value)
-    units = value / tick
+    tick = Decimal(str(tick_size if tick_size > 0 else guess_tick_size(value)))
+    decimal_value = max(tick, Decimal(str(value)))
+    units = decimal_value / tick
     if mode == "down":
-        units = math.floor(units)
+        units = units.to_integral_value(rounding=ROUND_FLOOR)
     elif mode == "up":
-        units = math.ceil(units)
+        units = units.to_integral_value(rounding=ROUND_CEILING)
     else:
-        units = round(units)
-    return round_price(max(tick, units * tick))
+        units = units.to_integral_value(rounding=ROUND_HALF_EVEN)
+    return float(max(tick, units * tick))
 
 
 def legal_stop(raw: float, side: str, entry: float, anchor: CandleIndicators, tick_size: float) -> float:
@@ -867,7 +868,7 @@ def read_backtest_cache(cache_key_value: str) -> Dict[str, DirectionalBacktest] 
         return None
 
 
-def acquire_backtest_cache_lock(timeout_seconds: float = 5.0) -> int | None:
+def acquire_backtest_cache_lock(timeout_seconds: float = 5.0) -> tuple[int, str] | None:
     if not BACKTEST_CACHE_FILE:
         return None
     lock_path = BACKTEST_CACHE_FILE + ".lock"
@@ -875,8 +876,9 @@ def acquire_backtest_cache_lock(timeout_seconds: float = 5.0) -> int | None:
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"{os.getpid()} {time.time():.6f}\n".encode("ascii", "ignore"))
-            return fd
+            token = f"{os.getpid()}-{time.time_ns()}-{os.urandom(16).hex()}"
+            os.write(fd, f"{token}\n".encode("ascii"))
+            return fd, token
         except FileExistsError:
             try:
                 if time.time() - os.path.getmtime(lock_path) > max(30.0, timeout_seconds * 3.0):
@@ -891,16 +893,20 @@ def acquire_backtest_cache_lock(timeout_seconds: float = 5.0) -> int | None:
             return None
 
 
-def release_backtest_cache_lock(fd: int | None) -> None:
-    if fd is None:
+def release_backtest_cache_lock(lock: tuple[int, str] | None) -> None:
+    if lock is None:
         return
+    fd, token = lock
     lock_path = BACKTEST_CACHE_FILE + ".lock"
     try:
         os.close(fd)
     except OSError:
         pass
     try:
-        os.unlink(lock_path)
+        with open(lock_path, "r", encoding="ascii") as fh:
+            current_token = fh.readline().strip()
+        if current_token == token:
+            os.unlink(lock_path)
     except OSError:
         pass
 
@@ -908,8 +914,8 @@ def release_backtest_cache_lock(fd: int | None) -> None:
 def write_backtest_cache(cache_key_value: str, backtests: Dict[str, DirectionalBacktest]) -> None:
     if not BACKTEST_CACHE_FILE:
         return
-    lock_fd = acquire_backtest_cache_lock()
-    if lock_fd is None:
+    cache_lock = acquire_backtest_cache_lock()
+    if cache_lock is None:
         return
     tmp = ""
     try:
@@ -947,7 +953,7 @@ def write_backtest_cache(cache_key_value: str, backtests: Dict[str, DirectionalB
                     os.unlink(tmp)
             except OSError:
                 pass
-        release_backtest_cache_lock(lock_fd)
+        release_backtest_cache_lock(cache_lock)
 
 
 def load_or_build_directional_backtests(symbol: str, candles: Sequence[list]) -> Dict[str, DirectionalBacktest]:

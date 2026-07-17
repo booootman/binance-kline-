@@ -1,6 +1,6 @@
 {
   "project": "binance-futures-dashboard",
-  "updated_at": "2026-07-16",
+  "updated_at": "2026-07-17",
   "features": [
     {
       "id": "project-structure",
@@ -28,7 +28,8 @@
         "Git ignore rules exclude local tool share packages, Python tool caches, and runtime lock/cache artifacts from accidental review",
         "Restored scripts/smoke.py, scripts/deploy.py, .env.example, and docs/storage.md so verification and deployment documentation reference real files",
         "Frontend offline smoke tests execute the production preference, timestamp, realtime freshness, bias, and symbol-limit functions in a sandboxed browser context",
-        "Frontend smoke coverage includes persisted conflict recovery, non-retryable preference failures, ordered unload batches, temporary storage retry, upstream-error badge state, and eight-custom-symbol restore after removing defaults"
+        "Frontend smoke coverage includes pre-reconciliation persistence, superseded recovery protection, non-retryable POST/GET failures, ordered unload batches, temporary storage retry, upstream-error badge state, and eight-custom-symbol restore after removing defaults",
+        "Offline smoke coverage includes Decimal tick-grid rounding, cache-lock ownership, exchange-event ordering, partial-review deadlines, auth-scope isolation, file/MySQL reconciliation, bounded request slots, body timeouts, and SSE capacity"
       ],
       "delivery_assets": [
         "docs/architecture.md",
@@ -79,7 +80,7 @@
         "Partial-symbol API responses are rejected with missing/returned symbol metadata instead of cached as successful snapshots",
         "Market cache keys treat symbols as a canonical set, so request order cannot duplicate analyzer work or Binance REST calls",
         "Market and realtime endpoints reject more than eight unique symbols instead of silently truncating the request; the frontend enforces the same limit",
-        "Backtest cache writes use lock-file protection and unique temp files for concurrent analyzer subprocesses",
+        "Backtest cache writes use lock-file protection, unique owner tokens, and unique temp files so an old stale-lock owner cannot remove a replacement lock",
         "Analyzer caches Binance exchangeInfo metadata per process so multi-symbol refreshes reuse tick-size and precision data instead of refetching it for every symbol",
         "TLM extreme-rally downgrade is applied before side, backtest, and stop selection, with downgraded direction-score caps",
         "Backend risk-budget sizing with suggested_size_pct, stop_distance_pct, max_loss_pct, and allowed/note metadata",
@@ -90,10 +91,10 @@
         "Same-side altcoin correlation exposure warning across loaded symbols",
         "Frontend stale/warning/error_type handling for delayed cached snapshots",
         "Realtime depth fields are preserved across bookTicker-only updates and strategy refreshes",
-        "Realtime depth20 snapshots refresh the displayed book midpoint and carry separate price/depth event timestamps so an old price cannot be kept artificially fresh",
+        "Realtime depth20 snapshots refresh the displayed book midpoint and carry separate monotonic price/depth exchange timestamps so out-of-order events cannot roll back price, book, or freshness",
         "LIVE badge requires an open SSE transport, Binance upstream connected=true, and an active-symbol price newer than 20 seconds; stale heartbeat prices cannot toggle it green, and an explicit upstream error without fresh data renders offline",
         "Browser LIVE freshness is based on local receipt time for a new server event identity, avoiding clock-skew errors without letting duplicate SSE heartbeats renew stale prices",
-        "Realtime reconnect state is shown separately from offline, with a one-second EventSource retry hint and configurable six-hour SSE response lifetime",
+        "Realtime reconnect state is shown separately from offline, with a one-second EventSource retry hint, five-minute default rotation, and bounded SSE client capacity",
         "Admin diagnostics expose realtime connect/disconnect counts and last connection, message, price, and depth timestamps for each shared hub",
         "Realtime trigger overlay rechecks executable bid/ask distance, spread, depth freshness, top5 size, and imbalance without upgrading an old unconfirmed 1m structure",
         "Confirmed realtime triggers expire after 90 seconds; strategy snapshots warn after 7 minutes and block new entries after 12 minutes",
@@ -101,7 +102,8 @@
         "Market cache TTL and live-review evaluation start at analysis completion/publication instead of before the analyzer subprocess runs",
         "Funding countdown uses Binance nextFundingTime with mark/index price fields retained in the strategy report",
         "Realtime entry, stop, chase, and strategy-snapshot drift warnings use ATR-adaptive thresholds instead of fixed percentages",
-        "Optional browser-local ALERT toggle plays cooldown-limited sound cues for visible near-entry and near-stop signal warnings"
+        "Optional browser-local ALERT toggle plays cooldown-limited sound cues for visible near-entry and near-stop signal warnings",
+        "Frontend risk sizing can only tighten the backend suggestion when realtime execution score drops, and concurrent symbol additions reserve slots before requests start"
       ],
       "verification": [
         "node --check web/assets/charts.js",
@@ -165,13 +167,14 @@
         "Fresh runtime disk market snapshots are reused within the normal cache TTL after server restart before spawning a new analyzer subprocess",
         "New GET/POST /api/preferences endpoints for browser-to-server preference sync",
         "Preference POSTs require a positive per-user monotonic revision locked in the same MySQL transaction, and late requests with lower revisions are rejected before values are changed",
-        "Browser preference writes are serialized, reconcile rejected patches against current server state, persist failed reconciliation reads across reload, retry only fields unchanged since the request snapshot, back off temporary failures, and stop automatic retries for non-retryable responses",
+        "Browser preference writes are serialized, persist rejected patches before reconciliation, preserve newer edits across reload and older async completions, retry only fields unchanged since the request snapshot, back off temporary failures, and stop automatic POST/GET retries for non-retryable responses",
         "Pagehide replay sends in-flight and pending preference patches as one ordered batch that is applied under one server revision lock and transaction",
         "Configured MySQL preference outages return HTTP 503, while explicitly unconfigured MySQL disables server sync and remains on browser localStorage without recurring POST retries",
         "Redis read failures become cache misses with a 30-second cooldown, allowing memory, disk, or fresh analysis fallback",
         "MySQL and Redis connection/read/write waits are bounded by documented environment settings, and availability health caches expire after five seconds",
         "New GET /api/storage-status endpoint for checking configured storage availability",
-        "Browser localStorage remains the fallback when MySQL or Redis is not configured"
+        "Browser localStorage remains the fallback when MySQL or Redis is not configured",
+        "Signal reviews written to the file fallback during a MySQL outage are merged by user/key and idempotently upserted before committed file rows are removed"
       ],
       "verification": [
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py",
@@ -218,7 +221,8 @@
         "New live-review records persist structured market regime buckets from the advice anchor interval, including trend, ATR regime, BOLL width regime, and BOLL position regime",
         "Dashboard can export the active symbol's live signal review records as UTF-8 CSV with horizon outcomes and regime fields",
         "Deployment docs explain that CSV net fields should drive hit-rate/expectancy review while gross fields are for raw price-path audit",
-        "Live-review calibration candidates require sufficient independent signals and independent triggers, and use the declared 1h terminal outcome so overlapping 5m/15m/1h paths cannot inflate threshold-tuning confidence"
+        "Live-review calibration candidates require sufficient independent signals and independent triggers, and use the declared 1h terminal outcome so overlapping 5m/15m/1h paths cannot inflate threshold-tuning confidence",
+        "Partial records remain pending until status is evaluated, and due backlog uses the deadline of the next missing horizon"
       ],
       "verification": [
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py",
@@ -254,7 +258,9 @@
         "Python deployment script skips protected /api/market curl checks when auth is enabled and asks for logged-in verification instead",
         "Python deployment script requires a clean Git worktree by default, preserves repository/global/Git-info ignore rules, fails closed when ignore configuration is unreadable, excludes local .env, and offers an explicit --allow-dirty development override",
         "Remote deployment stages a fresh release directory, preserves the previous release and uploaded archive until health passes, persists --public-port in remote .env, and supports bounded SSH/SCP retries",
-        "Docker Compose passes an optional Redis password through the dashboard client, Redis requirepass, and authenticated healthcheck; fresh scripted deployments generate the secret"
+        "Docker Compose passes an optional Redis password through the dashboard client, Redis requirepass, and authenticated healthcheck; fresh scripted deployments generate the secret",
+        "Production defaults bind the application upstream to loopback, require Secure authentication cookies, and document HTTPS reverse-proxy termination",
+        "HTTP handler concurrency, socket timeouts, SSE client count, and SSE response lifetime are bounded through environment variables"
       ],
       "verification": [
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py",
@@ -262,14 +268,13 @@
         "powershell -ExecutionPolicy Bypass -File scripts/verify.ps1",
         "server-side docker compose config passed under /opt/bian-dashboard",
         "server-side docker compose up -d --build started healthy dashboard, MySQL, and Redis containers",
-        "GET http://159.223.91.36:8000/binance-futures-dashboard.html returns HTTP 200",
-        "GET http://159.223.91.36:8000/api/storage-status reports MySQL and Redis available",
-        "GET http://159.223.91.36:8000/api/market?symbols=DOGEUSDT,TLMUSDT returns stale=false",
-        "GET http://159.223.91.36:8000/api/realtime-prices?symbols=DOGEUSDT streams connected=true SSE data"
+        "Loopback GET /api/health is used for container and release health checks",
+        "Production HTTPS dashboard, authenticated APIs, and EventSource reconnect require release-environment proxy verification"
       ],
       "limitations": [
         "Server access to Binance APIs still depends on the hosting provider network not being blocked or rate-limited by Binance.",
-        "Production secrets should be set in a server-only .env file, not committed."
+        "Production secrets should be set in a server-only .env file, not committed.",
+        "A production HTTPS reverse proxy and certificate are external deployment prerequisites; the application port intentionally has no public default binding."
       ]
     },
     {
@@ -308,7 +313,8 @@
         "Unexpected 500 errors on login, password change, user creation, preferences, and signal-review APIs return a generic browser-safe message while details stay in server logs",
         "Optional trusted-proxy X-Forwarded-For support through BIAN_AUTH_TRUST_PROXY_HEADERS, disabled by default",
         "Session last_seen_at touch interval through BIAN_AUTH_SESSION_TOUCH_INTERVAL_SECONDS to reduce MySQL write load",
-        "Duplicate admin-created usernames return a controlled duplicate-user error even under concurrent requests"
+        "Duplicate admin-created usernames return a controlled duplicate-user error even under concurrent requests",
+        "Dashboard boot accepts local scope only from an explicit auth-disabled response; auth outages stop preference sync and retry with bounded backoff"
       ],
       "verification": [
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py scripts/deploy.py bian.py server.py",
@@ -325,7 +331,7 @@
         "Bootstrap credentials are still provided through server-only environment variables for first-user creation.",
         "Anonymous public registration is intentionally not exposed; only admin users can create accounts.",
         "There is not yet a web UI for disabling users.",
-        "Set BIAN_AUTH_COOKIE_SECURE=1 when serving behind HTTPS.",
+        "Authenticated production access requires an HTTPS reverse proxy; Secure cookies are enabled by default in Compose and remote deployment.",
         "Set BIAN_AUTH_TRUST_PROXY_HEADERS=1 only behind a trusted local/private reverse proxy."
       ]
     }

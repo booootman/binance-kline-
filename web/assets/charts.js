@@ -15,6 +15,7 @@
   };
   var AUTO_STRATEGY_REFRESH_MS = 5 * 60 * 1000;
   var MAX_SYMBOLS = 8;
+  var pendingSymbolAdds = {};
   var LIVE_TRIGGER_CONFIRM_MAX_AGE_MS = 90 * 1000;
   var STRATEGY_WARN_AGE_MS = 7 * 60 * 1000;
   var STRATEGY_BLOCK_AGE_MS = 12 * 60 * 1000;
@@ -68,6 +69,8 @@
   var preferenceServerSnapshot = {};
   var preferenceConflictRecovery = null;
   var preferenceServerSyncEnabled = true;
+  var authRetryTimer = null;
+  var authRetryDelayMs = 1000;
   var root = getComputedStyle(document.documentElement);
   var C = {
     ink: root.getPropertyValue('--ink').trim(),
@@ -237,15 +240,25 @@
     if (!sizing) {
       return { stars: '', text: '0%', sizePct: 0, color: C.warn, note: '后端未返回风险预算仓位' };
     }
-    var pct = Number(sizing.suggested_size_pct) || 0;
-    var allowed = sizing.allowed !== false && pct > 0;
+    var score = Math.max(0, Math.min(100, Number(confidence) || 0));
+    var tierBudget = score >= 75 ? 0.5 : score >= 65 ? 0.35 : score >= 55 ? 0.25 : score >= 45 ? 0.15 : 0;
+    var tierMax = score >= 75 ? 30 : score >= 65 ? 22 : score >= 55 ? 15 : score >= 45 ? 8 : 0;
+    var backendMax = Number(sizing.max_size_pct);
+    if (isFinite(backendMax) && backendMax >= 0) tierMax = Math.min(tierMax, backendMax);
+    var stopDistance = Number(sizing.stop_distance_pct) || 0;
+    var budgetMax = stopDistance > 0 ? tierBudget * 100 / stopDistance : tierMax;
+    var originalPct = Number(sizing.suggested_size_pct) || 0;
+    var pct = Math.max(0, Math.min(originalPct, tierMax, budgetMax));
+    var allowed = sizing.allowed !== false && score >= 45 && pct > 0;
+    if (!allowed) pct = 0;
     var color = allowed ? (pct >= 20 ? C.accent2 : pct >= 10 ? C.accent : C.warn) : C.bear;
+    var reduced = pct + 0.001 < originalPct;
     return {
       stars: '',
       text: fmtSizePct(pct),
       sizePct: pct,
       color: color,
-      note: sizing.note || (allowed ? '风险预算仓位' : '当前不给仓位')
+      note: reduced ? '实时开仓分下降，仓位已按当前风险档位收紧' : (sizing.note || (allowed ? '风险预算仓位' : '当前不给仓位'))
     };
   }
   function emtText(e) { return e === 'bull' ? '多' : e === 'bear' ? '空' : '震'; }
@@ -312,6 +325,21 @@
     } catch (e) {}
     return normalized;
   }
+  function mergePreferenceConflictRecovery(patch) {
+    if (!preferenceConflictRecovery || !patch || typeof patch !== 'object') return;
+    var recovery = {
+      patch: clonePreferencePatch(preferenceConflictRecovery.patch),
+      baseSnapshot: clonePreferencePatch(preferenceConflictRecovery.baseSnapshot)
+    };
+    Object.keys(patch).forEach(function (key) {
+      recovery.patch[key] = patch[key];
+      if (!Object.prototype.hasOwnProperty.call(recovery.baseSnapshot, key)
+          && Object.prototype.hasOwnProperty.call(preferenceServerSnapshot, key)) {
+        recovery.baseSnapshot[key] = preferenceServerSnapshot[key];
+      }
+    });
+    rememberPreferenceConflictRecovery(recovery);
+  }
   function preferenceValueEqual(leftExists, left, rightExists, right) {
     if (leftExists !== rightExists) return false;
     if (!leftExists) return true;
@@ -325,6 +353,11 @@
     var mysql = payload && payload.storage && payload.storage.mysql;
     return !(mysql && mysql.configured === false);
   }
+  function preferenceFailureRetryable(status) {
+    status = Number(status) || 0;
+    return !status || status === 408 || status === 429 || status === 500
+      || status === 502 || status === 503 || status === 504;
+  }
   function updatePreferenceServerState(prefs, revision, replace) {
     var normalized = prefs && typeof prefs === 'object' ? clonePreferencePatch(prefs) : {};
     if (replace) preferenceServerSnapshot = normalized;
@@ -336,7 +369,11 @@
     return fetch('api/preferences', { cache: 'no-store' })
       .then(function (res) {
         return res.json().catch(function () { return {}; }).then(function (payload) {
-          if (!res.ok || !preferenceStorageReady(payload)) throw new Error(payload.error || ('HTTP ' + res.status));
+          if (!res.ok || !preferenceStorageReady(payload)) {
+            var error = new Error(payload.error || ('HTTP ' + res.status));
+            error.status = res.ok ? 503 : res.status;
+            throw error;
+          }
           return payload;
         });
       })
@@ -383,18 +420,19 @@
     preferenceInFlightPatch = {};
     preferenceInFlightRevision = 0;
     reconcilePreferenceConflict(recovery.patch, recovery.baseSnapshot).then(function () {
-      rememberPreferenceConflictRecovery(null);
+      if (preferenceConflictRecovery === recovery) rememberPreferenceConflictRecovery(null);
       preferenceRetryDelayMs = 5000;
       completePreferenceSave(false, false);
     }).catch(function (err) {
       console.warn('[dashboard] preference conflict reconciliation failed:', err.message);
-      completePreferenceSave(true, true);
+      completePreferenceSave(true, preferenceFailureRetryable(err && err.status));
     });
     return true;
   }
   function saveServerPreferences(patch) {
     if (!preferenceServerSyncEnabled || !patch || typeof patch !== 'object') return;
     preferencesUnloadFlushed = false;
+    mergePreferenceConflictRecovery(patch);
     mergePreferencePatch(pendingPreferencePatch, patch, true);
     if (preferenceSaveTimer) clearTimeout(preferenceSaveTimer);
     preferenceSaveTimer = setTimeout(flushServerPreferences, 350);
@@ -448,23 +486,24 @@
       saveFailed = true;
       if (err && err.preferenceConflict) {
         console.warn('[dashboard] preference revision conflict; reconciling server state');
+        var recovery = rememberPreferenceConflictRecovery({
+          patch: clonePreferencePatch(prefs),
+          baseSnapshot: clonePreferencePatch(baseSnapshot)
+        });
         preferenceInFlightPatch = {};
         preferenceInFlightRevision = 0;
-        return reconcilePreferenceConflict(prefs, baseSnapshot).then(function () {
+        return reconcilePreferenceConflict(recovery.patch, recovery.baseSnapshot).then(function () {
+          if (preferenceConflictRecovery === recovery) rememberPreferenceConflictRecovery(null);
           saveFailed = false;
           preferenceRetryDelayMs = 5000;
         }).catch(function (reconcileError) {
-          rememberPreferenceConflictRecovery({
-            patch: clonePreferencePatch(prefs),
-            baseSnapshot: clonePreferencePatch(baseSnapshot)
-          });
-          retryableFailure = true;
+          retryableFailure = preferenceFailureRetryable(reconcileError && reconcileError.status);
           console.warn('[dashboard] preference conflict reconciliation failed:', reconcileError.message);
         });
       }
       mergePreferencePatch(pendingPreferencePatch, prefs, false);
       var status = Number(err && err.status) || 0;
-      retryableFailure = !status || status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+      retryableFailure = preferenceFailureRetryable(status);
       console.warn('[dashboard] preference sync failed:', err.message);
     }).then(function () {
       completePreferenceSave(saveFailed, retryableFailure);
@@ -987,16 +1026,31 @@
   }
   function loadCurrentUser(done) {
     fetch('api/auth/me', { cache: 'no-store' })
-      .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+      .then(function (res) {
+        if (!res.ok) {
+          var error = new Error('HTTP ' + res.status);
+          error.status = res.status;
+          throw error;
+        }
+        return res.json();
+      })
       .then(function (payload) {
-        CURRENT_USER = payload && payload.authenticated ? payload.user : null;
+        var user = payload && payload.authenticated ? payload.user : null;
+        var localIdentity = user && (String(user.id) === '0' || String(user.username || '').toLowerCase() === 'local');
+        var explicitLocalMode = payload && payload.auth_enabled === false;
+        if (!user || (localIdentity && !explicitLocalMode)) throw new Error('authentication state is ambiguous');
+        CURRENT_USER = user;
+        preferenceServerSyncEnabled = true;
         updateAdminControls();
+        return { ready: true, status: 200 };
       })
-      .catch(function () {
+      .catch(function (err) {
         CURRENT_USER = null;
+        preferenceServerSyncEnabled = false;
         updateAdminControls();
+        return { ready: false, status: Number(err && err.status) || 0 };
       })
-      .then(function () { if (done) done(); });
+      .then(function (result) { if (done) done(result.ready, result.status); });
   }
   function bindCreateUser() {
     var btn = document.getElementById('create-user-btn');
@@ -1338,7 +1392,7 @@
     return active;
   }
   function hasSymbolCapacity() {
-    return normalizeSymbolList(DATA).length < MAX_SYMBOLS;
+    return normalizeSymbolList(DATA).length + Object.keys(pendingSymbolAdds).length < MAX_SYMBOLS;
   }
   function symbolHistoryCandidates() {
     var active = activeSymbolMap();
@@ -2589,33 +2643,42 @@
     if (!item || !item.symbol || item.price == null) return;
     var price = Number(item.price);
     if (!isFinite(price)) return;
-    var sourceMs = Number(item.price_received_ms || item.received_ms || item.price_event_ms || item.event_ms || 0);
-    var depthSourceMs = Number(item.depth_received_ms || item.depth_event_ms || 0);
+    var sourceMs = Number(item.price_event_ms || item.event_ms || item.price_received_ms || item.received_ms || 0);
+    var depthSourceMs = Number(item.depth_event_ms || item.depth_received_ms || 0);
     var receivedAt = Date.now();
+    var applied = false;
     DATA.forEach(function (r) {
       if (r.symbol !== item.symbol) return;
-      r.last = price;
-      if (sourceMs > 0 && sourceMs !== Number(r._price_source_ms || 0)) {
+      var previousPriceMs = Number(r._price_source_ms || 0);
+      var previousDepthMs = Number(r._depth_source_ms || 0);
+      var priceIsNew = sourceMs > previousPriceMs || (sourceMs <= 0 && previousPriceMs <= 0);
+      var depthIsNew = depthSourceMs > previousDepthMs || (depthSourceMs <= 0 && previousDepthMs <= 0);
+      if (priceIsNew) {
+        r.last = price;
+        applied = true;
+      }
+      if (priceIsNew && sourceMs > 0) {
         r._price_source_ms = sourceMs;
         r._price_snapshot_ms = receivedAt;
       }
-      if (depthSourceMs > 0 && depthSourceMs !== Number(r._depth_source_ms || 0)) {
+      if (depthIsNew && depthSourceMs > 0) {
         r._depth_source_ms = depthSourceMs;
         r._depth_snapshot_ms = receivedAt;
+        applied = true;
       }
-      if (item.source) r._price_source = item.source;
-      if (item.price_kind) r._price_kind = item.price_kind;
-      if (item.bid != null) r._price_bid = item.bid;
-      if (item.ask != null) r._price_ask = item.ask;
-      if (item.depth_imbalance != null) r._depth_imbalance = item.depth_imbalance;
-      if (item.bid_depth_top5_usd != null) r._bid_depth_top5_usd = item.bid_depth_top5_usd;
-      if (item.ask_depth_top5_usd != null) r._ask_depth_top5_usd = item.ask_depth_top5_usd;
-      if (item.depth_ladder != null) r._depth_ladder = item.depth_ladder;
+      if (priceIsNew && item.source) r._price_source = item.source;
+      if (priceIsNew && item.price_kind) r._price_kind = item.price_kind;
+      if (priceIsNew && item.bid != null) r._price_bid = item.bid;
+      if (priceIsNew && item.ask != null) r._price_ask = item.ask;
+      if (depthIsNew && item.depth_imbalance != null) r._depth_imbalance = item.depth_imbalance;
+      if (depthIsNew && item.bid_depth_top5_usd != null) r._bid_depth_top5_usd = item.bid_depth_top5_usd;
+      if (depthIsNew && item.ask_depth_top5_usd != null) r._ask_depth_top5_usd = item.ask_depth_top5_usd;
+      if (depthIsNew && item.depth_ladder != null) r._depth_ladder = item.depth_ladder;
     });
-    if (cur() && cur().symbol === item.symbol) {
+    if (applied && cur() && cur().symbol === item.symbol) {
       var el = document.querySelector('#kpi-main .price');
       if (el) {
-        el.textContent = fmtPrice(price);
+        el.textContent = fmtPrice(cur().last);
         el.title = item.price_kind === 'book_mid' ? 'Binance 合约盘口中间价' : 'Binance 合约实时价格';
       }
       updateRealtimeSignal();
@@ -2852,10 +2915,15 @@
       setAddStatus(raw + ' 已打开', 'ok');
       return;
     }
+    if (pendingSymbolAdds[raw]) {
+      setAddStatus(raw + ' 正在获取中…', '');
+      return;
+    }
     if (!hasSymbolCapacity()) {
       setAddStatus('最多同时打开 ' + MAX_SYMBOLS + ' 个币种，请先移除一个。', 'err');
       return;
     }
+    pendingSymbolAdds[raw] = true;
     var btn2 = document.getElementById('add-sym-btn');
     var input = document.getElementById('add-sym-input');
     if (btn2) btn2.disabled = true;
@@ -2865,10 +2933,13 @@
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         applyMarketPayloadState(payload);
-        var arr = stampReports(payload.data || [], payload.generated_at);
+        var arr = stampReports(payload.data || [], payload.generated_at).filter(function (item) { return item && item.symbol === raw; });
         if (!arr.length) throw new Error('未取到数据');
         arr.forEach(function (item) {
-          if (!DATA.some(function (r) { return r.symbol === item.symbol; })) DATA.push(item);
+          if (!DATA.some(function (r) { return r.symbol === item.symbol; })) {
+            if (normalizeSymbolList(DATA).length >= MAX_SYMBOLS) throw new Error('币种数量已达上限');
+            DATA.push(item);
+          }
         });
         GEN = payload.generated_at || GEN;
         refreshLiveBadge();
@@ -2886,8 +2957,9 @@
         setAddStatus('添加失败: ' + err.message, 'err');
       })
       .then(function () {
-        if (btn2) btn2.disabled = false;
-        hideLoading();
+        delete pendingSymbolAdds[raw];
+        if (btn2) btn2.disabled = Object.keys(pendingSymbolAdds).length > 0;
+        if (!Object.keys(pendingSymbolAdds).length) hideLoading();
       });
   }
 
@@ -3624,6 +3696,10 @@
       clearInterval(clockTimer);
       clockTimer = null;
     }
+    if (authRetryTimer) {
+      clearTimeout(authRetryTimer);
+      authRetryTimer = null;
+    }
     charts.forEach(function (c) { c.dispose(); });
     charts.length = 0;
     tvKlineKey = '';
@@ -3688,10 +3764,27 @@
     window.addEventListener('pagehide', flushPreferencesOnUnload);
     DATA = stampReports(DATA, GEN);
     showLoading('正在调用 bian.py 获取实时行情…');
-    loadCurrentUser(function () {
-      scopeLocalStorageKeys();
-      loadServerPreferences(startMarketBoot);
-    });
+    loadAuthAndContinue();
+
+    function loadAuthAndContinue() {
+      loadCurrentUser(function (ready, status) {
+        if (!ready) {
+          if (status === 401) {
+            showLoading('登录已失效，正在跳转…');
+            if (window.location) window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname || '/binance-futures-dashboard.html');
+            return;
+          }
+          showLoading('认证服务暂时不可用，正在重试…');
+          authRetryTimer = setTimeout(loadAuthAndContinue, authRetryDelayMs);
+          authRetryDelayMs = Math.min(30000, authRetryDelayMs * 2);
+          return;
+        }
+        authRetryDelayMs = 1000;
+        authRetryTimer = null;
+        scopeLocalStorageKeys();
+        loadServerPreferences(startMarketBoot);
+      });
+    }
 
     function startMarketBoot() {
       seedSymbolHistoryFromLocal();

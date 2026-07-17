@@ -459,6 +459,7 @@ class DashboardStorage:
             return {"backend": "none", "inserted": 0, "skipped": 0}
         if self.mysql_available():
             try:
+                self._reconcile_signal_review_file_to_mysql()
                 return self._save_signal_reviews_mysql(records)
             except Exception as exc:
                 LOG.warning("mysql signal review save failed; fallback=file; error=%s", exc)
@@ -469,6 +470,7 @@ class DashboardStorage:
         limit = max(1, min(int(limit or 200), 1000))
         if self.mysql_available():
             try:
+                self._reconcile_signal_review_file_to_mysql()
                 return self._load_signal_reviews_mysql(symbols, limit)
             except Exception as exc:
                 LOG.warning("mysql signal review load failed; fallback=file; error=%s", exc)
@@ -481,6 +483,7 @@ class DashboardStorage:
             return []
         if self.mysql_available():
             try:
+                self._reconcile_signal_review_file_to_mysql(all_users=all_users)
                 return self._load_due_signal_reviews_mysql(cutoff_ms, max_rows, all_users=all_users)
             except Exception as exc:
                 LOG.warning("mysql due signal review load failed; fallback=file; error=%s", exc)
@@ -510,6 +513,7 @@ class DashboardStorage:
         evaluation = evaluation if isinstance(evaluation, dict) else {}
         if self.mysql_available():
             try:
+                self._reconcile_signal_review_file_to_mysql(all_users=bool(user_id and str(user_id) != self.user_id))
                 return self._update_signal_review_mysql(signal_key, status, failure_reason, evaluation, user_id=user_id)
             except Exception as exc:
                 LOG.warning("mysql signal review update failed; fallback=file; error=%s", exc)
@@ -521,6 +525,7 @@ class DashboardStorage:
             return False
         if self.mysql_available():
             try:
+                self._reconcile_signal_review_file_to_mysql(all_users=bool(user_id and str(user_id) != self.user_id))
                 return self._defer_signal_review_mysql(signal_key, user_id=user_id)
             except Exception as exc:
                 LOG.warning("mysql signal review defer failed; fallback=file; error=%s", exc)
@@ -836,30 +841,7 @@ class DashboardStorage:
             for item in records:
                 if not isinstance(item, dict) or not item.get("signal_key"):
                     continue
-                rows.append(
-                    (
-                        self.user_id,
-                        str(item.get("signal_key"))[:191],
-                        str(item.get("symbol") or "")[:32],
-                        str(item.get("advice_name") or "")[:96],
-                        str(item.get("side") or "")[:12],
-                        float(item.get("entry_price") or 0.0),
-                        float(item.get("stop_price") or 0.0),
-                        float(item.get("snapshot_price") or 0.0),
-                        int(item.get("snapshot_at_ms") or 0),
-                        str(item.get("snapshot_at") or "")[:64],
-                        int(item.get("confidence") or 0),
-                        int(item.get("direction_score") or 0),
-                        int(item.get("execution_score") or 0),
-                        str(item.get("risk_gate") or "")[:64],
-                        str(item.get("candle_state") or "")[:64],
-                        str(item.get("trigger_status") or "")[:32],
-                        str(item.get("status") or "pending")[:32],
-                        str(item.get("failure_reason") or "")[:64],
-                        json.dumps(item.get("payload") or {}, ensure_ascii=False, separators=(",", ":")),
-                        json.dumps(item.get("evaluation") or {}, ensure_ascii=False, separators=(",", ":")),
-                    )
-                )
+                rows.append(self._signal_review_mysql_values(item, self.user_id))
             if not rows:
                 return {"backend": "mysql", "inserted": 0, "skipped": 0}
             cur.executemany(
@@ -879,6 +861,166 @@ class DashboardStorage:
             return {"backend": "mysql", "inserted": inserted, "skipped": max(0, len(rows) - inserted)}
         finally:
             conn.close()
+
+    def _signal_review_mysql_values(self, item, user_id):
+        return (
+            str(user_id or self.user_id)[:64],
+            str(item.get("signal_key"))[:191],
+            str(item.get("symbol") or "")[:32],
+            str(item.get("advice_name") or "")[:96],
+            str(item.get("side") or "")[:12],
+            float(item.get("entry_price") or 0.0),
+            float(item.get("stop_price") or 0.0),
+            float(item.get("snapshot_price") or 0.0),
+            int(item.get("snapshot_at_ms") or 0),
+            str(item.get("snapshot_at") or "")[:64],
+            int(item.get("confidence") or 0),
+            int(item.get("direction_score") or 0),
+            int(item.get("execution_score") or 0),
+            str(item.get("risk_gate") or "")[:64],
+            str(item.get("candle_state") or "")[:64],
+            str(item.get("trigger_status") or "")[:32],
+            str(item.get("status") or "pending")[:32],
+            str(item.get("failure_reason") or "")[:64],
+            json.dumps(item.get("payload") or {}, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(item.get("evaluation") or {}, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _merge_signal_review_records(self, database_record, file_record):
+        status_rank = {"pending": 1, "partial": 2, "evaluated": 3}
+
+        def rank(item):
+            evaluation = item.get("evaluation") if isinstance(item.get("evaluation"), dict) else {}
+            done = sum(1 for value in evaluation.values() if isinstance(value, dict) and value.get("status") == "done")
+            return (
+                status_rank.get(str(item.get("status") or "pending"), 0),
+                done,
+                int(item.get("updated_at_ms") or item.get("created_at_ms") or 0),
+            )
+
+        preferred, other = (file_record, database_record) if rank(file_record) > rank(database_record) else (database_record, file_record)
+        merged = dict(other)
+        merged.update(preferred)
+        merged_evaluation = {}
+        for source in (other, preferred):
+            evaluation = source.get("evaluation") if isinstance(source.get("evaluation"), dict) else {}
+            for horizon, value in evaluation.items():
+                current = merged_evaluation.get(horizon)
+                if current is None or (isinstance(value, dict) and value.get("status") == "done"):
+                    merged_evaluation[horizon] = value
+        merged["evaluation"] = merged_evaluation
+        merged["status"] = max(
+            (str(database_record.get("status") or "pending"), str(file_record.get("status") or "pending")),
+            key=lambda value: status_rank.get(value, 0),
+        )
+        created_values = [int(item.get("created_at_ms") or 0) for item in (database_record, file_record)]
+        created_values = [value for value in created_values if value > 0]
+        if created_values:
+            merged["created_at_ms"] = min(created_values)
+        merged["updated_at_ms"] = max(
+            int(database_record.get("updated_at_ms") or database_record.get("created_at_ms") or 0),
+            int(file_record.get("updated_at_ms") or file_record.get("created_at_ms") or 0),
+        )
+        return merged
+
+    def _upsert_signal_review_records_mysql(self, records):
+        conn = self._mysql_connect()
+        try:
+            self._ensure_signal_review_schema(conn)
+            cur = conn.cursor()
+            candidates = {}
+            for item in records:
+                if not isinstance(item, dict) or not item.get("signal_key"):
+                    continue
+                user_id = str(item.get("storage_user_id") or self.user_id)
+                candidates[(user_id, str(item.get("signal_key")))] = dict(item, storage_user_id=user_id)
+            existing = {}
+            by_user = {}
+            for user_id, signal_key in candidates:
+                by_user.setdefault(user_id, []).append(signal_key)
+            for user_id, signal_keys in by_user.items():
+                for offset in range(0, len(signal_keys), 200):
+                    chunk = signal_keys[offset:offset + 200]
+                    placeholders = ",".join(["%s"] * len(chunk))
+                    cur.execute(
+                        f"""
+                        SELECT user_id, signal_key, symbol, advice_name, side, entry_price, stop_price,
+                               snapshot_price, snapshot_at_ms, snapshot_at, confidence,
+                               direction_score, execution_score, risk_gate, candle_state,
+                               trigger_status, status, failure_reason, payload_json,
+                               evaluation_json, UNIX_TIMESTAMP(created_at) * 1000,
+                               UNIX_TIMESTAMP(updated_at) * 1000
+                        FROM bian_signal_reviews
+                        WHERE user_id=%s AND signal_key IN ({placeholders})
+                        """,
+                        tuple([user_id] + chunk),
+                    )
+                    for row in cur.fetchall():
+                        item = self._signal_review_from_row(row[1:21])
+                        item["storage_user_id"] = str(row[0])
+                        item["updated_at_ms"] = int(row[21] or 0)
+                        existing[(str(row[0]), str(row[1]))] = item
+            rows = []
+            for key, item in candidates.items():
+                if key in existing:
+                    item = self._merge_signal_review_records(existing[key], item)
+                rows.append(self._signal_review_mysql_values(item, key[0]))
+            if not rows:
+                return 0
+            cur.executemany(
+                """
+                INSERT INTO bian_signal_reviews
+                  (user_id, signal_key, symbol, advice_name, side, entry_price, stop_price,
+                   snapshot_price, snapshot_at_ms, snapshot_at, confidence, direction_score,
+                   execution_score, risk_gate, candle_state, trigger_status, status,
+                   failure_reason, payload_json, evaluation_json)
+                VALUES
+                  (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON DUPLICATE KEY UPDATE
+                  symbol=VALUES(symbol), advice_name=VALUES(advice_name), side=VALUES(side),
+                  entry_price=VALUES(entry_price), stop_price=VALUES(stop_price),
+                  snapshot_price=VALUES(snapshot_price), snapshot_at_ms=VALUES(snapshot_at_ms),
+                  snapshot_at=VALUES(snapshot_at), confidence=VALUES(confidence),
+                  direction_score=VALUES(direction_score), execution_score=VALUES(execution_score),
+                  risk_gate=VALUES(risk_gate), candle_state=VALUES(candle_state),
+                  trigger_status=VALUES(trigger_status), status=VALUES(status),
+                  failure_reason=VALUES(failure_reason), payload_json=VALUES(payload_json),
+                  evaluation_json=VALUES(evaluation_json), updated_at=CURRENT_TIMESTAMP,
+                  evaluated_at=CASE WHEN VALUES(status)='evaluated'
+                                    THEN COALESCE(evaluated_at, UTC_TIMESTAMP())
+                                    ELSE evaluated_at END
+                """,
+                rows,
+            )
+            conn.commit()
+            return len(rows)
+        finally:
+            conn.close()
+
+    def _reconcile_signal_review_file_to_mysql(self, all_users=False):
+        with self._signal_review_lock:
+            data = self._read_signal_review_file()
+            records = data.get("records", [])
+            candidates = [
+                item for item in records
+                if isinstance(item, dict)
+                and item.get("signal_key")
+                and (all_users or str(item.get("storage_user_id") or "default") == self.user_id)
+            ]
+            if not candidates:
+                return 0
+            migrated = self._upsert_signal_review_records_mysql(candidates)
+            migrated_keys = {
+                (str(item.get("storage_user_id") or "default"), str(item.get("signal_key")))
+                for item in candidates
+            }
+            data["records"] = [
+                item for item in records
+                if not isinstance(item, dict)
+                or (str(item.get("storage_user_id") or "default"), str(item.get("signal_key"))) not in migrated_keys
+            ]
+            self._write_signal_review_file(data)
+            return migrated
 
     def _load_signal_reviews_mysql(self, symbols, limit):
         conn = self._mysql_connect()

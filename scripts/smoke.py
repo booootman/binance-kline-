@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
+import io
 import os
 import sys
 import threading
@@ -49,6 +51,43 @@ def test_cache_and_symbol_contracts():
         pass
     else:
         raise AssertionError("oversized symbol requests must be rejected")
+
+
+def test_tick_rounding_and_cache_lock_ownership():
+    cases = (
+        (1.00001, 0.00001),
+        (1.00009, 0.00001),
+        (0.1234567, 0.000001),
+        (123.456, 0.05),
+    )
+    for value, tick in cases:
+        down = analyzer.round_to_tick(value, tick, "down")
+        nearest = analyzer.round_to_tick(value, tick)
+        up = analyzer.round_to_tick(value, tick, "up")
+        check(down <= value <= up, f"directional tick rounding crossed input for {value}/{tick}")
+        check(down <= nearest <= up, f"nearest tick rounding left directional bounds for {value}/{tick}")
+        for result in (down, nearest, up):
+            units = Decimal(str(result)) / Decimal(str(tick))
+            check(units == units.to_integral_value(), f"tick rounding produced an illegal price: {result}/{tick}")
+
+    original_cache_file = analyzer.BACKTEST_CACHE_FILE
+    lock_path = ROOT / "runtime" / f"smoke-backtest-{os.getpid()}-{time.time_ns()}.json.lock"
+    analyzer.BACKTEST_CACHE_FILE = str(lock_path)[:-5]
+    try:
+        lock = analyzer.acquire_backtest_cache_lock()
+        check(lock is not None, "backtest cache lock must be acquired")
+        os.close(lock[0])
+        lock_path.unlink()
+        replacement_token = "replacement-owner"
+        lock_path.write_text(replacement_token + "\n", encoding="ascii")
+        analyzer.release_backtest_cache_lock(lock)
+        check(lock_path.read_text(encoding="ascii").strip() == replacement_token, "old owner must not remove a replacement lock")
+    finally:
+        analyzer.BACKTEST_CACHE_FILE = original_cache_file
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def test_review_time_boundaries():
@@ -175,6 +214,30 @@ def test_realtime_hub_recovery_and_idle_cleanup():
 
     with server._realtime_hubs_lock:
         server._realtime_hubs.clear()
+
+
+def test_realtime_events_never_roll_back():
+    hub = server.RealtimePriceHub("ordering")
+    original_persist = server.persist_realtime_later
+    server.persist_realtime_later = lambda *args, **kwargs: None
+    try:
+        hub.handle_message({"data": {"e": "bookTicker", "s": "DOGEUSDT", "T": 200, "b": "100", "a": "102"}})
+        hub.handle_message({"data": {"e": "bookTicker", "s": "DOGEUSDT", "T": 100, "b": "50", "a": "52"}})
+        check(hub.latest["DOGEUSDT"]["price"] == 101, "older bookTicker must not roll back price")
+        check(hub.latest["DOGEUSDT"]["price_event_ms"] == 200, "older bookTicker must not roll back source time")
+
+        hub.handle_message({"data": {"e": "depthUpdate", "s": "DOGEUSDT", "T": 300, "b": [["103", "2"]], "a": [["105", "2"]]}})
+        hub.handle_message({"data": {"e": "depthUpdate", "s": "DOGEUSDT", "T": 250, "b": [["60", "2"]], "a": [["62", "2"]]}})
+        check(hub.latest["DOGEUSDT"]["price"] == 104, "older depth snapshot must not roll back price")
+        check(hub.latest["DOGEUSDT"]["depth_event_ms"] == 300, "older depth snapshot must not roll back depth time")
+
+        hub.handle_message({"data": {"e": "bookTicker", "s": "DOGEUSDT", "T": 400, "b": "110", "a": "112"}})
+        hub.handle_message({"data": {"e": "depthUpdate", "s": "DOGEUSDT", "T": 350, "b": [["106", "3"]], "a": [["108", "3"]]}})
+        check(hub.latest["DOGEUSDT"]["price"] == 111, "new depth data must not overwrite a newer price stream")
+        check(hub.latest["DOGEUSDT"]["bid"] == 110 and hub.latest["DOGEUSDT"]["ask"] == 112, "new depth data must not roll back a newer top of book")
+        check(hub.latest["DOGEUSDT"]["depth_event_ms"] == 350, "newer depth data should still advance independently")
+    finally:
+        server.persist_realtime_later = original_persist
     acquired, _, _ = server.realtime_hub_for_request(["DOGEUSDT"])
     check(acquired.client_count == 1, "hub selection must acquire before releasing the registry lock")
     acquired.stop_if_idle()
@@ -290,6 +353,24 @@ def test_due_review_deferral():
         server.storage = original_storage
     check(result["deferred"] == 1, "waiting partial record must be moved behind other due work")
     check(fake.deferred == [("wait-for-15m", "u1")], "deferral must preserve owning user")
+
+
+def test_partial_review_stats_follow_record_status_and_next_deadline():
+    now_ms = int(time.time() * 1000)
+    partial = {
+        "signal_key": "partial-5m",
+        "side": "long",
+        "status": "partial",
+        "snapshot_at_ms": now_ms - 10 * 60_000,
+        "evaluation": {"5m": {"status": "done", "failure_reason": "ok"}},
+    }
+    stats = server.build_signal_review_stats([partial])
+    check(stats["pending"] == 1, "partial record must remain pending after its first completed horizon")
+    check(stats["evaluated_records"] == 0, "partial record must not be counted as fully evaluated")
+    check(stats["due_pending"] == 0, "partial 5m record must wait until the missing 15m horizon is due")
+    partial["snapshot_at_ms"] = now_ms - 16 * 60_000
+    stats = server.build_signal_review_stats([partial])
+    check(stats["due_pending"] == 1, "partial record must become due when its next missing horizon expires")
 
 
 def test_redis_read_degrades():
@@ -619,6 +700,61 @@ def test_storage_timeouts_are_wired():
     check(captured.get("write_timeout") == storage_module.MYSQL_WRITE_TIMEOUT_SECONDS, "MySQL write timeout missing")
 
 
+def test_http_and_sse_resource_bounds():
+    class FakeSocket:
+        def __init__(self):
+            self.timeout = None
+
+        def settimeout(self, value):
+            self.timeout = value
+
+        def makefile(self, *args, **kwargs):
+            return io.BytesIO()
+
+    handler = object.__new__(server.Handler)
+    handler.request = FakeSocket()
+    server.Handler.setup(handler)
+    check(handler.request.timeout == server.HTTP_REQUEST_TIMEOUT_SECONDS, "handler sockets must enforce the configured request timeout")
+
+    timeout_handler = object.__new__(server.Handler)
+    timeout_handler.headers = {"Content-Length": "10"}
+    timeout_handler.rfile = types.SimpleNamespace(read=lambda _length: (_ for _ in ()).throw(TimeoutError("slow client")))
+    try:
+        timeout_handler.read_json_body()
+    except server.BadRequestError as exc:
+        check("timeout" in str(exc), "slow request body must be classified as a timeout")
+    else:
+        raise AssertionError("slow request body must not block indefinitely")
+
+    bounded = server.ThreadingServer(("127.0.0.1", 0), server.Handler, bind_and_activate=False)
+    try:
+        acquired = [bounded._request_slots.acquire(blocking=False) for _ in range(server.HTTP_MAX_CONCURRENT_REQUESTS)]
+        check(all(acquired), "configured HTTP request slots must be available")
+        check(not bounded._request_slots.acquire(blocking=False), "HTTP request slots must reject unbounded growth")
+        for _ in acquired:
+            bounded._request_slots.release()
+    finally:
+        bounded.server_close()
+
+    class FullSseSlots:
+        def acquire(self, blocking=False):
+            return False
+
+        def release(self):
+            raise AssertionError("unacquired SSE slot must not be released")
+
+    original_slots = server._sse_client_slots
+    response = {}
+    try:
+        server._sse_client_slots = FullSseSlots()
+        sse_handler = object.__new__(server.Handler)
+        sse_handler.send_json = lambda status, payload: response.update(status=status, payload=payload)
+        sse_handler.serve_realtime_prices("symbols=DOGEUSDT")
+    finally:
+        server._sse_client_slots = original_slots
+    check(response.get("status") == 503, "SSE clients above the configured limit must receive HTTP 503")
+
+
 def test_mysql_health_cache_expires():
     class FakeConnection:
         def close(self):
@@ -638,6 +774,51 @@ def test_mysql_health_cache_expires():
         storage_module.LOG.disabled = previous_disabled
     check(not available, "expired MySQL health cache must perform a real connection check")
     check(store._mysql_block_until > time.time(), "failed MySQL health check must start a short cooldown")
+
+
+def test_signal_review_file_reconciliation():
+    original_file = storage_module.SIGNAL_REVIEW_FILE
+    test_file = ROOT / "runtime" / f"smoke-signal-reviews-{os.getpid()}-{time.time_ns()}.json"
+    storage_module.SIGNAL_REVIEW_FILE = str(test_file)
+    try:
+        store = storage_module.DashboardStorage()
+        store.user_id = "u1"
+        record = {
+            "signal_key": "fallback-key",
+            "symbol": "DOGEUSDT",
+            "side": "long",
+            "status": "partial",
+            "snapshot_at_ms": 100,
+            "evaluation": {"5m": {"status": "done", "failure_reason": "ok"}},
+        }
+        store._save_signal_reviews_file([record])
+        captured = []
+        store._upsert_signal_review_records_mysql = lambda records: captured.extend(records) or len(records)
+        migrated = store._reconcile_signal_review_file_to_mysql()
+        check(migrated == 1 and captured[0]["signal_key"] == "fallback-key", "fallback record must be offered to MySQL reconciliation")
+        check(store._read_signal_review_file()["records"] == [], "committed fallback record must be removed from the file")
+
+        database_record = {
+            "signal_key": "merge-key",
+            "status": "evaluated",
+            "updated_at_ms": 100,
+            "evaluation": {"5m": {"status": "done", "failure_reason": "ok"}},
+        }
+        file_record = {
+            "signal_key": "merge-key",
+            "status": "partial",
+            "updated_at_ms": 200,
+            "evaluation": {"15m": {"status": "done", "failure_reason": "ok"}},
+        }
+        merged = store._merge_signal_review_records(database_record, file_record)
+        check(merged["status"] == "evaluated", "fallback reconciliation must not downgrade a terminal database record")
+        check(set(merged["evaluation"]) == {"5m", "15m"}, "fallback reconciliation must preserve completed horizons from both backends")
+    finally:
+        storage_module.SIGNAL_REVIEW_FILE = original_file
+        try:
+            test_file.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def test_required_assets_and_report_contract():
@@ -685,29 +866,38 @@ def test_deploy_contracts():
     health_check = "http://127.0.0.1:9000/api/health"
     archive_cleanup = "rm -f /tmp/bian-dashboard-test.tar.gz"
     check("BIAN_PUBLIC_PORT=9000" in remote, "public port must be persisted into the remote .env")
+    check("BIAN_BIND_ADDRESS=127.0.0.1" in remote, "remote deployment must bind the application upstream to loopback")
+    check("BIAN_AUTH_COOKIE_SECURE=1" in remote, "remote deployment must require secure authentication cookies")
     check("BIAN_REDIS_PASSWORD=$redis_password" in remote, "first deploy must generate a Redis password")
     check("mktemp -d" in remote and 'mv "$release_dir" /opt/bian-dashboard' in remote, "deploy must replace from a staging directory")
     check("/opt/bian-dashboard.previous" in remote, "deploy must retain the previous release until health passes")
     check(remote.index(health_check) < remote.index(archive_cleanup), "archive must remain available until deployment succeeds")
 
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    check("${BIAN_BIND_ADDRESS:-127.0.0.1}:${BIAN_PUBLIC_PORT:-8000}:8000" in compose, "Compose must not expose plaintext authentication publicly by default")
+    check("BIAN_AUTH_COOKIE_SECURE: ${BIAN_AUTH_COOKIE_SECURE:-1}" in compose, "Compose must default authentication cookies to Secure")
     check(compose.count("BIAN_REDIS_PASSWORD") >= 5, "Compose must wire the Redis password through app, server, and healthcheck")
     check("--requirepass" in compose and "REDISCLI_AUTH" in compose, "Redis password must be enforced and health-checked")
 
 
 def main():
     test_cache_and_symbol_contracts()
+    test_tick_rounding_and_cache_lock_ownership()
     test_review_time_boundaries()
     test_publication_price_alignment()
     test_realtime_hub_recovery_and_idle_cleanup()
+    test_realtime_events_never_roll_back()
     test_realtime_stopped_worker_cannot_publish_state()
     test_due_review_deferral()
+    test_partial_review_stats_follow_record_status_and_next_deadline()
     test_redis_read_degrades()
     test_preference_revision_guard()
     test_same_origin_rejects_invalid_source_headers()
     test_password_change_revokes_sessions_atomically()
     test_storage_timeouts_are_wired()
+    test_http_and_sse_resource_bounds()
     test_mysql_health_cache_expires()
+    test_signal_review_file_reconciliation()
     test_required_assets_and_report_contract()
     test_deploy_contracts()
     print("smoke ok")

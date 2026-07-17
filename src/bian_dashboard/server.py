@@ -89,11 +89,15 @@ SIGNAL_REVIEW_MIN_PROFIT_PCT = {"5m": 0.25, "15m": 0.45, "1h": 0.75}
 SIGNAL_REVIEW_TRIGGER_MIN_INTERVAL_SECONDS = float(os.environ.get("BIAN_SIGNAL_REVIEW_TRIGGER_MIN_INTERVAL_SECONDS", "20"))
 SIGNAL_REVIEW_TAKER_FEE_BPS = float(os.environ.get("BIAN_SIGNAL_REVIEW_TAKER_FEE_BPS", "5"))
 SIGNAL_REVIEW_SLIPPAGE_BPS = float(os.environ.get("BIAN_SIGNAL_REVIEW_SLIPPAGE_BPS", "2"))
-SSE_MAX_SECONDS = max(60, int(os.environ.get("BIAN_SSE_MAX_SECONDS", str(6 * 60 * 60))))
+SSE_MAX_SECONDS = max(60, int(os.environ.get("BIAN_SSE_MAX_SECONDS", "300")))
+SSE_MAX_CLIENTS = max(1, int(os.environ.get("BIAN_SSE_MAX_CLIENTS", "12")))
 SSE_HEARTBEAT_SECONDS = 15
 REALTIME_IDLE_SECONDS = 30
 REALTIME_STALE_SECONDS = max(10, int(os.environ.get("BIAN_REALTIME_STALE_SECONDS", "45")))
 MEMORY_CACHE_MAX_ITEMS = 64
+HTTP_MAX_CONCURRENT_REQUESTS = max(4, int(os.environ.get("BIAN_HTTP_MAX_CONCURRENT_REQUESTS", "32")))
+HTTP_REQUEST_QUEUE_SIZE = max(1, int(os.environ.get("BIAN_HTTP_REQUEST_QUEUE_SIZE", "64")))
+HTTP_REQUEST_TIMEOUT_SECONDS = max(1, int(os.environ.get("BIAN_HTTP_REQUEST_TIMEOUT_SECONDS", "15")))
 
 _last_payloads = {}
 _payload_lock = threading.RLock()
@@ -102,6 +106,7 @@ _market_locks = {}
 _market_lock_refs = {}
 _market_locks_guard = threading.RLock()
 _run_semaphore = threading.Semaphore(2)
+_sse_client_slots = threading.BoundedSemaphore(SSE_MAX_CLIENTS)
 _realtime_hubs = {}
 _realtime_hubs_lock = threading.RLock()
 _realtime_sharing_counts = {"exact": 0, "new": 0, "superset": 0}
@@ -385,8 +390,6 @@ class RealtimePriceHub:
                 total = bid_top20 + ask_top20
                 depth_update = {
                     "symbol": symbol,
-                    "bid": bid,
-                    "ask": ask,
                     "event_ms": event_ms,
                     "received_ms": received_ms,
                     "depth_event_ms": event_ms,
@@ -407,18 +410,26 @@ class RealtimePriceHub:
                     if direct_worker and not self._direct_worker_is_current_locked(*direct_worker):
                         return
                     item = dict(self.latest.get(symbol, {}))
+                    depth_is_new = event_ms > int(item.get("depth_event_ms") or 0)
+                    price_is_new = event_ms > int(item.get("price_event_ms") or 0)
+                    if not depth_is_new and not price_is_new:
+                        return
                     has_book_ticker = "bookTicker" in str(item.get("source") or "")
-                    item.update(depth_update)
-                    # depth20 is a fresh partial-book snapshot, so its top of
-                    # book is also a fresh midpoint price rather than a reason
-                    # to keep an older bookTicker midpoint alive.
-                    item["price"] = mid
-                    item["price_event_ms"] = event_ms
-                    item["price_received_ms"] = received_ms
-                    item["price_kind"] = "book_mid"
+                    if depth_is_new:
+                        item.update(depth_update)
+                        self.last_depth_event_ms = max(self.last_depth_event_ms, event_ms)
+                    if price_is_new:
+                        # depth20 is a fresh partial-book snapshot, so its top
+                        # of book can advance price, but never roll it back.
+                        item["bid"] = bid
+                        item["ask"] = ask
+                        item["price"] = mid
+                        item["price_event_ms"] = event_ms
+                        item["price_received_ms"] = received_ms
+                        item["price_kind"] = "book_mid"
+                        self.last_price_event_ms = max(self.last_price_event_ms, event_ms)
                     item["source"] = "futures_bookTicker+depth20" if has_book_ticker else "futures_depth20"
                     self.latest[symbol] = item
-                    self.last_depth_event_ms = event_ms
                     self.error = None
                 persist_realtime_later(symbol, item)
                 return
@@ -445,11 +456,13 @@ class RealtimePriceHub:
                 if direct_worker and not self._direct_worker_is_current_locked(*direct_worker):
                     return
                 old = dict(self.latest.get(symbol, {}))
+                if event_ms <= int(old.get("price_event_ms") or 0):
+                    return
                 old.update(item)
                 if old.get("depth_ok"):
                     old["source"] = "futures_bookTicker+depth20"
                 self.latest[symbol] = old
-                self.last_price_event_ms = event_ms
+                self.last_price_event_ms = max(self.last_price_event_ms, event_ms)
                 self.error = None
             persist_realtime_later(symbol, old)
         except Exception as exc:
@@ -1511,7 +1524,6 @@ def build_signal_review_stats(records):
     min_calibration_samples = 30
     min_calibration_triggered = 10
     now_ms = int(time.time() * 1000)
-    due_cutoff_ms = now_ms - 5 * 60 * 1000
 
     def new_review_bucket():
         return {
@@ -1616,10 +1628,8 @@ def build_signal_review_stats(records):
     calibration_segment_buckets = {name: {} for name in stats["segments"]}
     for record in records or []:
         evaluation = normalize_signal_review_evaluation(record.get("evaluation"))
-        done_any = False
         invalid = evaluation.get("invalid")
         if isinstance(invalid, dict) and invalid.get("status") == "done":
-            done_any = True
             stats["invalid_records"] += 1
             reason = str(invalid.get("failure_reason") or record.get("failure_reason") or "invalid_signal")
             invalid_item = dict(invalid)
@@ -1641,7 +1651,6 @@ def build_signal_review_stats(records):
             item = evaluation.get(horizon)
             if not isinstance(item, dict) or item.get("status") != "done":
                 continue
-            done_any = True
             reason = add_review_bucket(buckets[horizon], item, record.get("signal_key"))
             stats["top_failures"][reason] = stats["top_failures"].get(reason, 0) + 1
             for segment_name in segment_buckets:
@@ -1657,12 +1666,19 @@ def build_signal_review_stats(records):
                         item,
                         record.get("signal_key"),
                     )
-        if done_any or record.get("status") == "evaluated":
+        if str(record.get("status") or "pending") == "evaluated":
             stats["evaluated_records"] += 1
         else:
             stats["pending"] += 1
             if str(record.get("side") or "") in ("long", "short"):
-                if int(record.get("snapshot_at_ms") or 0) <= due_cutoff_ms:
+                snapshot_at_ms = int(record.get("snapshot_at_ms") or 0)
+                next_missing_horizon_ms = None
+                for horizon, horizon_ms in SIGNAL_REVIEW_HORIZONS:
+                    item = evaluation.get(horizon)
+                    if not isinstance(item, dict) or item.get("status") != "done":
+                        next_missing_horizon_ms = horizon_ms
+                        break
+                if next_missing_horizon_ms is not None and snapshot_at_ms + next_missing_horizon_ms <= now_ms:
                     stats["due_pending"] += 1
     for horizon, bucket in buckets.items():
         stats["per_horizon"][horizon] = finalize_review_bucket(bucket)
@@ -1970,6 +1986,7 @@ def diagnostics_payload(check_storage=True):
             "hub_count": len(realtime),
             "idle_seconds": REALTIME_IDLE_SECONDS,
             "sse_max_seconds": SSE_MAX_SECONDS,
+            "sse_max_clients": SSE_MAX_CLIENTS,
             "sharing": realtime_sharing_stats(),
             "hubs": realtime,
         },
@@ -2223,6 +2240,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self._current_user_cache = None
         super().__init__(*a, directory=WEB_ROOT, **kw)
 
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(HTTP_REQUEST_TIMEOUT_SECONDS)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
@@ -2245,7 +2266,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.serve_signal_reviews(parsed.query)
         elif parsed.path == "/api/auth/me":
             user = self.current_user()
-            self.send_json(200, {"authenticated": bool(user), "user": user})
+            self.send_json(200, {"auth_enabled": auth_enabled(), "authenticated": bool(user), "user": user})
         elif parsed.path == "/api/storage-status":
             self.serve_storage_status()
         elif parsed.path == "/api/diagnostics":
@@ -2688,9 +2709,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except BadRequestError as exc:
             self.send_json(400, {"error": str(exc), "error_type": "bad_request"})
             return
-        hub, ensure_symbols, sharing = realtime_hub_for_request(symbols)
-        record_realtime_sharing(sharing)
+        if not _sse_client_slots.acquire(blocking=False):
+            self.send_json(503, {"error": "too many realtime clients", "error_type": "realtime_capacity"})
+            return
+        hub = None
         try:
+            hub, ensure_symbols, sharing = realtime_hub_for_request(symbols)
+            record_realtime_sharing(sharing)
             hub.ensure(ensure_symbols)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -2699,15 +2724,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("X-Accel-Buffering", "no")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-        except Exception:
-            hub.release()
-            raise
-
-        last_payload = None
-        last_emit = 0
-        next_maintenance = 0
-        started = time.time()
-        try:
+            last_payload = None
+            last_emit = 0
+            next_maintenance = 0
+            started = time.time()
             self.wfile.write(b"retry: 1000\n\n")
             self.wfile.flush()
             while time.time() - started < SSE_MAX_SECONDS:
@@ -2725,10 +2745,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     last_payload = payload
                     last_emit = now
                 time.sleep(0.25)
-        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, TimeoutError):
             pass
         finally:
-            hub.release()
+            if hub is not None:
+                hub.release()
+            _sse_client_slots.release()
 
     def serve_preferences(self):
         user_storage = self.request_storage()
@@ -2892,6 +2914,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             raise BadRequestError("request body too large")
         try:
             raw = self.rfile.read(length).decode("utf-8")
+        except TimeoutError:
+            raise BadRequestError("request body timeout")
         except UnicodeDecodeError:
             raise BadRequestError("request body must be UTF-8")
         try:
@@ -2958,6 +2982,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 class ThreadingServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = HTTP_REQUEST_QUEUE_SIZE
+
+    def __init__(self, *args, **kwargs):
+        self._request_slots = threading.BoundedSemaphore(HTTP_MAX_CONCURRENT_REQUESTS)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        self._request_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
 
 def main():

@@ -96,3 +96,17 @@ This pass tightens the P0 trust issues from `docs/improvement-suggestions.md`: h
 - Conflict recovery patches and base snapshots are persisted per user and restored before server preferences can overwrite unresolved local fields.
 - Mixed pagehide work now uses one ordered batch request. The storage layer processes the batch under one revision row lock and transaction, so request arrival order cannot discard the in-flight patch.
 - Password verification uses `SELECT ... FOR UPDATE`, serializing concurrent changes before the old password is accepted.
+
+## 2026-07-17 Recovery Lifecycle Follow-up
+
+- Revision conflicts persist their patch and base snapshot before starting the reconciliation GET, closing the pagehide window where all in-memory ownership had already been cleared.
+- New preference edits update the durable recovery version. Promise identity checks prevent an older GET from deleting recovery state created while it was in flight.
+- Reconciliation GET errors retain their HTTP status and use the same retry policy as preference POSTs; 400/401/403 stop automatic retries while transient failures keep bounded backoff.
+
+## 2026-07-17 Full Review Remediation
+
+- Exchange price grids now use Decimal tick rounding, and backtest cache lock release validates a unique owner token.
+- Realtime price/depth updates are monotonic by exchange event time on both server and browser. Live score degradation also reduces the displayed risk-budget position, and in-flight symbol additions reserve capacity.
+- Authentication boot is fail-closed, file-fallback reviews reconcile into MySQL after recovery, and partial review records remain pending until their final status changes.
+- HTTP/SSE resource use is bounded. Production Compose binds the upstream to loopback, uses Secure cookies by default, and requires TLS termination on port 443.
+- Human release review must validate MySQL reconciliation against MySQL 8.4, Compose configuration, a real HTTPS proxy, EventSource reconnects, and saturation behavior before deployment approval.

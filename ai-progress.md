@@ -1611,3 +1611,36 @@
 - GitNexus classified the uncommitted impact as `critical` across 41 execution flows because shared preference save behavior participates in dashboard boot and multiple controls.
 - Restarted one local development backend on `127.0.0.1:8876` with authentication disabled for the unconfigured-MySQL fallback; health and dashboard assets returned HTTP 200 with the new batch and recovery code.
 - Real MySQL concurrency, browser pagehide delivery, and deployed multi-session ordering remain release-environment checks.
+
+## 2026-07-17 Preference recovery lifecycle remediation
+
+- Persisted rejected preference patches before reconciliation starts, so pagehide during an unresolved GET cannot lose all recovery ownership.
+- Merged later preference edits into the durable recovery record and used recovery object identity to prevent older promise completions from clearing newer state.
+- Preserved reconciliation HTTP status and stopped automatic recovery retries for 400/401/403 while keeping bounded backoff for network, 408/429, and 5xx failures.
+- Added VM regressions for pagehide during reconciliation, same-key recovery supersession across memory reload, and non-retryable recovery GET behavior.
+
+## Preference recovery lifecycle verification
+
+- Passed `node scripts\frontend-smoke.js` and `node --check web\assets\charts.js`.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok`, `frontend smoke ok`, and `verify ok`.
+- Passed `feature_list.json` parsing and `git diff --check` apart from line-ending warnings.
+- Real browser pagehide delivery and deployed multi-session ordering remain release-environment checks.
+
+## 2026-07-17 Full review remediation
+
+- Replaced coarse post-rounding with Decimal tick-grid rounding and added owner tokens to backtest cache locks so directional prices stay legal and an old owner cannot remove a replacement lock.
+- Rejected out-of-order price/depth events independently in the realtime hub and browser, recalculated frontend risk sizing from the current execution-score tier, and reserved symbol capacity across concurrent add requests.
+- Made dashboard boot fail closed on ambiguous or unavailable authentication. Only an explicit `auth_enabled=false` response can enter local scope; transient failures retry with bounded backoff and HTTP 401 redirects to login.
+- Reconciled file-fallback signal reviews into MySQL by `(storage_user_id, signal_key)` after recovery, merging terminal status and completed horizons before idempotent upsert and deleting file rows only after commit.
+- Classified partial signal reviews from their record status and next missing horizon deadline instead of treating the first completed horizon as terminal.
+- Bounded HTTP handler concurrency, socket waits, SSE clients, and SSE lifetime. Compose and remote deployment now bind the application to loopback and default authentication cookies to `Secure`, requiring an HTTPS reverse proxy for production access.
+
+## Full review remediation verification
+
+- Passed targeted `python -B scripts\smoke.py`, `node scripts\frontend-smoke.js`, frontend syntax, Python compilation, and `git diff --check` apart from existing line-ending warnings.
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok`, `frontend smoke ok`, and `verify ok`.
+- GitNexus detected 126 changed symbols and 92 affected execution flows across the full pre-existing worktree, retaining the expected `critical` L3 impact classification.
+- Offline tests cover tick monotonicity/divisibility, stale-lock ownership, exchange-event ordering, score-tier sizing, symbol reservations, auth failure isolation, partial review deadlines, fallback reconciliation, request timeouts, HTTP slots, and SSE rejection at capacity.
+- Restarted the single local backend on `127.0.0.1:8876` as PID 15520 with auth disabled; health, explicit local auth identity, updated frontend asset markers, and SSE diagnostics (`300s`, `12` clients) passed.
+- In-app browser navigation to the local URL was rejected by browser security policy, so DOM/render verification was skipped rather than bypassed.
+- Docker CLI is unavailable locally. Real MySQL 8.4 reconciliation/upsert, Docker Compose parsing/startup, HTTPS proxy/certificate behavior, and concurrent network saturation remain release-environment checks.

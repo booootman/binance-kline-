@@ -33,9 +33,18 @@ continues with later entries. A partial batch failure rolls back every entry.
 
 The browser treats `applied: false` as a revision conflict and reconciles the
 rejected patch against current server state. Failed reconciliation reads are
-persisted in user-scoped localStorage and resume after reload. Temporary storage
-failures retry with backoff; non-retryable HTTP errors remain pending without
-creating a zero-delay request loop.
+persisted in user-scoped localStorage before the reconciliation request starts
+and resume after reload. Later edits update that durable recovery version, and
+an older in-flight reconciliation cannot clear newer state. Temporary storage
+failures retry with backoff; non-retryable HTTP errors keep recovery data but
+stop automatic scheduling instead of creating recurring requests.
+
+Signal reviews written to `runtime/signal_reviews.json` during a MySQL outage are
+reconciled before later MySQL saves, reads, due scans, or updates. Reconciliation
+uses `(storage_user_id, signal_key)`, merges completed horizons without
+downgrading an `evaluated` record, performs an idempotent upsert, commits, and
+only then removes the migrated file rows. A failed MySQL transaction leaves the
+file intact for the next attempt.
 
 ## Redis
 
