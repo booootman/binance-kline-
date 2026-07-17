@@ -27,6 +27,12 @@ source = source.slice(0, close) + `
     flushPreferencesOnUnload: flushPreferencesOnUnload,
     loadServerPreferences: loadServerPreferences,
     loadCurrentUser: loadCurrentUser,
+    apiFetch: apiFetch,
+    resetAuthForTest: function () {
+      authRedirectStarted = false;
+      CURRENT_USER = null;
+      preferenceServerSyncEnabled = true;
+    },
     clearConflictRecoveryMemory: function () { preferenceConflictRecovery = null; },
     reloadConflictRecoveryMemory: function () { preferenceConflictRecovery = loadPreferenceConflictRecovery(); },
     setConflictRecovery: function (value) { rememberPreferenceConflictRecovery(value); },
@@ -43,7 +49,8 @@ source = source.slice(0, close) + `
         inFlightPatch: preferenceInFlightPatch,
         conflictRecovery: preferenceConflictRecovery,
         syncEnabled: preferenceServerSyncEnabled,
-        currentUser: CURRENT_USER
+        currentUser: CURRENT_USER,
+        authRedirecting: authRedirectStarted
       };
     }
   };
@@ -88,6 +95,11 @@ const window = {
   MARKET_DATA: [],
   GENERATED_AT: '',
   fetch: fetchMock,
+  location: {
+    pathname: '/binance-futures-dashboard.html',
+    redirects: [],
+    assign(value) { this.redirects.push(value); }
+  },
   addEventListener() {},
   removeEventListener() {}
 };
@@ -114,6 +126,7 @@ const context = {
   setInterval: setTimeoutMock,
   clearInterval: clearTimeoutMock,
   EventSource: function () {},
+  AbortController,
   URL,
   JSON,
   Math,
@@ -206,6 +219,43 @@ async function main() {
   assert.strictEqual(reports[0]._price_source_ms, 11, 'out-of-order realtime price must not roll back source time');
   api.applyRealtimePrice({ symbol: 'DOGEUSDT', price: 0.4, price_event_ms: 10, price_received_ms: 99, depth_event_ms: 20, depth_received_ms: 99 });
   assert.strictEqual(reports[0].last, 1.1, 'older exchange event must not win because it arrived later');
+
+  api.setData([{
+    symbol: 'DOGEUSDT',
+    last: 99,
+    _price_source_ms: 200,
+    _price_snapshot_ms: 9_000,
+    _price_bid: 98,
+    _price_ask: 100,
+    _depth_source_ms: 190,
+    _depth_imbalance: 0.2
+  }]);
+  let refreshed = api.stampReports([{
+    symbol: 'DOGEUSDT',
+    last: 100,
+    price_observed_at_ms: 150
+  }], '2026-07-17 00:00:00');
+  assert.strictEqual(refreshed[0]._analysis_last, 100, 'strategy refresh must retain the REST analysis price separately');
+  assert.strictEqual(refreshed[0].last, 99, 'newer realtime price must remain paired with its freshness metadata');
+  assert.strictEqual(refreshed[0]._price_source_ms, 200, 'newer realtime source time must survive strategy refresh');
+  api.setData(refreshed);
+  api.applyRealtimePrice({ symbol: 'DOGEUSDT', price: 88, price_event_ms: 200 });
+  assert.strictEqual(refreshed[0].last, 99, 'duplicate realtime events must not overwrite the preserved live price');
+  api.setRealtimeState({ transportOpen: false, upstreamConnected: false, error: 'disconnected' });
+  refreshed = api.stampReports([{
+    symbol: 'DOGEUSDT',
+    last: 101,
+    price_observed_at_ms: 180
+  }], '2026-07-17 00:01:00');
+  assert.strictEqual(refreshed[0].last, 99, 'a disconnected SSE must not make a newer known live price roll back');
+  api.setData(refreshed);
+  const analysisWins = api.stampReports([{
+    symbol: 'DOGEUSDT',
+    last: 102,
+    price_observed_at_ms: 250
+  }], '2026-07-17 00:02:00');
+  assert.strictEqual(analysisWins[0].last, 102, 'a newer REST observation must replace older realtime price metadata');
+  assert.strictEqual(analysisWins[0]._price_source_ms, undefined, 'older realtime freshness metadata must not label a newer REST price');
 
   nowValue = 10_000;
   api.saveServerPreferences({ custom_symbols: ['DOGEUSDT'] });
@@ -363,13 +413,13 @@ async function main() {
   assert.strictEqual(fetchCalls.length, 16, 'non-retryable failure test must start one preference request');
   fetchResolvers[15].resolve({
     ok: false,
-    status: 401,
-    json: () => Promise.resolve({ error: 'login required' })
+    status: 403,
+    json: () => Promise.resolve({ error: 'forbidden' })
   });
   await settle();
   runTimers();
   runTimers();
-  assert.strictEqual(fetchCalls.length, 16, 'HTTP 401 must not create zero-delay preference retries');
+  assert.strictEqual(fetchCalls.length, 16, 'HTTP 403 must not create zero-delay preference retries');
   assert.deepStrictEqual(api.preferenceState().pending.position_state, { DOGEUSDT: 'short' }, 'non-retryable failure must retain the local pending patch');
 
   api.setConflictRecovery({ patch: { tv_kline_interval: '60' }, baseSnapshot: {} });
@@ -385,16 +435,16 @@ async function main() {
   assert.strictEqual(api.preferenceState().conflictRecovery.patch.tv_kline_interval, 'D', 'older reconciliation completion must not clear a newer recovery version');
 
   api.flushServerPreferences();
-  assert.strictEqual(fetchCalls.length, 18, 'recovery authorization test must start one GET');
+  assert.strictEqual(fetchCalls.length, 18, 'non-retryable recovery test must start one GET');
   fetchResolvers[17].resolve({
     ok: false,
-    status: 401,
-    json: () => Promise.resolve({ error: 'login required' })
+    status: 403,
+    json: () => Promise.resolve({ error: 'forbidden' })
   });
   await settle();
   runTimers();
   runTimers();
-  assert.strictEqual(fetchCalls.length, 18, 'recovery GET must stop automatic retries after HTTP 401');
+  assert.strictEqual(fetchCalls.length, 18, 'recovery GET must stop automatic retries after HTTP 403');
   assert(api.preferenceState().conflictRecovery, 'non-retryable recovery failure must remain persisted');
   api.setConflictRecovery(null);
 
@@ -440,6 +490,41 @@ async function main() {
   await settle();
   assert.strictEqual(localAuthReady, true, 'explicit auth-disabled response may select local mode');
   assert.strictEqual(api.preferenceState().currentUser.id, 0, 'explicit local mode must retain its isolated user id');
+
+  let realLocalAuthReady = null;
+  api.loadCurrentUser((ready) => { realLocalAuthReady = ready; });
+  fetchResolvers[22].resolve(responsePayload({ auth_enabled: true, authenticated: true, user: { id: 7, username: 'local', role: 'user' } }));
+  await settle();
+  assert.strictEqual(realLocalAuthReady, true, 'auth-enabled database user named local must be accepted');
+  assert.strictEqual(api.preferenceState().currentUser.id, 7, 'real local username must keep its database identity');
+
+  let postBootPreferenceDone = false;
+  api.loadServerPreferences(() => { postBootPreferenceDone = true; });
+  fetchResolvers[23].resolve({ ok: false, status: 401, json: () => Promise.resolve({ error: 'login required' }) });
+  await settle();
+  assert.strictEqual(postBootPreferenceDone, false, 'post-boot 401 must stop the protected continuation');
+  assert.strictEqual(api.preferenceState().currentUser, null, 'post-boot 401 must clear the authenticated user');
+  assert.strictEqual(api.preferenceState().syncEnabled, false, 'post-boot 401 must stop preference synchronization');
+  assert.strictEqual(window.location.redirects.length, 1, 'post-boot 401 must trigger exactly one login redirect');
+
+  api.resetAuthForTest();
+  let expiredBootReady = null;
+  api.loadCurrentUser((ready) => { expiredBootReady = ready; });
+  fetchResolvers[24].resolve({ ok: false, status: 401, json: () => Promise.resolve({ error: 'login required' }) });
+  await settle();
+  assert.strictEqual(expiredBootReady, false, 'boot-time 401 must fail authentication readiness');
+  assert.strictEqual(api.preferenceState().authRedirecting, true, 'boot-time 401 must enter redirect state');
+  assert.strictEqual(window.location.redirects.length, 2, 'boot-time 401 must trigger one additional redirect');
+
+  api.resetAuthForTest();
+  api.setData(Array.from({ length: 7 }, (_, index) => ({ symbol: `T${index}USDT` })));
+  api.addSymbol('TIMEOUT', 'history');
+  const timeoutCall = fetchCalls[25];
+  assert(timeoutCall.options.signal, 'API requests must carry an AbortController signal');
+  runTimers();
+  await settle();
+  assert.strictEqual(timeoutCall.options.signal.aborted, true, 'request timeout must abort the underlying fetch');
+  assert.strictEqual(api.pendingSymbolAddCount(), 0, 'timed-out symbol request must release its pending reservation');
 
   console.log('frontend smoke ok');
 }

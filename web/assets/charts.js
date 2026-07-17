@@ -71,6 +71,9 @@
   var preferenceServerSyncEnabled = true;
   var authRetryTimer = null;
   var authRetryDelayMs = 1000;
+  var API_REQUEST_TIMEOUT_MS = 15000;
+  var authRedirectStarted = false;
+  var activeRequestControllers = [];
   var root = getComputedStyle(document.documentElement);
   var C = {
     ink: root.getPropertyValue('--ink').trim(),
@@ -86,6 +89,128 @@
   var TFS = ['1m', '5m', '15m', '1h', '4h', '8h', '1d'];
   var FONT = "'GeistMono','Microsoft YaHei',sans-serif";
   var charts = [];
+
+  function stopAuthenticatedActivity() {
+    CURRENT_USER = null;
+    preferenceServerSyncEnabled = false;
+    pendingPreferencePatch = {};
+    preferenceSaveInFlight = false;
+    preferenceInFlightPatch = {};
+    preferenceInFlightRevision = 0;
+    if (preferenceSaveTimer) {
+      clearTimeout(preferenceSaveTimer);
+      preferenceSaveTimer = null;
+    }
+    if (authRetryTimer) {
+      clearTimeout(authRetryTimer);
+      authRetryTimer = null;
+    }
+    if (strategyRefreshTimer) {
+      clearInterval(strategyRefreshTimer);
+      strategyRefreshTimer = null;
+    }
+    if (clockTimer) {
+      clearInterval(clockTimer);
+      clockTimer = null;
+    }
+    if (realtimeSource) {
+      realtimeSource.close();
+      realtimeSource = null;
+      realtimeKey = '';
+    }
+    activeRequestControllers.slice().forEach(function (controller) {
+      try { controller.abort(); } catch (e) {}
+    });
+    SIGNAL_REVIEW_REQUEST_SEQ += 1;
+    SIGNAL_REVIEW_STATE.loading = false;
+    strategyRefreshBusy = false;
+    updateAdminControls();
+  }
+
+  function redirectToLogin() {
+    if (authRedirectStarted) return;
+    authRedirectStarted = true;
+    stopAuthenticatedActivity();
+    showLoading('登录已失效，正在跳转...');
+    if (!window.location) return;
+    var next = window.location.pathname || '/binance-futures-dashboard.html';
+    var target = '/login?next=' + encodeURIComponent(next);
+    if (typeof window.location.assign === 'function') window.location.assign(target);
+    else window.location.href = target;
+  }
+
+  function apiFetch(url, options) {
+    options = options || {};
+    var timeoutMs = Number(options.timeoutMs);
+    if (!isFinite(timeoutMs) || timeoutMs <= 0) timeoutMs = API_REQUEST_TIMEOUT_MS;
+    var requestOptions = {};
+    Object.keys(options).forEach(function (key) {
+      if (key !== 'timeoutMs') requestOptions[key] = options[key];
+    });
+    var externalSignal = requestOptions.signal;
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var externalAbortHandler = null;
+    if (controller) {
+      if (externalSignal && externalSignal.aborted) controller.abort();
+      else if (externalSignal && typeof externalSignal.addEventListener === 'function') {
+        externalAbortHandler = function () { controller.abort(); };
+        externalSignal.addEventListener('abort', externalAbortHandler, { once: true });
+      }
+      requestOptions.signal = controller.signal;
+      activeRequestControllers.push(controller);
+    }
+    var timedOut = false;
+    var timeoutId = null;
+    var timeoutPromise = new Promise(function (_resolve, reject) {
+      timeoutId = setTimeout(function () {
+        timedOut = true;
+        if (controller) controller.abort();
+        var error = new Error('请求超时');
+        error.name = 'TimeoutError';
+        error.code = 'REQUEST_TIMEOUT';
+        error.status = 408;
+        error.timeout = true;
+        reject(error);
+      }, timeoutMs);
+    });
+    var requestPromise;
+    try {
+      requestPromise = fetch(url, requestOptions);
+    } catch (error) {
+      requestPromise = Promise.reject(error);
+    }
+    function cleanupRequest() {
+      if (timeoutId !== null) clearTimeout(timeoutId);
+      if (controller) {
+        var index = activeRequestControllers.indexOf(controller);
+        if (index >= 0) activeRequestControllers.splice(index, 1);
+      }
+      if (externalSignal && externalAbortHandler && typeof externalSignal.removeEventListener === 'function') {
+        externalSignal.removeEventListener('abort', externalAbortHandler);
+      }
+    }
+    return Promise.race([requestPromise, timeoutPromise]).then(function (response) {
+      cleanupRequest();
+      if (response && response.status === 401) redirectToLogin();
+      if (authRedirectStarted && (!response || response.status !== 401)) {
+        var error = new Error('登录已失效');
+        error.status = 401;
+        throw error;
+      }
+      return response;
+    }, function (error) {
+      cleanupRequest();
+      if (timedOut && !(error && error.timeout)) {
+        var timeoutError = new Error('请求超时');
+        timeoutError.name = 'TimeoutError';
+        timeoutError.code = 'REQUEST_TIMEOUT';
+        timeoutError.status = 408;
+        timeoutError.timeout = true;
+        throw timeoutError;
+      }
+      throw error;
+    });
+  }
 
   function scopeLocalStorageKeys() {
     var userId = CURRENT_USER && CURRENT_USER.id != null ? String(CURRENT_USER.id) : 'local';
@@ -366,7 +491,7 @@
     rememberPreferenceRevision(preferenceServerRevision);
   }
   function reconcilePreferenceConflict(rejectedPatch, baseSnapshot) {
-    return fetch('api/preferences', { cache: 'no-store' })
+    return apiFetch('api/preferences', { cache: 'no-store' })
       .then(function (res) {
         return res.json().catch(function () { return {}; }).then(function (payload) {
           if (!res.ok || !preferenceStorageReady(payload)) {
@@ -457,7 +582,7 @@
     preferenceSaveInFlight = true;
     preferenceInFlightPatch = prefs;
     preferenceInFlightRevision = revision;
-    fetch('api/preferences', {
+    apiFetch('api/preferences', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ preferences: prefs, revision: revision }),
@@ -520,7 +645,7 @@
       sent = navigator.sendBeacon('api/preferences', new Blob([body], { type: 'application/json' }));
     }
     if (!sent && window.fetch) {
-      window.fetch('api/preferences', {
+      apiFetch('api/preferences', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: body,
@@ -590,7 +715,7 @@
     }
   }
   function loadServerPreferences(done) {
-    fetch('api/preferences', { cache: 'no-store' })
+    apiFetch('api/preferences', { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         if (!preferenceStorageConfigured(payload)) {
@@ -615,7 +740,7 @@
         if (preferenceConflictRecovery && preferenceServerSyncEnabled && !preferenceSaveTimer) {
           preferenceSaveTimer = setTimeout(flushServerPreferences, 0);
         }
-        if (typeof done === 'function') done();
+        if (!authRedirectStarted && typeof done === 'function') done();
       });
   }
   function tvIntervalLabel(v) {
@@ -663,7 +788,7 @@
     if (!btn || btn._bound) return;
     btn._bound = true;
     btn.addEventListener('click', function () {
-      fetch('api/logout', { method: 'POST', cache: 'no-store' })
+      apiFetch('api/logout', { method: 'POST', cache: 'no-store' })
         .catch(function () {})
         .then(function () { window.location.href = '/login'; });
     });
@@ -775,7 +900,7 @@
     var body = document.getElementById('diagnostics-body');
     if (body) body.innerHTML = '<div class="diag-card"><div class="diag-line"><span>读取中</span><b>...</b></div></div>';
     setDiagnosticsMessage('', '');
-    fetch('api/diagnostics', { cache: 'no-store' })
+    apiFetch('api/diagnostics', { cache: 'no-store' })
       .then(function (res) {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         return res.json();
@@ -879,7 +1004,7 @@
     }
     if (submit) submit.disabled = true;
     setPasswordMessage('正在保存...', '');
-    fetch('api/auth/password', {
+    apiFetch('api/auth/password', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -992,7 +1117,7 @@
     }
     if (submit) submit.disabled = true;
     setRegisterMessage('正在创建账号...', '');
-    fetch('api/auth/users', {
+    apiFetch('api/auth/users', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: username, password: password, role: role }),
@@ -1025,7 +1150,7 @@
     }
   }
   function loadCurrentUser(done) {
-    fetch('api/auth/me', { cache: 'no-store' })
+    apiFetch('api/auth/me', { cache: 'no-store' })
       .then(function (res) {
         if (!res.ok) {
           var error = new Error('HTTP ' + res.status);
@@ -1036,9 +1161,9 @@
       })
       .then(function (payload) {
         var user = payload && payload.authenticated ? payload.user : null;
-        var localIdentity = user && (String(user.id) === '0' || String(user.username || '').toLowerCase() === 'local');
+        var localIdentity = user && String(user.id) === '0' && String(user.username || '').toLowerCase() === 'local';
         var explicitLocalMode = payload && payload.auth_enabled === false;
-        if (!user || (localIdentity && !explicitLocalMode)) throw new Error('authentication state is ambiguous');
+        if (!user || (explicitLocalMode && !localIdentity)) throw new Error('authentication state is ambiguous');
         CURRENT_USER = user;
         preferenceServerSyncEnabled = true;
         updateAdminControls();
@@ -1328,8 +1453,17 @@
     return (arr || []).map(function (r) {
       if (!r || typeof r !== 'object') return r;
       var old = oldBySymbol[r.symbol];
+      var analysisLast = Number(r.last) || 0;
       if (old) {
-        ['_price_snapshot_ms', '_depth_snapshot_ms', '_price_source_ms', '_depth_source_ms', '_price_bid', '_price_ask', '_price_source', '_price_kind', '_depth_imbalance', '_bid_depth_top5_usd', '_ask_depth_top5_usd', '_depth_ladder'].forEach(function (key) {
+        var analysisPriceMs = Number(r.price_observed_at_ms || r._price_source_ms || 0);
+        var oldPriceMs = Number(old._price_source_ms || 0);
+        if (oldPriceMs > 0 && oldPriceMs > analysisPriceMs && isFinite(Number(old.last))) {
+          r.last = Number(old.last);
+          ['_price_snapshot_ms', '_price_source_ms', '_price_bid', '_price_ask', '_price_source', '_price_kind'].forEach(function (key) {
+            if (old[key] != null) r[key] = old[key];
+          });
+        }
+        ['_depth_snapshot_ms', '_depth_source_ms', '_depth_imbalance', '_bid_depth_top5_usd', '_ask_depth_top5_usd', '_depth_ladder'].forEach(function (key) {
           if (old[key] != null && r[key] == null) r[key] = old[key];
         });
       }
@@ -1337,7 +1471,7 @@
       r._snapshot_ms = ms;
       r._strategy_snapshot_at = stamp;
       r._strategy_snapshot_ms = ms;
-      r._analysis_last = Number(r.last) || 0;
+      r._analysis_last = analysisLast;
       r._analysis_confidence = Number((r.signal_quality && r.signal_quality.execution_score) || r.confidence) || 0;
       r._payload_stale = MARKET_STATE.stale;
       r._payload_warning = MARKET_STATE.warning;
@@ -2384,7 +2518,7 @@
   }
   function forceEvaluateSignalReviews() {
     setSignalReviewEvaluateButton(true);
-    fetch('api/signal-reviews/evaluate', { method: 'POST', cache: 'no-store' })
+    apiFetch('api/signal-reviews/evaluate', { method: 'POST', cache: 'no-store' })
       .then(function (res) {
         return res.json().catch(function () { return {}; }).then(function (payload) {
           if (!res.ok) throw new Error(payload.error || (payload.evaluation && payload.evaluation.reason) || ('HTTP ' + res.status));
@@ -2511,7 +2645,7 @@
     SIGNAL_REVIEW_STATE.error = '';
     var requestSeq = ++SIGNAL_REVIEW_REQUEST_SEQ;
     renderSignalReview();
-    fetch('api/signal-reviews?symbols=' + encodeURIComponent(key) + '&limit=240', { cache: 'no-store' })
+    apiFetch('api/signal-reviews?symbols=' + encodeURIComponent(key) + '&limit=240', { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         if (requestSeq !== SIGNAL_REVIEW_REQUEST_SEQ || !cur() || cur().symbol !== key) return;
@@ -2598,6 +2732,7 @@
     return DATA.map(function (r) { return r.symbol; }).sort().slice(0, MAX_SYMBOLS).join(',');
   }
   function startRealtimePrices() {
+    if (authRedirectStarted) return;
     if (!window.EventSource) {
       REALTIME_STATE.error = '当前浏览器不支持 EventSource';
       updateLiveBadge('offline');
@@ -2688,14 +2823,14 @@
     }
   }
   function refreshStrategyAnalysis() {
-    if (strategyRefreshBusy || !DATA.length) return;
+    if (authRedirectStarted || strategyRefreshBusy || !DATA.length) return;
     var wantedSymbols = wantedRefreshSymbols();
     var symbols = wantedSymbols.join(',');
     if (!wantedSymbols.length) return;
     strategyRefreshBusy = true;
     nextStrategyRefreshAt = Date.now();
     setGen();
-    fetch('api/market?symbols=' + encodeURIComponent(symbols), { cache: 'no-store' })
+    apiFetch('api/market?symbols=' + encodeURIComponent(symbols), { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         applyMarketPayloadState(payload);
@@ -2713,16 +2848,18 @@
         render();
       })
       .catch(function (err) {
+        if (authRedirectStarted) return;
         console.warn('[dashboard] auto strategy refresh failed:', err.message);
       })
       .then(function () {
         strategyRefreshBusy = false;
+        if (authRedirectStarted) return;
         nextStrategyRefreshAt = Date.now() + AUTO_STRATEGY_REFRESH_MS;
         setGen();
       });
   }
   function startStrategyRefreshTimer() {
-    if (strategyRefreshTimer) return;
+    if (strategyRefreshTimer || authRedirectStarted) return;
     nextStrategyRefreshAt = Date.now() + AUTO_STRATEGY_REFRESH_MS;
     setGen();
     strategyRefreshTimer = setInterval(refreshStrategyAnalysis, AUTO_STRATEGY_REFRESH_MS);
@@ -2785,7 +2922,7 @@
 
   // refresh a single symbol's data in-place
   function refreshSymbol(sym, onDone) {
-    fetch('api/market?symbol=' + encodeURIComponent(sym), { cache: 'no-store' })
+    apiFetch('api/market?symbol=' + encodeURIComponent(sym), { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         applyMarketPayloadState(payload);
@@ -2929,7 +3066,7 @@
     if (btn2) btn2.disabled = true;
     setAddStatus('正在获取 ' + raw + ' 实时数据…', '');
     showLoading('正在获取 ' + raw + ' …');
-    fetch('api/market?symbol=' + encodeURIComponent(raw), { cache: 'no-store' })
+    apiFetch('api/market?symbol=' + encodeURIComponent(raw), { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         applyMarketPayloadState(payload);
@@ -3735,7 +3872,7 @@
     if (!custom.length) { done(); return; }
     rememberSymbols(custom, true);
     showLoading('正在恢复 ' + custom.length + ' 个自定义币种…');
-    fetch('api/market?symbols=' + encodeURIComponent(custom.join(',')), { cache: 'no-store' })
+    apiFetch('api/market?symbols=' + encodeURIComponent(custom.join(',')), { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         applyMarketPayloadState(payload);
@@ -3747,7 +3884,7 @@
         refreshLiveBadge();
       })
       .catch(function () { /* keep defaults when custom restore fails */ })
-      .then(done);
+      .then(function () { if (!authRedirectStarted) done(); });
   }
 
   function boot() {
@@ -3770,8 +3907,7 @@
       loadCurrentUser(function (ready, status) {
         if (!ready) {
           if (status === 401) {
-            showLoading('登录已失效，正在跳转…');
-            if (window.location) window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname || '/binance-futures-dashboard.html');
+            redirectToLogin();
             return;
           }
           showLoading('认证服务暂时不可用，正在重试…');
@@ -3789,7 +3925,7 @@
     function startMarketBoot() {
       seedSymbolHistoryFromLocal();
       // 1. load default symbols
-    fetch('api/market', { cache: 'no-store' })
+    apiFetch('api/market', { cache: 'no-store' })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (payload) {
         applyMarketPayloadState(payload);
@@ -3802,6 +3938,7 @@
         restoreCustomSymbols(restoreDone);
       })
       .catch(function (err) {
+        if (authRedirectStarted) return;
         refreshLiveBadge();
         console.warn('[dashboard] live fetch failed, using static data.js:', err.message);
         applyRemovedSyms();
@@ -3811,6 +3948,7 @@
     }
 
     function restoreDone() {
+      if (authRedirectStarted) return;
       applyRemovedSyms();
       renderSymbolTabs();
       recordSignalHistory('首次加载');

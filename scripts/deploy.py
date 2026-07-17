@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,6 +42,12 @@ def parse_args():
     parser.add_argument("--key", default=str(Path.home() / "Desktop" / "id_ed25519"), help="SSH private key")
     parser.add_argument("--remote-dir", default="/opt/bian-dashboard", help="Remote application directory")
     parser.add_argument("--public-port", type=int, default=8000, help="Published dashboard port")
+    parser.add_argument("--public-url", default="", help="Public HTTPS dashboard URL verified after deployment")
+    parser.add_argument(
+        "--allow-no-public-url",
+        action="store_true",
+        help="Skip the public HTTPS health check for an explicitly local development deployment",
+    )
     parser.add_argument("--retries", type=int, default=3, help="Attempts for each SSH/SCP step")
     parser.add_argument("--retry-delay", type=float, default=10, help="Seconds between retries")
     parser.add_argument("--scp-limit-kbps", type=int, default=0, help="Optional SCP bandwidth cap")
@@ -53,6 +60,27 @@ def parse_args():
     )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without connecting")
     return parser.parse_args()
+
+
+def normalize_public_url(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlsplit(text)
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        raise ValueError("--public-url must be an absolute HTTPS URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+        raise ValueError("--public-url must contain only the HTTPS origin, without credentials, path, query, or fragment")
+    return f"https://{parsed.netloc}"
+
+
+def validate_deploy_args(args):
+    try:
+        args.public_url = normalize_public_url(getattr(args, "public_url", ""))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if not args.public_url and not getattr(args, "allow_no_public_url", False):
+        raise SystemExit("--public-url is required; use --allow-no-public-url only for an explicitly local development deployment")
 
 
 def run_checked(command, retries, retry_delay, dry_run=False):
@@ -145,6 +173,11 @@ def remote_script(args, remote_archive):
     release_template = shlex.quote(args.remote_dir.rstrip("/") + ".release.XXXXXX")
     backup_dir = shlex.quote(args.remote_dir.rstrip("/") + ".previous")
     archive = shlex.quote(remote_archive)
+    public_url = normalize_public_url(getattr(args, "public_url", ""))
+    public_check = ""
+    if public_url:
+        public_health_url = shlex.quote(public_url + "/api/health")
+        public_check = f"curl -fsS --retry 6 --retry-delay 5 --max-time 15 --proto '=https' --tlsv1.2 {public_health_url} >/dev/null"
     market_check = ""
     if args.check_market:
         market_check = f"""
@@ -200,6 +233,7 @@ if grep -q '^BIAN_AUTH_COOKIE_SECURE=' "$release_dir/.env"; then
 else
   printf 'BIAN_AUTH_COOKIE_SECURE=1\n' >> "$release_dir/.env"
 fi
+chmod 600 "$release_dir/.env"
 cd "$release_dir"
 docker compose config >/dev/null
 if [ -d {remote_dir} ]; then
@@ -215,6 +249,7 @@ cd {remote_dir}
 docker compose up -d --build
 {ufw}
 curl -fsS --retry 12 --retry-delay 5 --max-time 10 http://127.0.0.1:{args.public_port}/api/health >/dev/null
+{public_check}
 {market_check}
 docker compose ps
 rm -rf {backup_dir}
@@ -225,6 +260,7 @@ trap - EXIT
 
 def main():
     args = parse_args()
+    validate_deploy_args(args)
     changes = worktree_changes()
     if changes and not args.allow_dirty:
         raise SystemExit("refusing to deploy a dirty Git worktree; review/commit changes or pass --allow-dirty explicitly")

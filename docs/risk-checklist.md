@@ -27,7 +27,7 @@
 - Realtime worker-generation risk: a stopped worker may finish a delayed connect or receive after its replacement starts. Every direct-worker state mutation must verify the current generation.
 - Same-origin parsing risk: an entirely missing source header remains allowed for CLI clients, but present opaque or malformed values such as `Origin: null` must fail closed.
 - Preference unload risk: in-flight and pending patches must share one ordered batch request and one server transaction. Separate requests can arrive in reverse order and make the global revision guard discard the older patch.
-- Preference retry risk: non-retryable 400/401/403 responses from either POST or reconciliation GET must retain local recovery state but stop automatic scheduling; retryable network, 408/429, and 5xx failures keep bounded backoff.
+- Preference retry risk: non-retryable 400/403 responses retain local recovery state without automatic scheduling. Any 401 is session expiration and must stop all authenticated activity, clear the active user, and redirect to login; retryable network, 408/429, and 5xx failures keep bounded backoff.
 - Password-change transaction risk: password verification must lock the user row, and password hash update plus other-session revocation must commit atomically. Missing the row lock permits concurrent requests with the same old password to both report success.
 - Realtime status risk: an explicit upstream error with no fresh price is offline even when the browser-to-server SSE remains open; transport connectivity alone must not display an endless connecting state.
 - Symbol restore risk: removed default symbols must be excluded before calculating the eight-symbol capacity, or valid custom symbols will be truncated during boot.
@@ -39,3 +39,9 @@
 - Review fallback risk: file rows written during a MySQL outage must be merged and committed by `(storage_user_id, signal_key)` before removal; otherwise recovered reads hide records or downgrade terminal evaluations.
 - Resource-exhaustion risk: HTTP handler count, socket waits, SSE client count, and SSE lifetime are bounded, but release testing must still verify proxy timeouts and expected concurrency for the target user count.
 - TLS deployment risk: authenticated Compose deployments bind to loopback and set Secure cookies by default. A public listener requires an HTTPS reverse proxy; changing the bind address or disabling Secure cookies reintroduces plaintext credential/session exposure.
+- Public-entry verification risk: a loopback-only health check cannot prove users can reach the Secure-cookie deployment. Production deploys require `--public-url` and must pass its HTTPS `/api/health` before cleanup.
+- Secret-file risk: the remote `.env` contains bootstrap, MySQL, root, and Redis secrets and must remain mode `0600` after every copy or edit.
+- Request-lifecycle risk: every dashboard API request is bounded by a client timeout. A 401 must close SSE and stop preference/auth/strategy timers before redirect so late completions cannot resume protected work.
+- Realtime merge risk: strategy refresh must keep `_analysis_last` from REST while preserving `last` and its price metadata only when the realtime source timestamp is newer than `price_observed_at_ms`.
+- Fallback-retention risk: `BIAN_SIGNAL_REVIEW_LIMIT` is a per-user limit. Applying it globally lets one user evict every other user's outage records.
+- Cache-lock risk: the backtest cache uses a held OS file lock. Reintroducing stale-file unlink or token-check-then-delete logic recreates a replacement-owner race.

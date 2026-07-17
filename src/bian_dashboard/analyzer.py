@@ -868,6 +868,25 @@ def read_backtest_cache(cache_key_value: str) -> Dict[str, DirectionalBacktest] 
         return None
 
 
+def _try_lock_backtest_cache_fd(fd: int) -> str:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(fd).st_size < 1:
+                os.write(fd, b"\0")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return "msvcrt"
+
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return "fcntl"
+    except (ImportError, OSError):
+        return ""
+
+
 def acquire_backtest_cache_lock(timeout_seconds: float = 5.0) -> tuple[int, str] | None:
     if not BACKTEST_CACHE_FILE:
         return None
@@ -875,40 +894,42 @@ def acquire_backtest_cache_lock(timeout_seconds: float = 5.0) -> tuple[int, str]
     deadline = time.time() + timeout_seconds
     while True:
         try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            token = f"{os.getpid()}-{time.time_ns()}-{os.urandom(16).hex()}"
-            os.write(fd, f"{token}\n".encode("ascii"))
-            return fd, token
-        except FileExistsError:
-            try:
-                if time.time() - os.path.getmtime(lock_path) > max(30.0, timeout_seconds * 3.0):
-                    os.unlink(lock_path)
-                    continue
-            except OSError:
-                pass
-            if time.time() >= deadline:
-                return None
-            time.sleep(0.05)
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         except OSError:
             return None
+        backend = _try_lock_backtest_cache_fd(fd)
+        if backend:
+            return fd, backend
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.05)
 
 
 def release_backtest_cache_lock(lock: tuple[int, str] | None) -> None:
     if lock is None:
         return
-    fd, token = lock
-    lock_path = BACKTEST_CACHE_FILE + ".lock"
+    fd, backend = lock
     try:
-        os.close(fd)
-    except OSError:
+        if backend == "msvcrt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        elif backend == "fcntl":
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except (ImportError, OSError):
         pass
-    try:
-        with open(lock_path, "r", encoding="ascii") as fh:
-            current_token = fh.readline().strip()
-        if current_token == token:
-            os.unlink(lock_path)
-    except OSError:
-        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def write_backtest_cache(cache_key_value: str, backtests: Dict[str, DirectionalBacktest]) -> None:

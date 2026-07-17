@@ -33,7 +33,7 @@ Do not use that override on a remote or shared host.
 From the project root:
 
 ```bash
-python scripts/deploy.py
+python scripts/deploy.py --public-url https://dashboard.example.com
 ```
 
 The defaults target `root@159.223.91.36`, use the private key at `~/Desktop/id_ed25519`,
@@ -47,11 +47,12 @@ docker compose up -d --build
 Useful options:
 
 ```bash
-python scripts/deploy.py --host 159.223.91.36 --key C:\Users\WIN11\Desktop\id_ed25519
+python scripts/deploy.py --host 159.223.91.36 --key C:\Users\WIN11\Desktop\id_ed25519 --public-url https://dashboard.example.com
 python scripts/deploy.py --retries 5 --retry-delay 20 --scp-limit-kbps 1024
-python scripts/deploy.py --public-port 9000 --check-market
+python scripts/deploy.py --public-port 9000 --public-url https://dashboard.example.com --check-market
 python scripts/deploy.py --no-ufw
-python scripts/deploy.py --allow-dirty --dry-run
+python scripts/deploy.py --allow-dirty --public-url https://dashboard.example.com --dry-run
+python scripts/deploy.py --allow-no-public-url --dry-run
 ```
 
 The deployed Compose port remains bound to loopback even if UFW has a matching
@@ -59,6 +60,10 @@ rule. Configure the public firewall for the TLS proxy's port 443, not the
 dashboard upstream port.
 `--check-market` only curls `/api/market` when auth is disabled; with auth enabled,
 verify market data after logging in.
+`--public-url` must be an HTTPS origin without a path, query, credentials, or
+fragment. Deployment fails unless its public `/api/health` succeeds after the
+loopback check. `--allow-no-public-url` is an explicit local-development
+override and must not be used for an authenticated production release.
 
 The default deployment refuses modified or untracked files. `--allow-dirty` is
 an explicit development override that includes modified tracked files and
@@ -75,7 +80,8 @@ previous application directory remains as `/opt/bian-dashboard.previous` until
 the new Compose stack passes `/api/health`, and the uploaded archive is deleted
 only after success so a failed SSH deployment step can reuse it. `--public-port`
 updates `BIAN_PUBLIC_PORT` in the preserved remote `.env`, so later manual
-Compose restarts keep the selected port.
+Compose restarts keep the selected port. After all generated or preserved
+secrets are updated, the script forces the remote `.env` to mode `0600`.
 
 ## Environment
 
@@ -122,6 +128,7 @@ Admin users can use the top-right `注册账号` button to create additional `us
 ```bash
 docker compose ps
 curl -fsS http://127.0.0.1:8000/api/health
+curl -fsS https://dashboard.example.com/api/health
 ```
 
 `/api/health` is public and returns only non-secret diagnostics such as uptime,

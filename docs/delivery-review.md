@@ -110,3 +110,11 @@ This pass tightens the P0 trust issues from `docs/improvement-suggestions.md`: h
 - Authentication boot is fail-closed, file-fallback reviews reconcile into MySQL after recovery, and partial review records remain pending until their final status changes.
 - HTTP/SSE resource use is bounded. Production Compose binds the upstream to loopback, uses Secure cookies by default, and requires TLS termination on port 443.
 - Human release review must validate MySQL reconciliation against MySQL 8.4, Compose configuration, a real HTTPS proxy, EventSource reconnects, and saturation behavior before deployment approval.
+
+## 2026-07-17 End-to-end review remediation
+
+- Deployment now requires a public HTTPS origin, validates its health after the loopback check, and hardens the secret-bearing remote `.env` to `0600` after every edit.
+- Dashboard API calls share a bounded timeout and centralized 401 lifecycle. Session expiration stops preference sync, timers, and SSE before clearing the user and redirecting once.
+- Auth-enabled users named `local` retain their database identity; only an explicit auth-disabled id-0 response selects local mode.
+- Strategy refresh keeps REST analysis price separately and preserves a realtime price only with its newer source metadata. File fallback retention is per user, logout clears cookies through database failures, explicit timestamp fallbacks are preserved, and backtest writes use held OS file locks.
+- Human release review must run the new dry-run command with the real HTTPS origin, verify `.env` permissions on the server, exercise session expiry in a browser, and validate multi-user fallback reconciliation against MySQL before staging.

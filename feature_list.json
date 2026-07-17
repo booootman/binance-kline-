@@ -68,7 +68,7 @@
         "Backtest filtered-out sample count and ATR/volume filter note",
         "Gross expectancy versus net expectancy after estimated fee/slippage",
         "Price-path drawdown kept separate from execution cost",
-        "Reusable runtime backtest cache for analyzer/server calls",
+        "Reusable runtime backtest cache for analyzer/server calls, serialized by a held cross-platform OS file lock without stale-lock deletion races",
         "Realtime SSE depth20 stream with depth imbalance and top5/top20 depth",
         "Realtime WebSocket hubs normalize symbol-set keys so differently cased shorthand symbols and different request orders share one backend stream",
         "Realtime SSE requests for a symbol subset can reuse an already-active superset WebSocket hub to reduce duplicate Binance connections",
@@ -174,7 +174,8 @@
         "MySQL and Redis connection/read/write waits are bounded by documented environment settings, and availability health caches expire after five seconds",
         "New GET /api/storage-status endpoint for checking configured storage availability",
         "Browser localStorage remains the fallback when MySQL or Redis is not configured",
-        "Signal reviews written to the file fallback during a MySQL outage are merged by user/key and idempotently upserted before committed file rows are removed"
+        "Signal reviews written to the file fallback during a MySQL outage are merged by user/key and idempotently upserted before committed file rows are removed",
+        "File-fallback signal-review retention applies BIAN_SIGNAL_REVIEW_LIMIT independently to each storage user"
       ],
       "verification": [
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py bian.py server.py",
@@ -257,7 +258,8 @@
         "Docker health checks surface a fresh auth deployment that has no users and no first-admin secret instead of leaving an unusable login page",
         "Python deployment script skips protected /api/market curl checks when auth is enabled and asks for logged-in verification instead",
         "Python deployment script requires a clean Git worktree by default, preserves repository/global/Git-info ignore rules, fails closed when ignore configuration is unreadable, excludes local .env, and offers an explicit --allow-dirty development override",
-        "Remote deployment stages a fresh release directory, preserves the previous release and uploaded archive until health passes, persists --public-port in remote .env, and supports bounded SSH/SCP retries",
+        "Remote deployment stages a fresh release directory, preserves the previous release and uploaded archive until loopback and required public HTTPS health checks pass, persists --public-port in remote .env, and supports bounded SSH/SCP retries",
+        "Production scripted deploys require an HTTPS --public-url unless an explicit local-development override is supplied, and remote .env permissions are forced to 0600 after all secret edits",
         "Docker Compose passes an optional Redis password through the dashboard client, Redis requirepass, and authenticated healthcheck; fresh scripted deployments generate the secret",
         "Production defaults bind the application upstream to loopback, require Secure authentication cookies, and document HTTPS reverse-proxy termination",
         "HTTP handler concurrency, socket timeouts, SSE client count, and SSE response lifetime are bounded through environment variables"
@@ -314,7 +316,9 @@
         "Optional trusted-proxy X-Forwarded-For support through BIAN_AUTH_TRUST_PROXY_HEADERS, disabled by default",
         "Session last_seen_at touch interval through BIAN_AUTH_SESSION_TOUCH_INTERVAL_SECONDS to reduce MySQL write load",
         "Duplicate admin-created usernames return a controlled duplicate-user error even under concurrent requests",
-        "Dashboard boot accepts local scope only from an explicit auth-disabled response; auth outages stop preference sync and retry with bounded backoff"
+        "Dashboard boot accepts local scope only from an explicit auth-disabled id-0 response while auth-enabled database users named local retain their real identity",
+        "Every dashboard API fetch has an AbortController-backed timeout; any HTTP 401 stops preference sync, timers, and realtime SSE, clears the user, and redirects to login once",
+        "Logout always expires the browser session cookie even when database session deletion fails"
       ],
       "verification": [
         "python -B -m py_compile src/bian_dashboard/storage.py src/bian_dashboard/server.py scripts/deploy.py bian.py server.py",

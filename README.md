@@ -64,8 +64,9 @@ powershell -ExecutionPolicy Bypass -File scripts\verify.ps1
 ## 部署
 
 ```powershell
-python scripts\deploy.py
+python scripts\deploy.py --public-url https://dashboard.example.com
 ```
 
 默认通过 Docker Compose 部署 `dashboard + MySQL + Redis`。部署前请确认服务器 `.env` 中的登录密码、MySQL 密码和公网端口配置。
+部署脚本要求提供公网 HTTPS origin，并在本机回环健康检查之后验证该入口；仅限明确的本地开发部署可使用 `--allow-no-public-url` 跳过。
 如果直接运行 `docker compose up -d --build`，请先复制 `.env.example` 为 `.env` 并设置 `BIAN_AUTH_BOOTSTRAP_PASSWORD`；否则空数据库会出现登录页但没有可用管理员，`/api/health` 会返回 `auth.issue=first_admin_secret_missing`。

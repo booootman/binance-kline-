@@ -29,7 +29,7 @@
 27. Confirm invalid symbols return HTTP 400 instead of stale cache.
 28. Confirm a signal published mid-minute ignores that minute's full OHLC high/low, while a candle opening exactly at publication remains eligible.
 29. Confirm `/api/preferences` rejects a missing, zero, or negative `revision` and that the storage layer cannot upsert without a positive revision.
-30. Confirm `python scripts/deploy.py --dry-run --allow-dirty --public-port 9000` writes `BIAN_PUBLIC_PORT=9000` into the remote release `.env` before Compose validation.
+30. Confirm `python scripts/deploy.py --dry-run --allow-dirty --public-port 9000 --public-url https://dashboard.example.com` writes `BIAN_PUBLIC_PORT=9000` into the remote release `.env` before Compose validation.
 31. Confirm the deployment archive cleanup appears after `/api/health`, so a failed deploy command can retry with the same uploaded archive.
 32. Confirm the default deploy rejects a dirty worktree and Git-ignored files never appear in the archive manifest.
 33. Confirm a preference response with `saved=true, applied=false` fetches current server preferences, drops a same-field stale patch, and retries only fields unchanged since the request's base snapshot.
@@ -45,11 +45,11 @@
 43. Confirm a rejected patch is persisted before conflict reconciliation completes, survives pagehide/runtime memory loss, and retries another GET before any safe field is written.
 44. Confirm `storage.mysql.configured=false` disables server preference sync while localStorage continues to work without recurring POST retries.
 45. Confirm password verification locks the user row, password hash update and other-session revocation use one transaction, and a revocation failure rolls back the password update.
-46. Confirm HTTP 400/401/403 preference POST and recovery GET failures remain pending without scheduling another request, while 429/503 failures continue to retry with backoff.
+46. Confirm HTTP 400/403 preference POST and recovery GET failures remain pending without scheduling another request, while 401 clears authenticated state and redirects exactly once, and 429/503 failures continue to retry with backoff.
 47. Confirm an ordered preference batch skips a stale first revision, applies a newer second revision, and rolls back all entries when a later write fails.
 48. Confirm a newer same-key edit replaces the persisted recovery value and an older reconciliation completion cannot clear or replay the superseded value.
 49. Confirm `round_to_tick` outputs legal tick multiples and `down <= input <= up` for fine and non-power-of-ten ticks.
-50. Confirm releasing an old backtest cache lock cannot delete a replacement lock with a different owner token.
+50. Confirm a held OS backtest cache lock rejects a second owner, release performs no unlink, and a new owner can acquire after release.
 51. Confirm older bookTicker/depth exchange timestamps cannot roll back price, bid/ask, depth, or freshness, while a newer depth event can advance independently.
 52. Confirm a realtime execution-score drop from 75 to 67 caps a 30% backend position at 22%, and a score below 45 produces 0%.
 53. Confirm two concurrent add-symbol actions reserve capacity and a late response rechecks the eight-symbol limit before mutating dashboard data.
@@ -58,3 +58,11 @@
 56. Confirm file-fallback signal reviews are merged into MySQL by user/key after recovery and removed from the file only after successful upsert.
 57. Confirm slow request bodies time out, active HTTP handlers cannot exceed the configured slots, and excess SSE clients receive HTTP 503.
 58. Confirm Compose binds `127.0.0.1:8000` by default, remote deploy forces loopback plus Secure cookies, and the public HTTPS proxy can reconnect EventSource after the five-minute SSE rotation.
+59. Confirm production deploy rejects a missing/non-HTTPS `--public-url`, validates public HTTPS before cleanup, and writes remote `.env` mode `0600` after all edits.
+60. Confirm an auth-enabled database user whose username is exactly `local` keeps its real user id, while auth-disabled mode requires the explicit id-0 local identity.
+61. Confirm both boot-time and post-boot API 401 responses stop preference sync/timers/SSE, clear the current user, and issue only one login redirect per expiration.
+62. Confirm a never-settling add-symbol request is aborted at the frontend timeout and always releases its pending symbol reservation.
+63. Confirm strategy refresh retains a newer SSE `last` with matching source metadata, ignores a duplicate SSE event, and lets a later REST observation replace older realtime metadata.
+64. Confirm logout still returns HTTP 200 and expires the cookie when database session deletion raises.
+65. Confirm signal-review file retention keeps the newest configured limit independently for two users and reconciliation removes only committed user scopes.
+66. Confirm invalid snapshot text preserves explicit fallbacks `0` and `-1`, while `None` alone uses current time.

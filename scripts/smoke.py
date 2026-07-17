@@ -76,18 +76,61 @@ def test_tick_rounding_and_cache_lock_ownership():
     try:
         lock = analyzer.acquire_backtest_cache_lock()
         check(lock is not None, "backtest cache lock must be acquired")
-        os.close(lock[0])
-        lock_path.unlink()
-        replacement_token = "replacement-owner"
-        lock_path.write_text(replacement_token + "\n", encoding="ascii")
-        analyzer.release_backtest_cache_lock(lock)
-        check(lock_path.read_text(encoding="ascii").strip() == replacement_token, "old owner must not remove a replacement lock")
+        check(analyzer.acquire_backtest_cache_lock(0.05) is None, "a held OS cache lock must reject a second owner")
+        original_unlink = analyzer.os.unlink
+        analyzer.os.unlink = lambda path: (_ for _ in ()).throw(AssertionError(f"cache lock release must not unlink {path}"))
+        try:
+            analyzer.release_backtest_cache_lock(lock)
+        finally:
+            analyzer.os.unlink = original_unlink
+        replacement = analyzer.acquire_backtest_cache_lock(0.05)
+        check(replacement is not None, "cache lock must be acquirable after the owner releases it")
+        analyzer.release_backtest_cache_lock(replacement)
     finally:
         analyzer.BACKTEST_CACHE_FILE = original_cache_file
         try:
             lock_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def test_snapshot_fallback_and_logout_cookie():
+    original_time = server.time.time
+    server.time.time = lambda: 123.0
+    try:
+        check(server.parse_snapshot_ms("", fallback=None) == 123_000, "None fallback must use current time")
+        check(server.parse_snapshot_ms("invalid", fallback=0) == 0, "zero timestamp fallback must not become current time")
+        check(server.parse_snapshot_ms("", fallback=-1) == -1_000, "negative timestamp fallback must be preserved")
+        valid = server.parse_snapshot_ms("2026-07-17 00:00:00", fallback=0)
+        check(valid != 0, "a valid timestamp must win over its fallback")
+    finally:
+        server.time.time = original_time
+
+    class BrokenLogoutStorage:
+        def delete_auth_session(self, token):
+            check(token == "session-token", "logout must delete the current session token")
+            raise TimeoutError("database unavailable")
+
+    handler = object.__new__(server.Handler)
+    response = {"headers": []}
+    handler.auth_token = lambda: "session-token"
+    handler.send_response = lambda status: response.update(status=status)
+    handler.send_header = lambda name, value: response["headers"].append((name, value))
+    handler.end_headers = lambda: response.update(ended=True)
+    handler.wfile = io.BytesIO()
+    original_storage = server.storage
+    previous_disabled = server.LOG.disabled
+    server.storage = BrokenLogoutStorage()
+    server.LOG.disabled = True
+    try:
+        handler.logout_api()
+    finally:
+        server.storage = original_storage
+        server.LOG.disabled = previous_disabled
+    check(response.get("status") == 200 and response.get("ended"), "logout must respond even when session deletion fails")
+    cookies = [value for name, value in response["headers"] if name.lower() == "set-cookie"]
+    check(cookies and "Max-Age=0" in cookies[0], "logout failure path must still expire the browser cookie")
+    check(handler.wfile.getvalue() == b'{"authenticated":false}', "logout failure path must return the logged-out payload")
 
 
 def test_review_time_boundaries():
@@ -821,6 +864,50 @@ def test_signal_review_file_reconciliation():
             pass
 
 
+def test_signal_review_file_retention_is_per_user():
+    original_file = storage_module.SIGNAL_REVIEW_FILE
+    original_limit = storage_module.SIGNAL_REVIEW_LIMIT
+    test_file = ROOT / "runtime" / f"smoke-signal-retention-{os.getpid()}-{time.time_ns()}.json"
+    storage_module.SIGNAL_REVIEW_FILE = str(test_file)
+    storage_module.SIGNAL_REVIEW_LIMIT = 2
+    try:
+        store = storage_module.DashboardStorage()
+
+        def records(prefix, start):
+            return [
+                {"signal_key": f"{prefix}-{index}", "symbol": "DOGEUSDT", "snapshot_at_ms": start + index}
+                for index in range(3)
+            ]
+
+        store.user_id = "u1"
+        store._save_signal_reviews_file(records("u1", 100))
+        store.user_id = "u2"
+        store._save_signal_reviews_file(records("u2", 200))
+        saved = store._read_signal_review_file()["records"]
+        by_user = {}
+        for item in saved:
+            by_user.setdefault(item["storage_user_id"], []).append(item["signal_key"])
+        check(set(by_user) == {"u1", "u2"}, "one user's fallback writes must not evict another user")
+        check(by_user["u1"] == ["u1-2", "u1-1"], "u1 must retain its two newest fallback records")
+        check(by_user["u2"] == ["u2-2", "u2-1"], "u2 must retain its two newest fallback records")
+
+        migrated = []
+        store.user_id = "u1"
+        store._upsert_signal_review_records_mysql = lambda items: migrated.extend(items) or len(items)
+        check(store._reconcile_signal_review_file_to_mysql() == 2, "scoped reconciliation must migrate the current user's retained records")
+        remaining = store._read_signal_review_file()["records"]
+        check({item["storage_user_id"] for item in remaining} == {"u2"}, "scoped reconciliation must preserve other users' fallback records")
+        check(store._reconcile_signal_review_file_to_mysql(all_users=True) == 2, "all-user reconciliation must migrate remaining user scopes")
+        check(store._read_signal_review_file()["records"] == [], "all-user reconciliation must remove only committed records")
+    finally:
+        storage_module.SIGNAL_REVIEW_FILE = original_file
+        storage_module.SIGNAL_REVIEW_LIMIT = original_limit
+        try:
+            test_file.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def test_required_assets_and_report_contract():
     for relative in ("scripts/deploy.py", "scripts/frontend-smoke.js", ".env.example"):
         check((ROOT / relative).is_file(), f"required project asset missing: {relative}")
@@ -861,6 +948,7 @@ def test_deploy_contracts():
         check_market=False,
         no_ufw=True,
         public_port=9000,
+        public_url="https://dashboard.example.com",
     )
     remote = deploy.remote_script(args, "/tmp/bian-dashboard-test.tar.gz")
     health_check = "http://127.0.0.1:9000/api/health"
@@ -868,10 +956,32 @@ def test_deploy_contracts():
     check("BIAN_PUBLIC_PORT=9000" in remote, "public port must be persisted into the remote .env")
     check("BIAN_BIND_ADDRESS=127.0.0.1" in remote, "remote deployment must bind the application upstream to loopback")
     check("BIAN_AUTH_COOKIE_SECURE=1" in remote, "remote deployment must require secure authentication cookies")
+    check('chmod 600 "$release_dir/.env"' in remote, "remote deployment must restrict secret file permissions")
+    check(remote.index('chmod 600 "$release_dir/.env"') > remote.rindex("BIAN_AUTH_COOKIE_SECURE"), "secret permissions must be hardened after every .env edit")
     check("BIAN_REDIS_PASSWORD=$redis_password" in remote, "first deploy must generate a Redis password")
     check("mktemp -d" in remote and 'mv "$release_dir" /opt/bian-dashboard' in remote, "deploy must replace from a staging directory")
     check("/opt/bian-dashboard.previous" in remote, "deploy must retain the previous release until health passes")
     check(remote.index(health_check) < remote.index(archive_cleanup), "archive must remain available until deployment succeeds")
+    public_health_check = "https://dashboard.example.com/api/health"
+    check(public_health_check in remote, "deployment must verify the configured public HTTPS health endpoint")
+    check(remote.index(public_health_check) < remote.index(archive_cleanup), "public HTTPS must pass before deployment cleanup")
+
+    for invalid_url in ("http://dashboard.example.com", "https://user:secret@dashboard.example.com", "https://dashboard.example.com/app"):
+        try:
+            deploy.normalize_public_url(invalid_url)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid public deployment URL must be rejected: {invalid_url}")
+    try:
+        deploy.validate_deploy_args(types.SimpleNamespace(public_url="", allow_no_public_url=False))
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("production deployment must require a public HTTPS URL")
+    local_args = types.SimpleNamespace(public_url="", allow_no_public_url=True)
+    deploy.validate_deploy_args(local_args)
+    check(local_args.public_url == "", "explicit local deployment override must remain available")
 
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     check("${BIAN_BIND_ADDRESS:-127.0.0.1}:${BIAN_PUBLIC_PORT:-8000}:8000" in compose, "Compose must not expose plaintext authentication publicly by default")
@@ -883,6 +993,7 @@ def test_deploy_contracts():
 def main():
     test_cache_and_symbol_contracts()
     test_tick_rounding_and_cache_lock_ownership()
+    test_snapshot_fallback_and_logout_cookie()
     test_review_time_boundaries()
     test_publication_price_alignment()
     test_realtime_hub_recovery_and_idle_cleanup()
@@ -898,6 +1009,7 @@ def main():
     test_http_and_sse_resource_bounds()
     test_mysql_health_cache_expires()
     test_signal_review_file_reconciliation()
+    test_signal_review_file_retention_is_per_user()
     test_required_assets_and_report_contract()
     test_deploy_contracts()
     print("smoke ok")

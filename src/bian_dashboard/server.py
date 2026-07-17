@@ -850,7 +850,7 @@ def parse_snapshot_ms(text, fallback=None):
             return int(datetime.fromisoformat(raw).timestamp() * 1000)
         except Exception:
             pass
-    return int((fallback or time.time()) * 1000)
+    return int((fallback if fallback is not None else time.time()) * 1000)
 
 
 def side_from_bias_text(text):
@@ -2442,7 +2442,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def logout_api(self):
         token = self.auth_token()
         if storage is not None:
-            storage.delete_auth_session(token)
+            try:
+                storage.delete_auth_session(token)
+            except Exception:
+                LOG.exception("auth session delete failed during logout")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Set-Cookie", f"{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")

@@ -1628,7 +1628,7 @@
 
 ## 2026-07-17 Full review remediation
 
-- Replaced coarse post-rounding with Decimal tick-grid rounding and added owner tokens to backtest cache locks so directional prices stay legal and an old owner cannot remove a replacement lock.
+- Replaced coarse post-rounding with Decimal tick-grid rounding and serialized backtest cache writes with a held cross-platform OS file lock, avoiding stale-file ownership and replacement-delete races.
 - Rejected out-of-order price/depth events independently in the realtime hub and browser, recalculated frontend risk sizing from the current execution-score tier, and reserved symbol capacity across concurrent add requests.
 - Made dashboard boot fail closed on ambiguous or unavailable authentication. Only an explicit `auth_enabled=false` response can enter local scope; transient failures retry with bounded backoff and HTTP 401 redirects to login.
 - Reconciled file-fallback signal reviews into MySQL by `(storage_user_id, signal_key)` after recovery, merging terminal status and completed horizons before idempotent upsert and deleting file rows only after commit.
@@ -1640,7 +1640,24 @@
 - Passed targeted `python -B scripts\smoke.py`, `node scripts\frontend-smoke.js`, frontend syntax, Python compilation, and `git diff --check` apart from existing line-ending warnings.
 - Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok`, `frontend smoke ok`, and `verify ok`.
 - GitNexus detected 126 changed symbols and 92 affected execution flows across the full pre-existing worktree, retaining the expected `critical` L3 impact classification.
-- Offline tests cover tick monotonicity/divisibility, stale-lock ownership, exchange-event ordering, score-tier sizing, symbol reservations, auth failure isolation, partial review deadlines, fallback reconciliation, request timeouts, HTTP slots, and SSE rejection at capacity.
+- Offline tests cover tick monotonicity/divisibility, OS lock contention/release, exchange-event ordering, score-tier sizing, symbol reservations, auth failure isolation, partial review deadlines, fallback reconciliation, request timeouts, HTTP slots, and SSE rejection at capacity.
 - Restarted the single local backend on `127.0.0.1:8876` as PID 15520 with auth disabled; health, explicit local auth identity, updated frontend asset markers, and SSE diagnostics (`300s`, `12` clients) passed.
 - In-app browser navigation to the local URL was rejected by browser security policy, so DOM/render verification was skipped rather than bypassed.
 - Docker CLI is unavailable locally. Real MySQL 8.4 reconciliation/upsert, Docker Compose parsing/startup, HTTPS proxy/certificate behavior, and concurrent network saturation remain release-environment checks.
+
+## 2026-07-17 End-to-end review remediation
+
+- Required scripted production deploys to declare a public HTTPS origin and pass both loopback and public health checks before cleanup. Remote `.env` permissions are forced to `0600` after all secret edits.
+- Added one timeout/AbortController request layer for every dashboard API fetch. A 401 now stops preference sync, auth/strategy timers, and SSE, clears the current user, and redirects once.
+- Accepted authenticated database users named `local` while requiring the exact id-0 local identity when authentication is explicitly disabled.
+- Kept REST `_analysis_last` separate while preserving a newer realtime `last` only with its matching price source metadata.
+- Made logout cookie expiry survive database deletion failures, preserved explicit zero/negative timestamp fallbacks, applied signal-review file retention per user, and replaced token/unlink cache locking with held OS locks.
+
+## End-to-end review remediation verification
+
+- Passed `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1` with `smoke ok`, `frontend smoke ok`, and `verify ok`.
+- Passed Python/Node syntax checks, targeted Python and frontend smoke tests, `feature_list.json` parsing, and `git diff --check` apart from repository LF-to-CRLF warnings.
+- Targeted tests cover deploy URL/permission contracts, logout database failure, timestamp `None`/`0`/`-1`, per-user file retention and reconciliation, OS lock contention/no-unlink release, real username `local`, boot/post-boot 401, never-settling fetch timeout cleanup, and realtime/analysis price merging.
+- GitNexus change detection reports critical impact across 59 flows because the shared frontend request layer participates in dashboard boot, preferences, refresh, diagnostics, reviews, and symbol management.
+- Restarted the single local auth-disabled backend on `127.0.0.1:8876` as PID `10072`; `/api/health` returned HTTP 200 and the port had exactly one listener.
+- Full deploy dry-run was skipped after the sandbox could not read the user's global Git ignore and the external approval service returned 404. The offline deployment contract test passed; real HTTPS proxy/certificate, remote `.env` mode, MySQL reconciliation, and browser EventSource/session-expiry behavior remain release checks.

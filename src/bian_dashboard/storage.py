@@ -1217,7 +1217,16 @@ class DashboardStorage:
                 existing.add(scoped_key)
                 inserted += 1
             items.sort(key=lambda x: int(x.get("snapshot_at_ms") or 0), reverse=True)
-            del items[SIGNAL_REVIEW_LIMIT:]
+            retained = []
+            per_user_counts = {}
+            for item in items:
+                user_id = str(item.get("storage_user_id") or "default")
+                count = per_user_counts.get(user_id, 0)
+                if count >= SIGNAL_REVIEW_LIMIT:
+                    continue
+                retained.append(item)
+                per_user_counts[user_id] = count + 1
+            items[:] = retained
             self._write_signal_review_file(data)
             return {"backend": "file", "inserted": inserted, "skipped": skipped}
 
